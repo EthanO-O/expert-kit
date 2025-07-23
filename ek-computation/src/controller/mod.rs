@@ -4,7 +4,11 @@ pub mod poller;
 pub mod registry;
 pub mod service;
 
-use crate::{metrics, proto::ek::control::v1::plan_service_server::PlanServiceServer};
+use crate::{
+    metrics, 
+    proto::ek::control::v1::plan_service_server::PlanServiceServer,
+    schedule,
+};
 use ek_base::error::EKResult;
 use metrics::spawn_metrics_server;
 use service::control::PlanServiceImpl;
@@ -21,6 +25,13 @@ pub async fn controller_main() -> EKResult<()> {
     let settings = ek_base::config::get_ek_settings();
 
     spawn_metrics_server("0.0.0.0:9080");
+
+    if settings.controller.auto_scaling.enabled {
+        schedule::init_schedule_module(settings.controller.auto_scaling.clone())?;
+        log::info!("Auto scaling module initialized");
+    } else {
+        log::info!("Auto scaling is disabled in configuration");
+    }
 
     let state_srv = tokio::task::spawn(async {
         let srv = controller::service::state::StateServerImpl::new();

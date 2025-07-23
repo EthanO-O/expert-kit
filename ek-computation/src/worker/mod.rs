@@ -24,6 +24,8 @@ use ek_base::{config::get_ek_settings, error::EKResult};
 pub async fn worker_main() -> EKResult<()> {
     let settings = get_ek_settings();
 
+    log::info!("Worker memory capacity: {}GB", settings.worker.memory_gb);
+
     spawn_metrics_server(&settings.worker.metrics);
 
     let token = CancellationToken::new();

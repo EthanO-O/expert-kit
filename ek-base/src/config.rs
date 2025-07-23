@@ -35,10 +35,45 @@ pub struct DBSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct AutoScalingConfig {
+    /// Enable auto scaling feature
+    pub enabled: bool,
+    /// Time window duration in seconds for expert activation tracking
+    pub window_duration: u64,
+    /// Interval in seconds between scaling checks
+    pub check_interval: u64,
+    /// Number of top-K hot experts per layer to scale out
+    pub topk_per_layer: usize,
+    /// Scale down delay in seconds
+    pub scale_down_delay: u64,
+    /// Memory utilization threshold (0.0 - 1.0)
+    pub memory_utilization: f64,
+    /// Data type size in bytes (e.g., 2 for fp16)
+    pub dtype_bytes: usize,
+}
+
+impl Default for AutoScalingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_duration: 30,
+            check_interval: 30,
+            topk_per_layer: 3,
+            scale_down_delay: 6,
+            memory_utilization: 0.8,
+            dtype_bytes: 2,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct ControllerSettings {
     pub listen: String,
     pub broadcast: String,
     pub ports: ControllerPorts,
+    #[serde(default)]
+    pub auto_scaling: AutoScalingConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -81,9 +116,15 @@ pub struct WorkerSettings {
     pub broadcast: String,
     pub ports: WorkerPorts,
     pub device: String,
+    #[serde(default = "default_worker_memory_gb")]
+    pub memory_gb: f64,
     #[serde(default = "default_worker_metrics")]
     pub metrics: String,
     pub advanced: Option<WorkerAdvancedSettings>,
+}
+
+fn default_worker_memory_gb() -> f64 {
+    16.0
 }
 
 fn default_worker_metrics() -> String {
@@ -223,6 +264,7 @@ worker:
   ports:
     main: 51234
   device: cpu
+  memory_gb: 16.0
   advanced:
     cpu_affinity:
       cores: [0, 1, 2, 3]
@@ -234,6 +276,14 @@ controller:
   ports:
     intra: 5001
     inter: 5002
+  auto_scaling:
+    enabled: true
+    window_duration: 30
+    check_interval: 30
+    topk_per_layer: 3
+    scale_down_delay: 6
+    memory_utilization: 0.8
+    dtype_bytes: 2
 "#
     }
 
