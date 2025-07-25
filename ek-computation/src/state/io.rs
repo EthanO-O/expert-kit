@@ -1,7 +1,7 @@
 use crate::{proto::ek::object::v1::ExpertSlice, schema, state::pool::POOL};
 
 use super::models::{self, NewExpert, NewInstance, NewModel, NewNode};
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use ek_base::error::EKResult;
 use models::{Expert, Instance, Model, Node};
@@ -14,6 +14,9 @@ pub trait StateReader {
     async fn instance_by_id(&self, id: i32) -> EKResult<Option<Instance>>;
     async fn experts_by_node(&self, node_id: i32) -> EKResult<Vec<Expert>>;
     async fn node_by_expert(&self, expert_id: &str) -> EKResult<Vec<Node>>;
+    
+    async fn active_nodes(&self) -> EKResult<Vec<Node>>;
+    async fn instance_by_name(&self, name: &str) -> EKResult<Option<Instance>>;
 }
 
 #[allow(dead_code)]
@@ -85,9 +88,11 @@ impl StateReaderImpl {
             .filter(dsl::name.eq(name))
             .select(models::Instance::as_select())
             .first(&mut conn)
-            .await?;
-        Ok(Some(res))
+            .await
+            .optional()?;
+        Ok(res)
     }
+    
     async fn _node_by_expert(&self, expert_id: &str) -> EKResult<Vec<Node>> {
         let mut conn = POOL.get().await?;
 
@@ -116,6 +121,30 @@ impl StateReader for StateReaderImpl {
             .get_result(&mut conn)
             .await?;
         Ok(Some(res))
+    }
+
+    async fn active_nodes(&self) -> EKResult<Vec<Node>> {
+        let mut conn = POOL.get().await?;
+        use schema::node::dsl;
+        let th = std::time::SystemTime::now() - std::time::Duration::from_secs(20);
+        let res = schema::node::table
+            .filter(dsl::last_seen_at.gt(th))
+            .select(models::Node::as_select())
+            .load(&mut conn)
+            .await?;
+        Ok(res)
+    }
+    
+    async fn instance_by_name(&self, name: &str) -> EKResult<Option<Instance>> {
+        let mut conn = POOL.get().await?;
+        use schema::instance::dsl;
+        let res = schema::instance::table
+            .filter(dsl::name.eq(name))
+            .select(models::Instance::as_select())
+            .first(&mut conn)
+            .await
+            .optional()?;
+        Ok(res)
     }
 
     async fn instance_by_id(&self, id: i32) -> EKResult<Option<Instance>> {

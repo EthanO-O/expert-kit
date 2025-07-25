@@ -43,6 +43,23 @@ impl StateServerImpl {
                     if let Err(e) = e {
                         log::error!("worker ping error: {e}");
                     }
+                    
+                    // Update worker capacity information to DeploymentCache
+                    if msg.memory_gb > 0.0 {
+                        if let Ok(deployment_cache) = std::panic::catch_unwind(|| {
+                            crate::schedule::get_deployment_cache()
+                        }) {
+                            deployment_cache.update_worker_capacity(
+                                &msg.id,
+                                msg.memory_gb,
+                                msg.current_expert_count as usize
+                            ).await;
+                            
+                            log::debug!("Updated capacity for worker {}: {}GB, {} experts", 
+                                       msg.id, msg.memory_gb, msg.current_expert_count);
+                        }
+                    }
+
                     continue;
                 }
                 Ok(Ok(None)) => {

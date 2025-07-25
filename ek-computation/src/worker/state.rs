@@ -53,15 +53,38 @@ impl StateClient {
     /// Generate request stream for state exchange
     async fn get_request_stream(worker_id: String) -> impl Stream<Item = ExchangeReq> {
         let settings = get_ek_settings();
-        tokio_stream::iter(1..usize::MAX).map(move |_| ExchangeReq {
-            id: worker_id.clone(),
-            addr: format!(
-                "http://{}:{}",
-                settings.worker.broadcast, settings.worker.ports.main
-            ),
-            channel: "grpc".to_string(),
-            device: settings.worker.device.clone(),
-            last_will: false,
+        tokio_stream::iter(1..usize::MAX).then(move |_| {
+            let worker_id = worker_id.clone();
+            let settings = settings.clone();
+            
+            async move {
+                // Get current loaded expert count
+                let current_expert_count = {
+                    if let Ok(gate) = std::panic::catch_unwind(|| {
+                        crate::worker::core::get_instance_gate()
+                    }) {
+                        gate.read().await.current_experts().await
+                            .map(|experts| experts.len())
+                            .unwrap_or(0) as u32
+                    } else {
+                        0u32
+                    }
+                };
+                
+                ExchangeReq {
+                    id: worker_id,
+                    addr: format!(
+                        "http://{}:{}",
+                        settings.worker.broadcast, settings.worker.ports.main
+                    ),
+                    channel: "grpc".to_string(),
+                    device: settings.worker.device.clone(),
+                    last_will: false,
+
+                    memory_gb: settings.worker.memory_gb,
+                    current_expert_count,
+                }
+            }
         })
     }
 

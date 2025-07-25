@@ -27,8 +27,44 @@ pub async fn controller_main() -> EKResult<()> {
     spawn_metrics_server("0.0.0.0:9080");
 
     if settings.controller.auto_scaling.enabled {
+        // Initialize deployment cache
+        let deployment_cache = schedule::init_deployment_cache();
+        
         schedule::init_schedule_module(settings.controller.auto_scaling.clone())?;
         log::info!("Auto scaling module initialized");
+        
+        // Start deployment cache sync loop
+        let cache_sync_task = {
+            let cache = deployment_cache.clone();
+            tokio::task::spawn(async move {
+                cache.run_sync_loop().await;
+            })
+        };
+        
+        // Start profiler maintenance loop
+        let profiler_task = {
+            let profiler = schedule::get_profiler();
+            tokio::task::spawn(async move {
+                profiler.run_maintenance_loop().await;
+            })
+        };
+        
+        // Start auto scaler loop
+        let auto_scaler_task = {
+            let config = settings.controller.auto_scaling.clone();
+            tokio::task::spawn(async move {
+                log::info!("Auto scaling is enabled, starting scaler");
+                let mut scaler = schedule::AutoScaler::new(config);
+                if let Err(e) = scaler.run_scaling_loop().await {
+                    log::error!("Auto scaler error: {e}");
+                }
+            })
+        };
+        
+        // Register background tasks
+        tokio::spawn(async move {
+            tokio::try_join!(cache_sync_task, profiler_task, auto_scaler_task).ok();
+        });
     } else {
         log::info!("Auto scaling is disabled in configuration");
     }

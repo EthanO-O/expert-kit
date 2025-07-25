@@ -153,6 +153,8 @@ impl NaiveExecutor {
         let mut chips: Vec<(ExpertId, Vec<EgressMeta>)> = vec![];
         let settings = get_ek_settings();
 
+        let execution_start = std::time::Instant::now();
+
         while let Some((expert_id, egress_meta)) = self.pending_egress.pop_first() {
             let expert_id: ExpertIdRef = expert_id.as_ref();
             let Ok(channel) = self.registry.lock().await.select(expert_id).await else {
@@ -239,6 +241,18 @@ impl NaiveExecutor {
         }
 
         tit.stop("remote resp joined");
+
+
+        let completion_time_ms = execution_start.elapsed().as_millis() as u64;
+        for (expert_id, egress_meta) in &chips {
+            // egress_meta.len() represents the batch size for this expert
+            crate::schedule::record_activation_completion(
+                expert_id, 
+                egress_meta.len(), 
+                completion_time_ms
+            );
+        }
+
         self.output().await;
         tit.stop("output generated");
 

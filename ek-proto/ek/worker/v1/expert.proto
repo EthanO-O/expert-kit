@@ -37,6 +37,9 @@ message ExchangeReq {
   string channel = 3;
   string device = 4;
   bool last_will = 5;
+
+  double memory_gb = 6;
+  uint32 current_expert_count = 7;
 }
 
 message ExchangeResp {
