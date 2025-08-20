@@ -243,21 +243,30 @@ impl ExpertRegistryImpl {
     }
 }
 
-const MAX_TENSOR_SIZE: usize = 64 * 1024 * 1024;
+const MAX_TENSOR_SIZE: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalShmWorkerReq {
     id: usize,
     expert_id: [u8; 64],
     input_tensor: Vec<u8>,
+    // Timing analysis IDs
+    forward_id: [u8; 64],
+    exp_cal_id: [u8; 64],
 }
 
 impl LocalShmWorkerReq {
     pub fn new(expert_id: ExpertIdRef<'_>, input_tensor: &[u8]) -> Self {
+        Self::new_with_ids(expert_id, input_tensor, "", "")
+    }
+    
+    pub fn new_with_ids(expert_id: ExpertIdRef<'_>, input_tensor: &[u8], forward_id: &str, exp_cal_id: &str) -> Self {
         static ID: AtomicUsize = AtomicUsize::new(1);
 
         assert!(expert_id.len() < 64);
         assert!(input_tensor.len() <= MAX_TENSOR_SIZE);
+        assert!(forward_id.len() < 64);
+        assert!(exp_cal_id.len() < 64);
 
         // Safely convert expert_id to fixed-size array, padding with zeros if necessary
         let mut expert_id_array = [0u8; 64];
@@ -265,10 +274,24 @@ impl LocalShmWorkerReq {
         let copy_len = std::cmp::min(expert_id_bytes.len(), 63);
         expert_id_array[..copy_len].copy_from_slice(&expert_id_bytes[..copy_len]);
 
+        // Convert forward_id to fixed-size array
+        let mut forward_id_array = [0u8; 64];
+        let forward_id_bytes = forward_id.as_bytes();
+        let copy_len = std::cmp::min(forward_id_bytes.len(), 63);
+        forward_id_array[..copy_len].copy_from_slice(&forward_id_bytes[..copy_len]);
+
+        // Convert exp_cal_id to fixed-size array
+        let mut exp_cal_id_array = [0u8; 64];
+        let exp_cal_id_bytes = exp_cal_id.as_bytes();
+        let copy_len = std::cmp::min(exp_cal_id_bytes.len(), 63);
+        exp_cal_id_array[..copy_len].copy_from_slice(&exp_cal_id_bytes[..copy_len]);
+
         Self {
             id: ID.fetch_add(1, Ordering::SeqCst),
             expert_id: expert_id_array,
             input_tensor: input_tensor.to_vec(),
+            forward_id: forward_id_array,
+            exp_cal_id: exp_cal_id_array,
         }
     }
 
@@ -283,6 +306,16 @@ impl LocalShmWorkerReq {
         String::from_utf8(self.expert_id[..end].to_vec()).unwrap()
     }
 
+    pub fn forward_id(&self) -> String {
+        let end = self.forward_id.iter().position(|&b| b == 0).unwrap_or(64);
+        String::from_utf8(self.forward_id[..end].to_vec()).unwrap()
+    }
+
+    pub fn exp_cal_id(&self) -> String {
+        let end = self.exp_cal_id.iter().position(|&b| b == 0).unwrap_or(64);
+        String::from_utf8(self.exp_cal_id[..end].to_vec()).unwrap()
+    }
+
     pub fn input_tensor(&self) -> &[u8] {
         &self.input_tensor
     }
@@ -290,7 +323,7 @@ impl LocalShmWorkerReq {
 
 impl ShmBytes for LocalShmWorkerReq {
     const SIZE: usize =
-        std::mem::size_of::<usize>() + 64 + std::mem::size_of::<usize>() + MAX_TENSOR_SIZE;
+        std::mem::size_of::<usize>() + 64 + std::mem::size_of::<usize>() + MAX_TENSOR_SIZE + 64 + 64;
 
     fn as_bytes(&self) -> impl Iterator<Item = u8> + '_ {
         self.id
@@ -299,6 +332,8 @@ impl ShmBytes for LocalShmWorkerReq {
             .chain(self.expert_id)
             .chain(self.input_tensor.len().to_le_bytes())
             .chain(self.input_tensor.clone())
+            .chain(self.forward_id)
+            .chain(self.exp_cal_id)
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
@@ -312,15 +347,27 @@ impl ShmBytes for LocalShmWorkerReq {
                 .try_into()
                 .unwrap(),
         );
-        let input_tensor = bytes
-            [std::mem::size_of::<usize>() + 64 + std::mem::size_of::<usize>()..]
-            [..input_tensor_len]
-            .to_vec();
+        let input_tensor_start = std::mem::size_of::<usize>() + 64 + std::mem::size_of::<usize>();
+        let input_tensor = bytes[input_tensor_start..input_tensor_start + input_tensor_len].to_vec();
+        
+        // For fixed-size fields, we use their position from the end of the buffer
+        let payload_size = input_tensor_start + input_tensor_len;
+        let forward_id_start = payload_size;
+        let forward_id = bytes[forward_id_start..forward_id_start + 64]
+            .try_into()
+            .unwrap();
+        
+        let exp_cal_id_start = forward_id_start + 64;
+        let exp_cal_id = bytes[exp_cal_id_start..exp_cal_id_start + 64]
+            .try_into()
+            .unwrap();
 
         Self {
             id,
             expert_id,
             input_tensor,
+            forward_id,
+            exp_cal_id,
         }
     }
 }

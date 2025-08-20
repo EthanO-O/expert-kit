@@ -151,10 +151,41 @@ impl EKInstanceGateSync {
         expert_id: ExpertIdRef<'_>,
         input_tensor: &[u8],
     ) -> EKResult<Vec<u8>> {
+        // Fallback with auto-generated IDs for backward compatibility
+        let exp_cal_id = format!("shm_core_{}_{}", expert_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        self.forward_sync_core_with_ids(expert_id, input_tensor, "", &exp_cal_id)
+    }
+    
+    pub fn forward_sync_core_with_ids(
+        &self,
+        expert_id: ExpertIdRef<'_>,
+        input_tensor: &[u8],
+        forward_id: &str,
+        exp_cal_id: &str,
+    ) -> EKResult<Vec<u8>> {
+        log::info!(
+            forward_id:%,
+            exp_cal_id:%,
+            expert:% = expert_id,
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: shm core expert computation start"
+        );
+        
+        let computation_start = std::time::Instant::now();
         let exp = self.experts.load(expert_id)?;
         let st = safetensors::SafeTensors::deserialize(input_tensor)?;
         let tv = st.tensor("data")?;
         let res = exp.forward(&tv)?;
+        
+        log::info!(
+            forward_id:%,
+            exp_cal_id:%,
+            expert:% = expert_id,
+            computation_us:% = computation_start.elapsed().as_micros(),
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: shm core expert computation end"
+        );
+        
         Ok(res)
     }
 

@@ -135,11 +135,35 @@ pub async fn worker_main() -> EKResult<()> {
                         req.id(),
                         req.expert_id()
                     );
+                    
+                    // Use timing IDs from the request
+                    let forward_id = req.forward_id();
+                    let exp_cal_id = req.exp_cal_id();
+                    
+                    log::info!(
+                        forward_id:%,
+                        exp_cal_id:%,
+                        expert:% = req.expert_id(),
+                        req_id:% = req.id(),
+                        timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                        ; "TIMING: shm worker request received"
+                    );
+                    
                     let now = time::Instant::now();
                     let expert_id = req.expert_id();
                     let input_tensor = req.input_tensor();
+                    log::info!(
+                        forward_id:%,
+                        exp_cal_id:%,
+                        expert:% = expert_id,
+                        req_id:% = req.id(),
+                        timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                        ; "TIMING: shm worker computation start"
+                    );
+                    
+                    let computation_start = time::Instant::now();
                     let output_tensor = loop {
-                        match gate.forward_sync_core(&expert_id, input_tensor) {
+                        match gate.forward_sync_core_with_ids(&expert_id, input_tensor, &forward_id, &exp_cal_id) {
                             Ok(result) => {
                                 log::debug!("forward_sync_core completed for expert={}", expert_id);
                                 break result;
@@ -148,16 +172,29 @@ pub async fn worker_main() -> EKResult<()> {
                         }
                         std::thread::sleep(Duration::from_secs(1));
                     };
+                    
+                    log::info!(
+                        forward_id:%,
+                        exp_cal_id:%,
+                        expert:% = expert_id,
+                        req_id:% = req.id(),
+                        computation_us:% = computation_start.elapsed().as_micros(),
+                        timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                        ; "TIMING: shm worker computation end"
+                    );
                     let resp = LocalShmWorkerResp::new(req.id(), output_tensor);
                     while send_channel.lock().unwrap().send(&resp).is_err() {
                         log::warn!("send_channel full, retrying...");
                         std::thread::sleep(Duration::from_micros(100));
                     }
                     log::info!(
-                        "request id={} expert={} processed in {}us",
-                        req.id(),
-                        req.expert_id(),
-                        now.elapsed().as_micros(),
+                        forward_id:%,
+                        exp_cal_id:%,
+                        expert:% = expert_id,
+                        req_id:% = req.id(),
+                        total_us:% = now.elapsed().as_micros(),
+                        timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                        ; "TIMING: shm worker response sent"
                     );
                 }
             });

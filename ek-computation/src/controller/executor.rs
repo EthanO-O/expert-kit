@@ -250,8 +250,21 @@ impl NaiveExecutor {
                     handles.push(f);
                 }
                 ExpertClient::Shm((send_channel, recv_channel)) => {
+                    // Generate IDs for timing analysis (same format as GRPC)
+                    let forward_id = format!("fwd_{}", egress_meta.first().map(|e| e.req_id).unwrap_or(0));
+                    let exp_cal_id = format!("exp_{}_{}", expert_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+                    
                     let fu = async move {
-                        let req = LocalShmWorkerReq::new(expert_id.as_ref(), &serialized_tensor);
+                        let req = LocalShmWorkerReq::new_with_ids(expert_id.as_ref(), &serialized_tensor, &forward_id, &exp_cal_id);
+
+                        log::info!(
+                            forward_id:%,
+                            exp_cal_id:%,
+                            expert:% = expert_id,
+                            req_id:% = req.id(),
+                            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                            ; "TIMING: controller shm dispatch start"
+                        );
 
                         let start = time::Instant::now();
                         let _d = Defers::defer(Box::new(move || {
@@ -267,9 +280,13 @@ impl NaiveExecutor {
                             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
                         }
 
-                        log::debug!(
-                            "request sent for expert {}, waiting for response",
-                            expert_id
+                        log::info!(
+                            forward_id:%,
+                            exp_cal_id:%,
+                            expert:% = expert_id,
+                            req_id:% = req.id(),
+                            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                            ; "TIMING: controller shm sent, waiting response"
                         );
                         let resp = loop {
                             if let Some(resp) = pending_resp.lock().await.remove(&req.id()) {
@@ -293,6 +310,17 @@ impl NaiveExecutor {
                                 }
                             }
                         };
+                        
+                        log::info!(
+                            forward_id:%,
+                            exp_cal_id:%,
+                            expert:% = expert_id,
+                            req_id:% = req.id(),
+                            total_us:% = start.elapsed().as_micros(),
+                            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                            ; "TIMING: controller shm response received"
+                        );
+                        
                         Ok(ForwardResponse::Shm(resp))
                     }
                     .in_current_span();
