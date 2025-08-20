@@ -172,6 +172,19 @@ impl NaiveExecutor {
         let mut chips: Vec<(ExpertId, Vec<EgressMeta>)> = vec![];
         let settings = get_ek_settings();
 
+        // Extract forward_id from first egress meta for timing logs
+        let forward_id = self.pending_egress.first_key_value()
+            .and_then(|(_, egress_meta)| egress_meta.first())
+            .map(|meta| format!("fwd_{}", meta.req_id))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        log::info!(
+            forward_id:%,
+            expert_count:% = self.pending_egress.len(),
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: executor dispatch start"
+        );
+
         while let Some((expert_id, egress_meta)) = self.pending_egress.pop_first() {
             let expert_id: ExpertIdRef = expert_id.as_ref();
             let Ok(client) = self.registry.lock().await.select(expert_id).await else {
@@ -206,11 +219,17 @@ impl NaiveExecutor {
 
                     let f = tokio::spawn(
                         async move {
+                            // Generate IDs for timing analysis
+                            let forward_id = format!("fwd_{}", egress_meta.first().map(|e| e.req_id).unwrap_or(0));
+                            let exp_cal_id = format!("exp_{}_{}", expert_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+                            
                             let req = v1::ForwardReq {
                                 // TODO: hardcode instance id.
                                 instance_id: "0".into(),
                                 tensor: serialized_tensor,
                                 sequences: seqs,
+                                forward_id: forward_id.clone(),
+                                exp_cal_id: exp_cal_id.clone(),
                             };
 
                             let start = time::Instant::now();
@@ -313,6 +332,13 @@ impl NaiveExecutor {
         }
 
         tit.stop("remote resp joined");
+        
+        log::info!(
+            forward_id:%,
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: executor responses received"
+        );
+        
         self.output().await;
         tit.stop("output generated");
 
@@ -341,6 +367,8 @@ impl NaiveExecutor {
 
             let resp = v1::ForwardResp {
                 output_tensor: serialized_tensor,
+                forward_id: format!("fwd_{}", req_id),
+                exp_cal_id: "aggregated".to_string(), // This is the final aggregated response
             };
 
             let send_res = meta

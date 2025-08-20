@@ -189,6 +189,8 @@ impl ExpertKitService {
 
         Ok(ForwardResp {
             output_tensor: buffer,
+            forward_id: request.forward_id.clone(),
+            exp_cal_id: request.exp_cal_id.clone(),
         })
     }
 }

@@ -57,6 +57,16 @@ impl BasicExpertImpl {
             request.get_ref().sequences.len(),
         );
         let exp_id = request.get_ref().sequences[0].experts[0].clone();
+        
+        // Log request received with timing IDs
+        log::info!(
+            forward_id:% = request.get_ref().forward_id,
+            exp_cal_id:% = request.get_ref().exp_cal_id,
+            expert:% = exp_id,
+            seq_count:% = request.get_ref().sequences.len(),
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: worker request received"
+        );
         let start = Instant::now();
 
         let start_cloned = start;
@@ -99,6 +109,19 @@ impl BasicExpertImpl {
         tracing::debug!("[L2 {:?}] sync_gate.forward() start", &exp_id,);
 
         let forward_now = Instant::now();
+        
+        // Capture IDs before moving request
+        let forward_id = request.get_ref().forward_id.clone();
+        let exp_cal_id = request.get_ref().exp_cal_id.clone();
+        
+        log::info!(
+            forward_id:%,
+            exp_cal_id:%,
+            expert:% = exp_id,
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: worker computation start"
+        );
+        
         let req_inner = request.into_inner();
 
         // Use sync gate for compute-intensive operations
@@ -131,12 +154,30 @@ impl BasicExpertImpl {
             &exp_id,
             forward_now.elapsed(),
         );
+        
+        log::info!(
+            forward_id:%,
+            exp_cal_id:%,
+            expert:% = exp_id,
+            computation_us:% = forward_now.elapsed().as_micros(),
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: worker computation end"
+        );
 
         let res = Ok(Response::new(res));
         tracing::debug!(
             "[L2 {:?}] rpc.forward() end with {:?}",
             &exp_id,
             start.elapsed(),
+        );
+        
+        log::info!(
+            forward_id:%,
+            exp_cal_id:%,
+            expert:% = exp_id,
+            total_us:% = start.elapsed().as_micros(),
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: worker response sent"
         );
 
         res

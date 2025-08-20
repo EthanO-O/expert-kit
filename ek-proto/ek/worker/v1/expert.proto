@@ -9,11 +9,17 @@ message ForwardReq {
   repeated SequenceInfo sequences = 2;
   // dimension: [seq,dim]
   bytes tensor = 3;
+  // Timing analysis IDs
+  string forward_id = 4;  // Overall forward request ID
+  string exp_cal_id = 5;  // Individual expert calculation ID
 }
 
 message ForwardResp {
   // dimension: [seq,expert,dim]
   bytes output_tensor = 1;
+  // Timing analysis IDs (copied from request)
+  string forward_id = 2;  // Overall forward request ID
+  string exp_cal_id = 3;  // Individual expert calculation ID
 }
 
 service ComputationService {

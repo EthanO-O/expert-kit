@@ -101,7 +101,25 @@ impl EKInstanceGateSync {
         // Perform synchronous computation
         let st = safetensors::SafeTensors::deserialize(&input_tensor).unwrap();
         let tv = st.tensor("data")?;
+        
+        log::info!(
+            forward_id:% = req.forward_id,
+            exp_cal_id:% = req.exp_cal_id,
+            expert:% = exp_id,
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: expert computation start"
+        );
+        
         let res = exp.forward(&tv)?;
+        
+        log::info!(
+            forward_id:% = req.forward_id,
+            exp_cal_id:% = req.exp_cal_id,
+            expert:% = exp_id,
+            computation_us:% = now.elapsed().as_micros(),
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: expert computation end"
+        );
 
         tracing::debug!(
             "[L3 {:?}] exp_backend.forward_sync() completed in {:?}",
@@ -115,6 +133,8 @@ impl EKInstanceGateSync {
 
         let resp = ek::worker::v1::ForwardResp {
             output_tensor: output_bytes,
+            forward_id: req.forward_id.clone(),
+            exp_cal_id: req.exp_cal_id.clone(),
         };
 
         tracing::debug!(

@@ -2,6 +2,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use ek_base::{config::get_ek_settings, utils::Defers};
 use tokio::sync::{Mutex, mpsc};
+use tonic::IntoRequest;
 use tracing::Instrument;
 
 use crate::{
@@ -42,7 +43,18 @@ impl ComputationProxyServiceImpl {
         request: tonic::Request<v1::ForwardReq>,
     ) -> Result<tonic::Response<v1::ForwardResp>, tonic::Status> {
         let seq_len = request.get_ref().sequences.len();
-        log::info!(seq_len; "forward request in controller start");
+        let forward_id = if request.get_ref().forward_id.is_empty() {
+            format!("fwd_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
+        } else {
+            request.get_ref().forward_id.clone()
+        };
+        
+        log::info!(
+            seq_len:%,
+            forward_id:%,
+            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+            ; "TIMING: controller request start"
+        );
         let start = std::time::Instant::now();
         let settings = get_ek_settings();
 
@@ -79,17 +91,33 @@ impl ComputationProxyServiceImpl {
             tokio::select! {
                 err = err_rx.recv() => {
                     if let Some(err) = err {
-                        log::error!("executor error: {err:?}");
+                        log::error!(
+                            forward_id:%,
+                            elapsed_us:% = start.elapsed().as_micros(),
+                            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                            ; "TIMING: controller request error: {err:?}"
+                        );
                         return Err(tonic::Status::internal(format!("executor error: {err:?}")))
                     }
                     continue
                 }
                 res = rx.recv() => {
-                    let elapsed_ms=  start.elapsed().as_millis();
-                    log::info!(elapsed_ms; "forward request in controller done" );
+                    let elapsed_us = start.elapsed().as_micros();
                     if let Some(resp) = res {
+                        log::info!(
+                            forward_id:%,
+                            elapsed_us:%,
+                            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                            ; "TIMING: controller request done"
+                        );
                         return Ok(tonic::Response::new(resp.as_ref().clone()));
                     } else {
+                        log::error!(
+                            forward_id:%,
+                            elapsed_us:%,
+                            timestamp_us:% = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()
+                            ; "TIMING: controller request error: no data"
+                        );
                         return Err(tonic::Status::internal("forward error: no data"));
                     }
                 }
