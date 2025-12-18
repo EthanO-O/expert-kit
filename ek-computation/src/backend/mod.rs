@@ -48,6 +48,9 @@ impl From<&str> for Device {
         let str_dev = value.to_lowercase();
         if str_dev == "cpu" {
             Device::CPU
+        } else if let Some(str_dev) = str_dev.strip_prefix("cuda:") {
+            let idx = str_dev.parse::<usize>().unwrap_or(0);
+            Device::CUDA(idx)
         } else if let Some(str_dev) = str_dev.strip_prefix("cuda") {
             let idx = str_dev.parse::<usize>().unwrap_or(0);
             Device::CUDA(idx)
