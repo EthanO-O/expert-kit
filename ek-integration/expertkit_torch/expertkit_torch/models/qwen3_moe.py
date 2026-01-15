@@ -72,15 +72,7 @@ def intercept_moe(
                 InterceptedMoE.client = ExpertKitClient(
                     controller_addr=ek_addr,
                     timeout_sec=DEFAULT_TIMEOUT_INTVAL,
-                    enable_direct_path=enable_direct_path,
                 )
-                # Initialize the client asynchronously (fetches routing table)
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                loop.run_until_complete(InterceptedMoE.client.start())
                 print(
                     f"[ExpertKit] Client initialized: controller={ek_addr}, direct_path={enable_direct_path}")
             self.layer_id = layer_idx
