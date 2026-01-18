@@ -9,6 +9,7 @@ pub enum DType {
     Uint8,
     Int8,
     Int16,
+    Float16,
     BFloat16,
     Float,
     Float8e4m3fn,
@@ -21,6 +22,7 @@ impl DType {
             DType::Uint8 => 1,
             DType::Int8 => 1,
             DType::Int16 => 2,
+            DType::Float16 => 2,
             DType::BFloat16 => 2,
             DType::Float => 4,
             DType::Float8e4m3fn | DType::Float8e4m3fnuz => 1, // Assuming these are packed formats
