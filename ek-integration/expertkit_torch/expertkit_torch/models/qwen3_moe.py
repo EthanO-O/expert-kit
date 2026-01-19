@@ -501,24 +501,6 @@ def main():
                 f"Input Tokens: {result['input_tokens']}, Output Tokens: {result['output_tokens']}")
             print("-" * 40)
 
-    # Cleanup: Stop ExpertKit client if it was initialized
-    if args.enable_ek:
-        try:
-            # Access the client through the InterceptedMoE class
-            # We need to get the class dynamically since it's defined in intercept_moe
-            from expertkit_torch.grpc_client_new import ExpertKitClient
-            # Get event loop and close the client
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            # Note: The client is stored as a class variable, but we can't easily access it
-            # For now, connections will be cleaned up on process exit
-            pass
-        except Exception as e:
-            print(f"Warning: Failed to cleanup ExpertKit client: {e}")
-
 
 if __name__ == "__main__":
     main()

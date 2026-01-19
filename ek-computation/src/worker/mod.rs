@@ -239,7 +239,8 @@ pub async fn worker_main() -> EKResult<()> {
                             if let Ok(req) = recv_channel.lock().unwrap().recv() {
                                 break req;
                             }
-                            std::thread::sleep(Duration::from_micros(100));
+                            std::hint::spin_loop();
+                            std::thread::yield_now();
                         };
                         log::debug!(
                             "received request: id={} expert={}",
@@ -319,7 +320,8 @@ pub async fn worker_main() -> EKResult<()> {
                             match recv_channel.lock().unwrap().recv() {
                                 Ok(req) => break req,
                                 Err(_) => {
-                                    std::thread::sleep(Duration::from_micros(100));
+                                    std::hint::spin_loop();
+                                    std::thread::yield_now();
                                     continue;
                                 }
                             }
