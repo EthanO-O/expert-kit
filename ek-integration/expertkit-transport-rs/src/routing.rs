@@ -7,7 +7,7 @@ use tonic::transport::Channel;
 
 // Import generated routing proto
 use crate::transport::grpc::proto::ek::control::v1::{
-    routing_service_client::RoutingServiceClient, GetRoutingReq, WorkerEndpoint,
+    GetRoutingReq, WorkerEndpoint, routing_service_client::RoutingServiceClient,
 };
 
 /// Routing table client for fetching expert → worker mappings
@@ -82,13 +82,17 @@ impl RoutingClient {
     }
 
     /// Get worker endpoint for an expert
+    #[allow(unused)]
     pub async fn get_worker(&self, expert_id: &str) -> Option<WorkerEndpoint> {
         let table = self.routing_table.read().await;
         table.get(expert_id).cloned()
     }
 
     /// Get workers for multiple experts
-    pub async fn get_workers(&self, expert_ids: &[String]) -> HashMap<String, Option<WorkerEndpoint>> {
+    pub async fn get_workers(
+        &self,
+        expert_ids: &[String],
+    ) -> HashMap<String, Option<WorkerEndpoint>> {
         let table = self.routing_table.read().await;
         expert_ids
             .iter()
@@ -103,6 +107,7 @@ impl RoutingClient {
     }
 
     /// Get routing version
+    #[allow(unused)]
     pub async fn get_version(&self) -> u64 {
         let version = self.routing_version.read().await;
         *version

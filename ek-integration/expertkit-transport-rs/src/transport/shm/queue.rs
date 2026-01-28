@@ -47,12 +47,14 @@ pub struct ShmQueue {
     mmap: (NonNull<c_void>, usize),
     meta: *mut ShmQueueMeta,
     data: *mut u8,
+    #[allow(unused)]
     capacity: usize,
     slot_size: usize,
 }
 
 impl ShmQueue {
     /// Create a new shared memory queue
+    #[allow(unused)]
     pub fn new(name: &str, capacity: usize, slot_size: usize) -> Result<Self> {
         // Align slot size to 64 bytes
         let slot_size = ((slot_size + 63) / 64) * 64;
@@ -110,7 +112,7 @@ impl ShmQueue {
     }
 
     /// Open an existing shared memory queue
-    pub fn open(name: &str, capacity: usize, slot_size: usize) -> Option<Self> {
+    pub fn open(name: &str, _capacity: usize, slot_size: usize) -> Option<Self> {
         // Align slot size to 64 bytes
         let slot_size = ((slot_size + 63) / 64) * 64;
 
@@ -299,6 +301,7 @@ pub struct ShmqWorkerResp {
 }
 
 impl ShmqWorkerResp {
+    #[allow(unused)]
     pub fn new(id: usize, output_tensor: Vec<u8>) -> Self {
         Self { id, output_tensor }
     }

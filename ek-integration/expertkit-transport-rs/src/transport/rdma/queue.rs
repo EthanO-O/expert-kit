@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Import from the ibverbs library (InfiniBand verbs)
 use ibverbs::{
     CompletionQueue, Context, MemoryRegion, PreparedQueuePair, ProtectionDomain, QueuePair,
-    QueuePairBuilder, QueuePairEndpoint, RemoteMemoryRegion, devices, ibv_qp_type,
+    QueuePairEndpoint, RemoteMemoryRegion, devices, ibv_qp_type,
 };
 
 /// Maximum tensor size (64 MB) - must match worker expectations
@@ -92,6 +92,7 @@ pub struct RdmaQueue<T> {
     remote_region: Option<RemoteMemoryRegion>,
 
     // Queue configuration
+    #[allow(unused)]
     capacity: usize, // Number of slots in the queue
     is_sender: bool, // Role: true = sender (controller), false = receiver (worker)
 
@@ -446,6 +447,7 @@ impl<T: GeneralShmQueueBytes> RdmaQueue<T> {
     }
 
     /// Get queue capacity
+    #[allow(unused)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -498,11 +500,13 @@ impl ShmqWorkerReq {
         self.id
     }
 
+    #[allow(unused)]
     pub fn expert_id(&self) -> String {
         let end = self.expert_id.iter().position(|&b| b == 0).unwrap_or(64);
         String::from_utf8(self.expert_id[..end].to_vec()).unwrap()
     }
 
+    #[allow(unused)]
     pub fn input_tensor(&self) -> &[u8] {
         &self.input_tensor
     }
@@ -568,6 +572,7 @@ pub struct ShmqWorkerResp {
 }
 
 impl ShmqWorkerResp {
+    #[allow(unused)]
     pub fn new(id: usize, output_tensor: Vec<u8>) -> Self {
         assert!(
             output_tensor.len() <= MAX_TENSOR_SIZE,

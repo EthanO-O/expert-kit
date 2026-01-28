@@ -3,7 +3,6 @@ use pyo3::types::PyAny;
 
 use crate::client::ExpertKitClient as RustExpertKitClient;
 use crate::utils::{TensorMetadata, pytorch_to_tch_tensor, tch_to_pytorch_tensor};
-use env_logger;
 
 const DEFAULT_THREAD_NUM: usize = 16;
 

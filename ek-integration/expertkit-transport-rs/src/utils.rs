@@ -116,7 +116,11 @@ pub fn serialize_tch_tensor_2_safetensor(tensor: &Tensor) -> Result<Vec<u8>> {
     let result = safetensors::serialize(views, &None)
         .map_err(|e| anyhow::anyhow!("Failed to serialize tensor: {}", e))?;
     let serialize_elapsed = serialize_start.elapsed();
-    debug!("[Serialize] 📦 Safetensors: {:?} ({} bytes)", serialize_elapsed, result.len());
+    debug!(
+        "[Serialize] 📦 Safetensors: {:?} ({} bytes)",
+        serialize_elapsed,
+        result.len()
+    );
 
     Ok(result)
 }
@@ -144,7 +148,9 @@ pub struct TensorMetadata {
     pub shape: Vec<i64>,
     pub tch_kind: tch::Kind,
     pub device_str: String,
+    #[allow(unused)]
     pub target_device: tch::Device,
+    #[allow(unused)]
     pub requires_grad: bool,
 }
 

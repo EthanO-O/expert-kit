@@ -20,7 +20,6 @@ use crate::{
 use super::{
     dispatcher::{DISPATCHER, Dispatcher},
     routing_broadcaster::RoutingBroadcaster,
-    scheduler::WorkerScheduler,
 };
 
 #[async_trait]
@@ -30,7 +29,6 @@ pub trait StatePoller {
 
 pub struct StatePollerImpl {
     broadcaster: Arc<RoutingBroadcaster>,
-    scheduler: Arc<WorkerScheduler>,
 }
 
 #[async_trait]
@@ -50,10 +48,9 @@ impl StatePoller for StatePollerImpl {
 }
 
 impl StatePollerImpl {
-    pub fn new(broadcaster: Arc<RoutingBroadcaster>, scheduler: Arc<WorkerScheduler>) -> Self {
+    pub fn new(broadcaster: Arc<RoutingBroadcaster>) -> Self {
         StatePollerImpl {
             broadcaster,
-            scheduler,
         }
     }
 
@@ -173,8 +170,8 @@ impl StatePollerImpl {
     }
 }
 
-pub fn start_poll(broadcaster: Arc<RoutingBroadcaster>, scheduler: Arc<WorkerScheduler>) {
-    let mut poller = StatePollerImpl::new(broadcaster, scheduler);
+pub fn start_poll(broadcaster: Arc<RoutingBroadcaster>) {
+    let mut poller = StatePollerImpl::new(broadcaster);
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
             log::error!("state poller error {e}");

@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
 // Include generated proto code
+#[allow(unused)]
 pub mod proto {
     pub mod ek {
         pub mod object {

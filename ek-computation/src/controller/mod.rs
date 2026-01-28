@@ -36,14 +36,13 @@ pub async fn controller_main() -> EKResult<()> {
     let broadcaster = Arc::new(routing_broadcaster::RoutingBroadcaster::new(1000));
     let load_tracker = Arc::new(load_tracker::LoadTracker::new());
     let state_reader = Arc::new(StateReaderImpl::new());
-    let scheduler = Arc::new(scheduler::WorkerScheduler::new(
+    let _scheduler = Arc::new(scheduler::WorkerScheduler::new(
         state_reader,
         load_tracker.clone(),
     ));
 
     // Clone for use in computation server
     let broadcaster_clone = broadcaster.clone();
-    let scheduler_clone = scheduler.clone();
 
     let state_srv = tokio::task::spawn(async {
         let srv = controller::service::state::StateServerImpl::new();
@@ -79,7 +78,7 @@ pub async fn controller_main() -> EKResult<()> {
         log::info!("computation server listening on {inter_addr}");
         let plan_srv = PlanServiceImpl::new();
         let routing_srv =
-            controller::service::routing::RoutingServiceImpl::new(broadcaster_clone, scheduler_clone);
+            controller::service::routing::RoutingServiceImpl::new(broadcaster_clone);
         let err = tonic::transport::Server::builder()
             // .layer(layer)
             .add_service(
@@ -96,7 +95,7 @@ pub async fn controller_main() -> EKResult<()> {
         }
     });
 
-    start_poll(broadcaster, scheduler);
+    start_poll(broadcaster);
 
     log::info!("expert kit controller started");
     state_srv.await?;

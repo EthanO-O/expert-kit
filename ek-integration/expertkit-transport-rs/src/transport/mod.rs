@@ -12,6 +12,7 @@ pub mod rdma;
 pub use grpc::proto::ek::control::v1::WorkerEndpoint;
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub enum TransportType {
     Grpc,
     SharedMemory,
@@ -39,6 +40,7 @@ impl ExpertRequest {
 
 #[derive(Debug, Clone)]
 pub struct ExpertResponse {
+    #[allow(unused)]
     pub expert_id: String,
     pub tensor_data: Vec<u8>, // Safetensors blob with output sequences
 }
@@ -54,10 +56,10 @@ pub trait Transport: Send + Sync {
     ) -> Result<Vec<ExpertResponse>>;
 
     /// Get transport type
-    #[allow(dead_code)]
+    #[allow(unused)]
     fn transport_type(&self) -> TransportType;
 
     /// Check if transport is available for endpoint
-    #[allow(dead_code)]
+    #[allow(unused)]
     async fn is_available(&self, endpoint: &WorkerEndpoint) -> bool;
 }

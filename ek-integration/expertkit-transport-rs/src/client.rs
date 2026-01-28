@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::routing::RoutingClient;
-use crate::transport::{ExpertRequest, ExpertResponse, Transport, auto::AutoTransport};
+use crate::transport::{ExpertRequest, Transport, auto::AutoTransport};
 use crate::utils::{deserialize_safetensor_2_tch_tensor, serialize_tch_tensor_2_safetensor};
 
 use tch::Tensor;

@@ -5,7 +5,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Result, Status};
 
 use crate::{
-    controller::{routing_broadcaster::RoutingBroadcaster, scheduler::WorkerScheduler},
+    controller::routing_broadcaster::RoutingBroadcaster,
     proto::ek::control::v1::{
         GetRoutingReq, GetRoutingResp, RoutingUpdate, SubscribeRoutingReq,
         routing_service_server::RoutingService,
@@ -16,14 +16,12 @@ use crate::{
 /// This service provides routing information to frontends for direct worker communication
 pub struct RoutingServiceImpl {
     broadcaster: Arc<RoutingBroadcaster>,
-    scheduler: Arc<WorkerScheduler>,
 }
 
 impl RoutingServiceImpl {
-    pub fn new(broadcaster: Arc<RoutingBroadcaster>, scheduler: Arc<WorkerScheduler>) -> Self {
+    pub fn new(broadcaster: Arc<RoutingBroadcaster>) -> Self {
         Self {
             broadcaster,
-            scheduler,
         }
     }
 
@@ -34,21 +32,6 @@ impl RoutingServiceImpl {
         INSTANCE
             .get_or_init(|| Arc::new(RoutingBroadcaster::new(1000)))
             .clone()
-    }
-
-    /// Get global scheduler instance (singleton pattern)
-    /// This will be initialized in controller_main
-    pub fn get_scheduler() -> Option<Arc<WorkerScheduler>> {
-        static INSTANCE: std::sync::OnceLock<Option<Arc<WorkerScheduler>>> =
-            std::sync::OnceLock::new();
-        INSTANCE.get_or_init(|| None).clone()
-    }
-
-    /// Initialize global scheduler (called from controller_main)
-    pub fn init_scheduler(scheduler: Arc<WorkerScheduler>) {
-        static INSTANCE: std::sync::OnceLock<Option<Arc<WorkerScheduler>>> =
-            std::sync::OnceLock::new();
-        let _ = INSTANCE.set(Some(scheduler));
     }
 }
 
