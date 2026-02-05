@@ -25,7 +25,7 @@ dependencies = [
     "safetensors>=0.5.3",
     "sympy>=1.14.0",
     "torch==2.7.0",
-    "transformers[cu128]>=4.51.3",
+    "transformers[cu128]>=4.54.0",
     "uvloop>=0.21.0",
 ]
 
