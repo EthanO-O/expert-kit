@@ -21,7 +21,7 @@ set_verbosity_error()
 
 # default timeout interval for ek client, in seconds
 DEFAULT_TIMEOUT_INTVAL = 100
-layer_idx = 0
+layer_idx = None
 
 # The default device should be set according to the environment.
 if torch.cuda.is_available():
@@ -67,13 +67,17 @@ def intercept_moe(
         def __init__(self, config):
             super().__init__()
             global layer_idx
+            # Auto-detect first_k_dense_replace from config on first instantiation
+            if layer_idx is None:
+                layer_idx = getattr(config, "first_k_dense_replace", 0)
             self.layer_id = layer_idx
             layer_idx += 1
             self.config = config
             self.num_experts = config.n_routed_experts
             self.top_k = config.num_experts_per_tok
             self.norm_topk_prob = config.norm_topk_prob
-            self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+            self.routed_scaling_factor = getattr(
+                config, "routed_scaling_factor", 1.0)
             self.topk_method = getattr(config, "topk_method", "greedy")
             self.n_group = getattr(config, "n_group", 1)
             self.topk_group = getattr(config, "topk_group", 1)
@@ -110,7 +114,8 @@ def intercept_moe(
             """
             V2 gating: softmax scoring with greedy or group_limited_greedy routing.
             """
-            router_logits = self.gate(hidden_states.view(-1, hidden_states.shape[-1]))
+            router_logits = self.gate(
+                hidden_states.view(-1, hidden_states.shape[-1]))
             scores = F.softmax(router_logits, dim=1, dtype=torch.float)
 
             if self.topk_method == "greedy":
@@ -120,7 +125,8 @@ def intercept_moe(
             elif self.topk_method == "group_limited_greedy":
                 # Group experts and select top groups first
                 group_scores = (
-                    scores.view(-1, self.n_group, self.num_experts // self.n_group)
+                    scores.view(-1, self.n_group,
+                                self.num_experts // self.n_group)
                     .max(dim=-1)[0]
                 )
                 group_idx = torch.topk(
@@ -173,7 +179,8 @@ def intercept_moe(
             outputs = self.client.forward_expert(
                 expert_ids=expert_ids, hidden_state=hidden_states
             )
-            outputs = outputs.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            outputs = outputs.to(device=hidden_states.device,
+                                 dtype=hidden_states.dtype)
             expanded_weights = topk_weights.unsqueeze(-1)
             output = torch.sum(expanded_weights * outputs, dim=1)
 
@@ -205,11 +212,14 @@ def intercept_moe(
                 token_indices, weight_indices = torch.where(mask)
 
                 if token_indices.numel() > 0:
-                    expert_weights = topk_weights[token_indices, weight_indices]
+                    expert_weights = topk_weights[token_indices,
+                                                  weight_indices]
                     expert_input = hidden_states[token_indices]
                     expert_output = expert(expert_input)
-                    weighted_output = expert_output * expert_weights.unsqueeze(-1)
-                    final_hidden_states.index_add_(0, token_indices, weighted_output)
+                    weighted_output = expert_output * \
+                        expert_weights.unsqueeze(-1)
+                    final_hidden_states.index_add_(
+                        0, token_indices, weighted_output)
 
             return final_hidden_states.type(hidden_states.dtype)
 
@@ -282,12 +292,14 @@ def evaluate_batch(
             pretrained_model_name_or_path=model_path,
         )
     if model is None:
-        model_config = ds_v2_config.DeepseekV2Config.from_pretrained(model_path)
+        model_config = ds_v2_config.DeepseekV2Config.from_pretrained(
+            model_path)
         model = ds_v2.DeepseekV2ForCausalLM.from_pretrained(
             model_path,
             config=model_config,
             local_files_only=True,
             device_map=device,
+            torch_dtype=torch.bfloat16 if device == "cuda" else "auto"
         )
 
     # Initialize profiler manager with context manager

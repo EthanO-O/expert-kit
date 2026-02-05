@@ -56,7 +56,9 @@ impl ModelConfig {
 
     pub fn routed_experts(&self) -> Option<usize> {
         match self.model_type() {
-            "deepseek_v2" | "deepseek_v3" => Some(self.map.get("n_routed_experts")?.as_u64()? as usize),
+            "deepseek_v2" | "deepseek_v3" => {
+                Some(self.map.get("n_routed_experts")?.as_u64()? as usize)
+            }
             "qwen3_moe" => Some(self.map.get("num_experts")?.as_u64()? as usize),
             "mixtral" => Some(self.map.get("num_local_experts")?.as_u64()? as usize),
             _ => {
@@ -266,9 +268,9 @@ where
                 let key_gate =
                     format!("model.layers.{layer_id}.mlp.experts.{expert_id}.down_proj.weight");
                 let key_gate_scale = format!("{key_gate}_scale_inv");
+
                 let key_down =
                     format!("model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight");
-
                 let key_down_scale = format!("{key_down}_scale_inv");
 
                 Ok(vec![
