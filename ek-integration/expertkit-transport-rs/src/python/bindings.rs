@@ -81,7 +81,7 @@ impl PyExpertKitClient {
         // Extract tensor metadata from Python
         let metadata = TensorMetadata::from_pytorch(hidden_state)?;
 
-        eprintln!(
+        log::debug!(
             "[PyBinding-Time] 🚗 Runtime get and extracted tensor metadata in {:?} μs",
             t.elapsed().as_micros()
         );
@@ -89,7 +89,7 @@ impl PyExpertKitClient {
         // Convert PyTorch tensor to tch::Tensor
         let t = std::time::Instant::now();
         let input_tensor = pytorch_to_tch_tensor(hidden_state, &metadata)?;
-        eprintln!(
+        log::debug!(
             "[PyBinding-Time] 🚗 Converted PyTorch tensor to tch::Tensor in {:?} μs",
             t.elapsed().as_micros()
         );
@@ -101,7 +101,7 @@ impl PyExpertKitClient {
                 .block_on(async { client.forward_expert_tensor(expert_ids, input_tensor).await })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })?;
-        eprintln!(
+        log::debug!(
             "[PyBinding-Time] 🚗 Processed tensor in {:?} μs",
             t.elapsed().as_micros()
         );
@@ -109,7 +109,7 @@ impl PyExpertKitClient {
         // Convert tch::Tensor back to PyTorch tensor
         let t = std::time::Instant::now();
         let final_tensor = tch_to_pytorch_tensor(py, &output_tensor, &metadata.device_str)?;
-        eprintln!(
+        log::debug!(
             "[PyBinding-Time] 🚗 Converted tch::Tensor back to PyTorch tensor in {:?} μs",
             t.elapsed().as_micros()
         );
