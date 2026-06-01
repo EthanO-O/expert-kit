@@ -67,6 +67,9 @@ fn maybe_route_expert_bytes_through_rsm<'a>(
     expert_str_key: &str,
     bytes: &'a [u8],
 ) -> EKResult<Cow<'a, [u8]>> {
+    #[cfg(not(feature = "rsm-integration"))]
+    let _ = expert_str_key;
+
     #[cfg(feature = "rsm-integration")]
     {
         if rsm_host_mode_enabled() {
