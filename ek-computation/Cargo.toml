@@ -45,7 +45,11 @@ tonic = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+rsm-expert-kit = { path = "../../runtime-state-manager/crates/rsm-expert-kit", optional = true }
 url = { workspace = true }
+
+[features]
+rsm-integration = ["dep:rsm-expert-kit"]
 
 [build-dependencies]
 tonic-build = { workspace = true }

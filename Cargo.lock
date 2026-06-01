@@ -1501,6 +1501,7 @@ dependencies = [
  "prost 0.13.5",
  "rand 0.9.2",
  "rand_distr 0.5.1",
+ "rsm-expert-kit",
  "safetensors 0.5.3",
  "serde",
  "serde_arrays",
@@ -4696,6 +4697,67 @@ dependencies = [
  "bitflags 2.9.1",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "rsm-access"
+version = "0.1.0"
+dependencies = [
+ "rsm-catalog",
+ "rsm-core",
+ "rsm-dsm",
+ "rsm-observe",
+ "rsm-policy",
+ "rsm-topology",
+]
+
+[[package]]
+name = "rsm-catalog"
+version = "0.1.0"
+dependencies = [
+ "rsm-core",
+]
+
+[[package]]
+name = "rsm-core"
+version = "0.1.0"
+
+[[package]]
+name = "rsm-dsm"
+version = "0.1.0"
+dependencies = [
+ "rsm-core",
+]
+
+[[package]]
+name = "rsm-expert-kit"
+version = "0.1.0"
+dependencies = [
+ "rsm-access",
+ "rsm-core",
+ "rsm-observe",
+]
+
+[[package]]
+name = "rsm-observe"
+version = "0.1.0"
+dependencies = [
+ "rsm-core",
+]
+
+[[package]]
+name = "rsm-policy"
+version = "0.1.0"
+dependencies = [
+ "rsm-core",
+ "rsm-topology",
+]
+
+[[package]]
+name = "rsm-topology"
+version = "0.1.0"
+dependencies = [
+ "rsm-core",
 ]
 
 [[package]]
