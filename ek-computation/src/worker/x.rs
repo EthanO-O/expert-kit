@@ -94,6 +94,29 @@ fn route_expert_bytes_through_rsm(expert_str_key: &str, bytes: &[u8]) -> EKResul
                 "RSM Expert-Kit host load failed for {expert_str_key}: {err}"
             ))
         })?;
+    if let Ok(path) = std::env::var("EK_RSM_EVENT_LOG") {
+        rsm_expert_kit::append_events_jsonl(&path, &load.events).map_err(|err| {
+            ek_base::error::EKError::RuntimeError(format!(
+                "failed to append RSM Expert-Kit events to {path}: {err}"
+            ))
+        })?;
+    }
+    let acquire_line = format!(
+        "[rsm] acquire object={} tier={:?} path={:?} lease={} events={}",
+        load.object_id,
+        load.selected_tier,
+        load.access_path,
+        load.lease_id.0,
+        load.events.len()
+    );
+    let release_line = format!(
+        "[rsm] release lease={} released={}",
+        load.lease_id.0, load.lease_released
+    );
+    println!("{acquire_line}");
+    println!("{release_line}");
+    log::info!("{acquire_line}");
+    log::info!("{release_line}");
     log::info!(
         "loaded expert bytes through RSM host bridge expert={} object_id={} access_path={:?} events={}",
         expert_str_key,

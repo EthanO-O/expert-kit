@@ -15,6 +15,7 @@ use tokio::select;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 mod manager;
+pub use manager::get_expert_db;
 pub mod server;
 pub mod state;
 pub mod x;

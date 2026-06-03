@@ -63,3 +63,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [[bench]]
 name = "main"
 harness = false
+[[bin]]
+name = "rsm_load_smoke"
+path = "src/bin/rsm_load_smoke.rs"
+required-features = ["rsm-integration"]
+
