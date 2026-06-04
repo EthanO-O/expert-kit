@@ -87,19 +87,19 @@ impl WeightManager<'_> {
     ) -> EKResult<Vec<u8>> {
         let key = format!("{}/l{}-e{}", model, layer, eid);
 
-        if let (Some(idx), Some(cache_dir)) = (self.indices.get(model), &self.cache_dir) {
-            if idx.entries.get(&key).map(|e| e.cached).unwrap_or(false) {
-                let blob_path = cache_dir.join(model).join(format!("l{}-e{}", layer, eid));
-                match tokio::fs::read(&blob_path).await {
-                    Ok(bytes) => return Ok(bytes),
-                    Err(e) => {
-                        log::warn!(
-                            "index says {} is cached at {} but read failed: {}, falling back",
-                            key,
-                            blob_path.display(),
-                            e
-                        );
-                    }
+        if let (Some(idx), Some(cache_dir)) = (self.indices.get(model), &self.cache_dir)
+            && idx.entries.get(&key).map(|e| e.cached).unwrap_or(false)
+        {
+            let blob_path = cache_dir.join(model).join(format!("l{}-e{}", layer, eid));
+            match tokio::fs::read(&blob_path).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    log::warn!(
+                        "index says {} is cached at {} but read failed: {}, falling back",
+                        key,
+                        blob_path.display(),
+                        e
+                    );
                 }
             }
         }

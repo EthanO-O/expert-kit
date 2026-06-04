@@ -43,6 +43,7 @@ impl SmokeMode {
 struct Options {
     mode: SmokeMode,
     event_log: Option<PathBuf>,
+    stage_log: Option<PathBuf>,
     out_dir: PathBuf,
     cache_dir: PathBuf,
 }
@@ -53,7 +54,9 @@ struct SmokeOutcome {
     expert_key: String,
     cache_dir: PathBuf,
     event_log: Option<PathBuf>,
+    stage_log: Option<PathBuf>,
     new_event_count: usize,
+    new_stage_rows: usize,
     loaded_count: usize,
     elapsed_ms: u128,
     report_path: PathBuf,
@@ -74,15 +77,21 @@ async fn main() -> EKResult<()> {
         } else {
             std::env::remove_var("EK_RSM_EVENT_LOG");
         }
+        if let Some(stage_log) = options.stage_log.as_ref() {
+            std::env::set_var("EK_RSM_STAGE_LOG", stage_log);
+        } else {
+            std::env::remove_var("EK_RSM_STAGE_LOG");
+        }
     }
 
     let outcome = run_smoke(options).await?;
     println!(
-        "[expert-loader] loaded {} mode={} loaded_count={} new_rsm_events={} elapsed_ms={}",
+        "[expert-loader] loaded {} mode={} loaded_count={} new_rsm_events={} new_stage_rows={} elapsed_ms={}",
         outcome.expert_key,
         outcome.mode.as_str(),
         outcome.loaded_count,
         outcome.new_event_count,
+        outcome.new_stage_rows,
         outcome.elapsed_ms
     );
     println!(
@@ -119,6 +128,12 @@ async fn run_smoke(options: Options) -> EKResult<SmokeOutcome> {
         .map(|path| count_lines(path))
         .transpose()?
         .unwrap_or(0);
+    let stage_count_before = options
+        .stage_log
+        .as_ref()
+        .map(|path| count_data_rows(path))
+        .transpose()?
+        .unwrap_or(0);
 
     let wm = make_weight_manager(&options.cache_dir);
     let expert_db = get_expert_db();
@@ -144,6 +159,13 @@ async fn run_smoke(options: Options) -> EKResult<SmokeOutcome> {
         .transpose()?
         .unwrap_or(0);
     let new_event_count = event_count_after.saturating_sub(event_count_before);
+    let stage_count_after = options
+        .stage_log
+        .as_ref()
+        .map(|path| count_data_rows(path))
+        .transpose()?
+        .unwrap_or(0);
+    let new_stage_rows = stage_count_after.saturating_sub(stage_count_before);
 
     if options.mode == SmokeMode::RsmHost {
         println!(
@@ -163,7 +185,9 @@ async fn run_smoke(options: Options) -> EKResult<SmokeOutcome> {
         expert_key: expert_object_key,
         cache_dir: options.cache_dir,
         event_log: options.event_log,
+        stage_log: options.stage_log,
         new_event_count,
+        new_stage_rows,
         loaded_count,
         elapsed_ms,
         report_path,
@@ -181,6 +205,7 @@ fn init_logger() {
 fn parse_options() -> EKResult<Options> {
     let mut mode = SmokeMode::Baseline;
     let mut event_log = None;
+    let mut stage_log = None;
     let mut out_dir = PathBuf::from("target/rsm-load-smoke");
     let mut cache_dir = None;
 
@@ -198,6 +223,12 @@ fn parse_options() -> EKResult<Options> {
                     EKError::InvalidInput("missing value after --event-log".to_string())
                 })?;
                 event_log = Some(PathBuf::from(value));
+            }
+            "--stage-log" => {
+                let value = args.next().ok_or_else(|| {
+                    EKError::InvalidInput("missing value after --stage-log".to_string())
+                })?;
+                stage_log = Some(PathBuf::from(value));
             }
             "--out" => {
                 let value = args.next().ok_or_else(|| {
@@ -232,6 +263,7 @@ fn parse_options() -> EKResult<Options> {
     Ok(Options {
         mode,
         event_log,
+        stage_log,
         out_dir,
         cache_dir,
     })
@@ -250,6 +282,7 @@ fn parse_mode(value: &str) -> EKResult<SmokeMode> {
 fn print_help() {
     println!(
         "Usage: rsm_load_smoke --mode baseline|rsm-host [--event-log PATH] [--out DIR] [--cache-dir DIR]\n\
+         [--stage-log PATH]\n\
          Seeds a tiny SafeTensors expert into LocalWeightManager FS cache and calls real Expert-Kit load_expert_task."
     );
 }
@@ -306,6 +339,10 @@ fn count_lines(path: &Path) -> std::io::Result<usize> {
     }
 }
 
+fn count_data_rows(path: &Path) -> std::io::Result<usize> {
+    Ok(count_lines(path)?.saturating_sub(1))
+}
+
 fn smoke_report_markdown(outcome: &SmokeOutcome) -> String {
     format!(
         "# Real Expert-Kit load_expert_task Smoke Report\n\n\
@@ -316,7 +353,9 @@ fn smoke_report_markdown(outcome: &SmokeOutcome) -> String {
          - ExpertBackend build succeeded: `true`\n\
          - Loaded ExpertDB entries: `{}`\n\
          - New RSM events: `{}`\n\
+         - New stage timing rows: `{}`\n\
          - Event log: `{}`\n\
+         - Stage timing CSV: `{}`\n\
          - Cache dir: `{}`\n\
          - Elapsed ms: `{}`\n\n\
          Evidence boundary: this smoke proves the local Expert-Kit loading seam and RSM event export. It does not claim production multi-node performance, full forward-path integration, RDMA/Mooncake transport, or real DeviceHBM hardware validation.\n",
@@ -324,8 +363,14 @@ fn smoke_report_markdown(outcome: &SmokeOutcome) -> String {
         outcome.expert_key,
         outcome.loaded_count,
         outcome.new_event_count,
+        outcome.new_stage_rows,
         outcome
             .event_log
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unset>".to_string()),
+        outcome
+            .stage_log
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unset>".to_string()),

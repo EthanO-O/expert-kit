@@ -1,6 +1,8 @@
 use tonic::transport::Endpoint;
 
-use std::{borrow::Cow, str::FromStr, sync::Arc};
+use std::{
+    borrow::Cow, fs, fs::OpenOptions, io::Write, path::Path, str::FromStr, sync::Arc, time::Instant,
+};
 
 #[cfg(feature = "rsm-integration")]
 use std::sync::{Mutex, OnceLock};
@@ -29,21 +31,83 @@ pub async fn load_expert_task(
     expert_key: &ExpertKey,
 ) -> EKResult<()> {
     let expert_str_key = expert_key.as_object_key();
+    let total_started = Instant::now();
 
     // Mark expert as loading in shared database
+    let mark_started = Instant::now();
     {
         let mut wg = expert_db.write().await;
-        wg.mark_loading(&expert_str_key)?;
+        let result = wg.mark_loading(&expert_str_key);
+        record_stage_timing(
+            &expert_str_key,
+            "mark_loading",
+            mark_started.elapsed(),
+            0,
+            0,
+            0,
+            result.is_ok(),
+        )?;
+        result?;
     }
 
     // Fetch bytes and build backend within a scoped block so that
     // `bytes` (and thus `st`) are dropped before we take the expert_db write lock.
     // On any error, unmark_loading so the expert can be retried on the next update.
     let backend = match async {
+        let get_started = Instant::now();
         let bytes = weight_manager.get_expert(expert_key).await?;
-        let bytes = maybe_route_expert_bytes_through_rsm(&expert_str_key, bytes.as_ref())?;
-        let st = safetensors::SafeTensors::deserialize(bytes.as_ref())?;
-        ExpertBackend::build(instance, &st).await
+        let weight_bytes = bytes.len();
+        record_stage_timing(
+            &expert_str_key,
+            "local_weight_manager_get_expert",
+            get_started.elapsed(),
+            0,
+            weight_bytes,
+            0,
+            true,
+        )?;
+
+        let route_started = Instant::now();
+        let routed = maybe_route_expert_bytes_through_rsm(&expert_str_key, bytes.as_ref())?;
+        let route_stage = if routed.rsm_event_count > 0 {
+            "rsm_acquire_release"
+        } else {
+            "rsm_bypass"
+        };
+        record_stage_timing(
+            &expert_str_key,
+            route_stage,
+            route_started.elapsed(),
+            weight_bytes,
+            routed.bytes.len(),
+            routed.rsm_event_count,
+            true,
+        )?;
+
+        let deserialize_started = Instant::now();
+        let st = safetensors::SafeTensors::deserialize(routed.bytes.as_ref())?;
+        record_stage_timing(
+            &expert_str_key,
+            "safetensors_deserialize",
+            deserialize_started.elapsed(),
+            routed.bytes.len(),
+            0,
+            routed.rsm_event_count,
+            true,
+        )?;
+
+        let build_started = Instant::now();
+        let backend = ExpertBackend::build(instance, &st).await?;
+        record_stage_timing(
+            &expert_str_key,
+            "expert_backend_build",
+            build_started.elapsed(),
+            routed.bytes.len(),
+            0,
+            routed.rsm_event_count,
+            true,
+        )?;
+        Ok(backend)
         // `bytes` and `st` are dropped here
     }
     .await
@@ -58,29 +122,68 @@ pub async fn load_expert_task(
 
     // Insert loaded expert into shared database
     let mut edb_wg = expert_db.write().await;
-    edb_wg.insert(&expert_str_key, backend).await?;
+    let insert_started = Instant::now();
+    let result = edb_wg.insert(&expert_str_key, backend).await;
+    record_stage_timing(
+        &expert_str_key,
+        "expert_db_insert",
+        insert_started.elapsed(),
+        0,
+        0,
+        0,
+        result.is_ok(),
+    )?;
+    result?;
+
+    record_stage_timing(
+        &expert_str_key,
+        "load_expert_task_total",
+        total_started.elapsed(),
+        0,
+        0,
+        0,
+        true,
+    )?;
 
     Ok(())
+}
+
+struct RoutedExpertBytes<'a> {
+    bytes: Cow<'a, [u8]>,
+    rsm_event_count: usize,
 }
 
 fn maybe_route_expert_bytes_through_rsm<'a>(
     expert_str_key: &str,
     bytes: &'a [u8],
-) -> EKResult<Cow<'a, [u8]>> {
+) -> EKResult<RoutedExpertBytes<'a>> {
     #[cfg(not(feature = "rsm-integration"))]
     let _ = expert_str_key;
 
     #[cfg(feature = "rsm-integration")]
     {
         if rsm_host_mode_enabled() {
-            return route_expert_bytes_through_rsm(expert_str_key, bytes).map(Cow::Owned);
+            let routed = route_expert_bytes_through_rsm(expert_str_key, bytes)?;
+            return Ok(RoutedExpertBytes {
+                bytes: Cow::Owned(routed.bytes),
+                rsm_event_count: routed.rsm_event_count,
+            });
         }
     }
-    Ok(Cow::Borrowed(bytes))
+    Ok(RoutedExpertBytes {
+        bytes: Cow::Borrowed(bytes),
+        rsm_event_count: 0,
+    })
 }
 
 #[cfg(feature = "rsm-integration")]
-fn route_expert_bytes_through_rsm(expert_str_key: &str, bytes: &[u8]) -> EKResult<Vec<u8>> {
+struct RsmRoutedBytes {
+    bytes: Vec<u8>,
+    rsm_event_count: usize,
+}
+
+#[cfg(feature = "rsm-integration")]
+fn route_expert_bytes_through_rsm(expert_str_key: &str, bytes: &[u8]) -> EKResult<RsmRoutedBytes> {
     let bridge = get_rsm_bridge();
     let mut bridge = bridge.lock().map_err(|err| {
         ek_base::error::EKError::RuntimeError(format!(
@@ -124,7 +227,58 @@ fn route_expert_bytes_through_rsm(expert_str_key: &str, bytes: &[u8]) -> EKResul
         load.access_path,
         load.events.len()
     );
-    Ok(load.returned_bytes)
+    Ok(RsmRoutedBytes {
+        bytes: load.returned_bytes,
+        rsm_event_count: load.events.len(),
+    })
+}
+
+fn record_stage_timing(
+    expert_str_key: &str,
+    stage: &str,
+    elapsed: std::time::Duration,
+    input_bytes: usize,
+    output_bytes: usize,
+    rsm_event_count: usize,
+    success: bool,
+) -> EKResult<()> {
+    let Ok(path) = std::env::var("EK_RSM_STAGE_LOG") else {
+        return Ok(());
+    };
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let needs_header = fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_header {
+        writeln!(
+            file,
+            "schema_version,mode,expert_key,stage,elapsed_ns,input_bytes,output_bytes,rsm_event_count,success"
+        )?;
+    }
+    let mode = std::env::var("EK_RSM_WEIGHT_MODE").unwrap_or_else(|_| "off".to_string());
+    writeln!(
+        file,
+        "1,{},{},{},{},{},{},{},{}",
+        csv_field(&mode),
+        csv_field(expert_str_key),
+        csv_field(stage),
+        elapsed.as_nanos(),
+        input_bytes,
+        output_bytes,
+        rsm_event_count,
+        success
+    )?;
+    Ok(())
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 #[cfg(feature = "rsm-integration")]
