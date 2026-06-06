@@ -46,6 +46,9 @@ struct Options {
     stage_log: Option<PathBuf>,
     out_dir: PathBuf,
     cache_dir: PathBuf,
+    repeat: usize,
+    hidden: usize,
+    intermediate: usize,
 }
 
 #[derive(Debug)]
@@ -58,7 +61,13 @@ struct SmokeOutcome {
     new_event_count: usize,
     new_stage_rows: usize,
     loaded_count: usize,
-    elapsed_ms: u128,
+    repeat: usize,
+    hidden: usize,
+    intermediate: usize,
+    weight_bytes: usize,
+    total_elapsed_ms: u128,
+    median_elapsed_us: u128,
+    p95_elapsed_us: u128,
     report_path: PathBuf,
 }
 
@@ -92,7 +101,7 @@ async fn main() -> EKResult<()> {
         outcome.loaded_count,
         outcome.new_event_count,
         outcome.new_stage_rows,
-        outcome.elapsed_ms
+        outcome.total_elapsed_ms
     );
     println!(
         "[expert-loader] report written to {}",
@@ -107,7 +116,7 @@ async fn run_smoke(options: Options) -> EKResult<SmokeOutcome> {
 
     let expert_key = ExpertKey::new("toy-moe".to_string(), 0, 1);
     let expert_object_key = expert_key.as_object_key();
-    let weight_bytes = tiny_expert_safetensors(4, 3)?;
+    let weight_bytes = tiny_expert_safetensors(options.hidden, options.intermediate)?;
     seed_cache(&options.cache_dir, &expert_key, &weight_bytes).await?;
 
     println!(
@@ -138,15 +147,20 @@ async fn run_smoke(options: Options) -> EKResult<SmokeOutcome> {
     let wm = make_weight_manager(&options.cache_dir);
     let expert_db = get_expert_db();
     let instance = EKInstance {
-        hidden: 4,
-        intermediate: 3,
+        hidden: options.hidden,
+        intermediate: options.intermediate,
         backend: ExpertBackendType::Ggml,
         device: Device::CPU,
     };
 
-    let started = Instant::now();
-    load_expert_task(wm, expert_db.clone(), instance, &expert_key).await?;
-    let elapsed_ms = started.elapsed().as_millis();
+    let total_started = Instant::now();
+    let mut per_run_elapsed_us = Vec::with_capacity(options.repeat);
+    for _ in 0..options.repeat {
+        let started = Instant::now();
+        load_expert_task(wm.clone(), expert_db.clone(), instance, &expert_key).await?;
+        per_run_elapsed_us.push(started.elapsed().as_micros());
+    }
+    let total_elapsed_ms = total_started.elapsed().as_millis();
 
     let loaded_count = {
         let guard = expert_db.read().await;
@@ -189,7 +203,13 @@ async fn run_smoke(options: Options) -> EKResult<SmokeOutcome> {
         new_event_count,
         new_stage_rows,
         loaded_count,
-        elapsed_ms,
+        repeat: options.repeat,
+        hidden: options.hidden,
+        intermediate: options.intermediate,
+        weight_bytes: weight_bytes.len(),
+        total_elapsed_ms,
+        median_elapsed_us: percentile(&per_run_elapsed_us, 50),
+        p95_elapsed_us: percentile(&per_run_elapsed_us, 95),
         report_path,
     };
     fs::write(&outcome.report_path, smoke_report_markdown(&outcome))?;
@@ -208,6 +228,9 @@ fn parse_options() -> EKResult<Options> {
     let mut stage_log = None;
     let mut out_dir = PathBuf::from("target/rsm-load-smoke");
     let mut cache_dir = None;
+    let mut repeat = 1usize;
+    let mut hidden = 4usize;
+    let mut intermediate = 3usize;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -242,6 +265,35 @@ fn parse_options() -> EKResult<Options> {
                 })?;
                 cache_dir = Some(PathBuf::from(value));
             }
+            "--repeat" => {
+                let value = args.next().ok_or_else(|| {
+                    EKError::InvalidInput("missing value after --repeat".to_string())
+                })?;
+                repeat = value.parse()?;
+                if repeat == 0 {
+                    return Err(EKError::InvalidInput("--repeat must be > 0".to_string()));
+                }
+            }
+            "--hidden" => {
+                let value = args.next().ok_or_else(|| {
+                    EKError::InvalidInput("missing value after --hidden".to_string())
+                })?;
+                hidden = value.parse()?;
+                if hidden == 0 {
+                    return Err(EKError::InvalidInput("--hidden must be > 0".to_string()));
+                }
+            }
+            "--intermediate" => {
+                let value = args.next().ok_or_else(|| {
+                    EKError::InvalidInput("missing value after --intermediate".to_string())
+                })?;
+                intermediate = value.parse()?;
+                if intermediate == 0 {
+                    return Err(EKError::InvalidInput(
+                        "--intermediate must be > 0".to_string(),
+                    ));
+                }
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -266,6 +318,9 @@ fn parse_options() -> EKResult<Options> {
         stage_log,
         out_dir,
         cache_dir,
+        repeat,
+        hidden,
+        intermediate,
     })
 }
 
@@ -282,7 +337,7 @@ fn parse_mode(value: &str) -> EKResult<SmokeMode> {
 fn print_help() {
     println!(
         "Usage: rsm_load_smoke --mode baseline|rsm-host [--event-log PATH] [--out DIR] [--cache-dir DIR]\n\
-         [--stage-log PATH]\n\
+         [--stage-log PATH] [--repeat N] [--hidden N] [--intermediate N]\n\
          Seeds a tiny SafeTensors expert into LocalWeightManager FS cache and calls real Expert-Kit load_expert_task."
     );
 }
@@ -343,6 +398,16 @@ fn count_data_rows(path: &Path) -> std::io::Result<usize> {
     Ok(count_lines(path)?.saturating_sub(1))
 }
 
+fn percentile(samples: &[u128], percentile: usize) -> u128 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[idx]
+}
+
 fn smoke_report_markdown(outcome: &SmokeOutcome) -> String {
     format!(
         "# Real Expert-Kit load_expert_task Smoke Report\n\n\
@@ -352,16 +417,26 @@ fn smoke_report_markdown(outcome: &SmokeOutcome) -> String {
          - load_expert_task invoked: `true`\n\
          - ExpertBackend build succeeded: `true`\n\
          - Loaded ExpertDB entries: `{}`\n\
+         - Repeat count: `{}`\n\
+         - Hidden size: `{}`\n\
+         - Intermediate size: `{}`\n\
+         - Weight bytes: `{}`\n\
          - New RSM events: `{}`\n\
          - New stage timing rows: `{}`\n\
          - Event log: `{}`\n\
          - Stage timing CSV: `{}`\n\
          - Cache dir: `{}`\n\
-         - Elapsed ms: `{}`\n\n\
+         - Total elapsed ms: `{}`\n\
+         - Median per-run elapsed us: `{}`\n\
+         - P95 per-run elapsed us: `{}`\n\n\
          Evidence boundary: this smoke proves the local Expert-Kit loading seam and RSM event export. It does not claim production multi-node performance, full forward-path integration, RDMA/Mooncake transport, or real DeviceHBM hardware validation.\n",
         outcome.mode.as_str(),
         outcome.expert_key,
         outcome.loaded_count,
+        outcome.repeat,
+        outcome.hidden,
+        outcome.intermediate,
+        outcome.weight_bytes,
         outcome.new_event_count,
         outcome.new_stage_rows,
         outcome
@@ -375,6 +450,8 @@ fn smoke_report_markdown(outcome: &SmokeOutcome) -> String {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unset>".to_string()),
         outcome.cache_dir.display(),
-        outcome.elapsed_ms
+        outcome.total_elapsed_ms,
+        outcome.median_elapsed_us,
+        outcome.p95_elapsed_us
     )
 }
