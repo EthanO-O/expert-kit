@@ -31,13 +31,20 @@ class SafeTensorDType(StrEnum):
     FP16 = "F16"
     BF16 = "BF16"
     FP32 = "F32"
+    INT8 = "I8"
+    INT32 = "I32"
+    INT64 = "I64"
 
     @property
     def element_bytes(self) -> int:
         """Return the fixed encoded element width."""
 
-        if self is SafeTensorDType.FP32:
+        if self is SafeTensorDType.FP32 or self is SafeTensorDType.INT32:
             return 4
+        if self is SafeTensorDType.INT64:
+            return 8
+        if self is SafeTensorDType.INT8:
+            return 1
         return 2
 
 

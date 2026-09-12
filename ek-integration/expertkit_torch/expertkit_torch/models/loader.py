@@ -75,7 +75,7 @@ class LoadedModel:
 
 
 def _qwen_layer_ids(config: Any) -> tuple[int, ...]:
-    mlp_only_layers = set(config.mlp_only_layers or ())
+    mlp_only_layers = set(getattr(config, "mlp_only_layers", None) or ())
     return tuple(
         layer_id
         for layer_id in range(config.num_hidden_layers)
@@ -102,6 +102,18 @@ def _adapter_spec(model_type: str) -> _AdapterSpec:
         return _AdapterSpec(
             modeling_qwen3_moe,
             "Qwen3MoeSparseMoeBlock",
+            _qwen_layer_ids,
+            lambda config: config.num_experts,
+            create_routed_moe_class,
+        )
+    if model_type == "qwen2_moe":
+        from transformers.models.qwen2_moe import modeling_qwen2_moe
+
+        from expertkit_torch.models.qwen2_moe import create_routed_moe_class
+
+        return _AdapterSpec(
+            modeling_qwen2_moe,
+            "Qwen2MoeSparseMoeBlock",
             _qwen_layer_ids,
             lambda config: config.num_experts,
             create_routed_moe_class,
@@ -143,7 +155,7 @@ def _adapter_spec(model_type: str) -> _AdapterSpec:
             create_routed_moe_class,
         )
     raise ValueError(
-        f"unsupported model_type {model_type!r}; expected qwen3_moe, "
+        f"unsupported model_type {model_type!r}; expected qwen2_moe, qwen3_moe, "
         "deepseek_v2, deepseek_v3, or mixtral"
     )
 

@@ -38,6 +38,29 @@ class ActivationDType(StrEnum):
     FP32 = "fp32"
 
 
+class QuantizationType(StrEnum):
+    """Weight quantization recipes implemented by the Torch Backend."""
+
+    GPTQ = "gptq"
+
+
+class QuantizationConfig(_StrictModel):
+    """Static quantization metadata required to decode stored expert weights."""
+
+    type: QuantizationType
+    bits: Literal[4] = 4
+    group_size: int = Field(default=128, gt=0)
+    symmetric: bool = True
+
+    @model_validator(mode="after")
+    def validate_supported_recipe(self) -> QuantizationConfig:
+        """Reject GPTQ variants whose zero-point semantics are not implemented."""
+
+        if not self.symmetric:
+            raise ValueError("the Torch GPTQ Backend currently requires symmetric weights")
+        return self
+
+
 class LogLevel(StrEnum):
     """Supported process log thresholds."""
 
@@ -109,6 +132,7 @@ class ModelConfig(_StrictModel):
     activation_dtype: ActivationDType
     weight_dtype: ActivationDType
     activation: Literal["silu"] = "silu"
+    quantization: QuantizationConfig | None = None
 
     @model_validator(mode="after")
     def validate_routing_shape(self) -> ModelConfig:

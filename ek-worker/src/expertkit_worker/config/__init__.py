@@ -7,6 +7,8 @@ from expertkit_worker.config.models import (
     GrpcTransportConfig,
     LogFormat,
     LogLevel,
+    QuantizationConfig,
+    QuantizationType,
     ShmTransportConfig,
     WorkerConfig,
 )
@@ -24,6 +26,8 @@ __all__ = [
     "GrpcTransportConfig",
     "LogFormat",
     "LogLevel",
+    "QuantizationConfig",
+    "QuantizationType",
     "ShmTransportConfig",
     "WorkerConfig",
     "load_config",
