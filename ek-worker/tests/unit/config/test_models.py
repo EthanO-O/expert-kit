@@ -99,6 +99,18 @@ def test_device_memory_limit_must_be_positive(tmp_path: Path) -> None:
         WorkerConfig.model_validate(raw)
 
 
+def test_gptq_quantization_requires_4_bit_grouped_weights(tmp_path: Path) -> None:
+    raw = _config(tmp_path, backend="torch", device="cuda:0")
+    model = raw["model"]
+    assert isinstance(model, dict)
+    model["quantization"] = {"type": "gptq", "bits": 4, "group_size": 128}
+
+    config = WorkerConfig.model_validate(raw)
+
+    assert config.model.quantization is not None
+    assert config.model.quantization.group_size == 128
+
+
 def test_shm_transport_uses_only_notification_rpc_fields(tmp_path: Path) -> None:
     raw = _config(tmp_path, backend="torch", device="cuda:0")
     raw["transport"] = {

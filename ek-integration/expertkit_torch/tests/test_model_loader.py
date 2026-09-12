@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM
 from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.mixtral.configuration_mixtral import MixtralConfig
+from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 from transformers.models.qwen3_moe import modeling_qwen3_moe
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
@@ -165,6 +166,21 @@ def test_local_load_keeps_native_transformers_model(
     ("config", "expected_layer_ids"),
     [
         (
+            Qwen2MoeConfig(
+                vocab_size=32,
+                hidden_size=16,
+                intermediate_size=24,
+                moe_intermediate_size=8,
+                shared_expert_intermediate_size=16,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                num_experts=4,
+                num_experts_per_tok=2,
+            ),
+            [0, 1],
+        ),
+        (
             Qwen3MoeConfig(
                 vocab_size=32,
                 hidden_size=16,
@@ -239,7 +255,7 @@ def test_local_load_keeps_native_transformers_model(
             [0, 1],
         ),
     ],
-    ids=("qwen3_moe", "deepseek_v2", "deepseek_v3", "mixtral"),
+    ids=("qwen2_moe", "qwen3_moe", "deepseek_v2", "deepseek_v3", "mixtral"),
 )
 def test_transformers_constructs_replacement_blocks_at_real_layer_ids(
     config: Any,

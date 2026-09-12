@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from expertkit_worker.backends.base import ComputeBackend
-from expertkit_worker.config import ActivationDType, BackendName, WorkerConfig
+from expertkit_worker.config import ActivationDType, BackendName, QuantizationType, WorkerConfig
 from expertkit_worker.weights.adapter import WeightAdapter
 
 _TORCH_DTYPES = {
@@ -34,7 +34,17 @@ def create_weight_adapter(
     """Create the weight conversion and device-placement implementation for the Backend."""
 
     if config.worker.backend is BackendName.TORCH:
-        from expertkit_worker.backends.torch import TorchWeightAdapter
+        from expertkit_worker.backends.torch import TorchGPTQWeightAdapter, TorchWeightAdapter
+
+        if config.model.quantization is not None:
+            if config.model.quantization.type is not QuantizationType.GPTQ:
+                raise ValueError("unsupported Torch quantization type")
+            return TorchGPTQWeightAdapter(
+                hidden_dim=config.model.hidden_dim,
+                intermediate_dim=config.model.expert_intermediate_dim,
+                group_size=config.model.quantization.group_size,
+                device=device,
+            )
 
         return TorchWeightAdapter(
             hidden_dim=config.model.hidden_dim,

@@ -5,7 +5,11 @@ from __future__ import annotations
 import torch
 from expertkit_transport.batches import ACTIVATION_DTYPES
 
-from expertkit_worker.backends.torch.weights import TorchExpertWeights
+from expertkit_worker.backends.torch.weights import (
+    TorchExpertWeights,
+    TorchGPTQCpuWeight,
+    dequantize_gptq,
+)
 from expertkit_worker.weights.adapter import (
     WeightAdapter,
     WeightPlacementFatalError,
@@ -22,6 +26,95 @@ _TORCH_DTYPES = {
     SafeTensorDType.BF16: torch.bfloat16,
     SafeTensorDType.FP32: torch.float32,
 }
+
+
+class TorchGPTQWeightAdapter(WeightAdapter[TorchGPTQCpuWeight, TorchExpertWeights]):
+    """Decode AutoGPTQ expert tensors when they enter the ready device cache."""
+
+    def __init__(
+        self, *, hidden_dim: int, intermediate_dim: int, group_size: int, device: torch.device | str
+    ) -> None:
+        if hidden_dim <= 0 or intermediate_dim <= 0 or group_size <= 0:
+            raise ValueError("GPTQ dimensions and group_size must be positive")
+        self._hidden_dim = hidden_dim
+        self._intermediate_dim = intermediate_dim
+        self._group_size = group_size
+        self._device = torch.device(device)
+
+    @property
+    def backend_name(self) -> str:
+        return "torch-gptq"
+
+    @staticmethod
+    def _matrix(
+        source: SafeTensorData, suffix: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qweight = source.find_unique_suffix((suffix + ".qweight",))
+        qzeros = source.find_unique_suffix((suffix + ".qzeros",))
+        scales = source.find_unique_suffix((suffix + ".scales",))
+        if qweight.dtype not in {
+            SafeTensorDType.INT32,
+            SafeTensorDType.INT64,
+        } or qzeros.dtype not in {
+            SafeTensorDType.INT32,
+            SafeTensorDType.INT64,
+        }:
+            raise ValueError("GPTQ qweight and qzeros must be I32")
+        if scales.dtype not in {SafeTensorDType.FP16, SafeTensorDType.BF16, SafeTensorDType.FP32}:
+            raise ValueError("GPTQ scales must be floating point")
+        qdtype = torch.int32 if qweight.dtype is SafeTensorDType.INT32 else torch.int64
+        sdtype = _TORCH_DTYPES[scales.dtype]
+        return (
+            torch.frombuffer(qweight.data, dtype=qdtype).reshape(qweight.shape),
+            torch.frombuffer(qzeros.data, dtype=qdtype).reshape(qzeros.shape),
+            torch.frombuffer(scales.data, dtype=sdtype).reshape(scales.shape),
+        )
+
+    def make_cpu_weight(self, source: SafeTensorData) -> TorchGPTQCpuWeight:
+        return TorchGPTQCpuWeight(
+            gate=self._matrix(source, "gate_proj"),
+            up=self._matrix(source, "up_proj"),
+            down=self._matrix(source, "down_proj"),
+        )
+
+    def make_ready_weight(
+        self, cpu_weight: TorchGPTQCpuWeight, *, layer_id: int, expert_id: int
+    ) -> TorchExpertWeights:
+        del layer_id, expert_id
+        matrices = [
+            dequantize_gptq(
+                *matrix,
+                in_features=self._hidden_dim if i != 2 else self._intermediate_dim,
+                out_features=self._intermediate_dim if i != 2 else self._hidden_dim,
+                group_size=self._group_size,
+            ).to(device=self._device, dtype=torch.float16)
+            for i, matrix in enumerate((cpu_weight.gate, cpu_weight.up, cpu_weight.down))
+        ]
+        return TorchExpertWeights(gate_proj=matrices[0], up_proj=matrices[1], down_proj=matrices[2])
+
+    def cpu_extra_bytes(self) -> int:
+        return 0
+
+    def source_tensor_bytes(self) -> int:
+        groups_gate = self._hidden_dim // self._group_size
+        groups_down = self._intermediate_dim // self._group_size
+        gate_up = (
+            2 * (self._hidden_dim // 8) * self._intermediate_dim * 4
+            + 2 * ((groups_gate + 7) // 8) * self._intermediate_dim * 4
+            + 2 * groups_gate * self._intermediate_dim * 2
+        )
+        down = (
+            (self._intermediate_dim // 8) * self._hidden_dim * 4
+            + ((groups_down + 7) // 8) * self._hidden_dim * 4
+            + groups_down * self._hidden_dim * 2
+        )
+        return gate_up + down
+
+    def ready_weight_bytes(self) -> int:
+        return 3 * self._hidden_dim * self._intermediate_dim * 2
+
+    def conversion_temporary_bytes(self) -> int:
+        return self.ready_weight_bytes()
 
 
 class TorchWeightAdapter(WeightAdapter[TorchExpertWeights, TorchExpertWeights]):

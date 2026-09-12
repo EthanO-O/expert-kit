@@ -59,7 +59,7 @@ impl ModelConfig {
             "deepseek_v2" | "deepseek_v3" => {
                 Some(self.map.get("n_routed_experts")?.as_u64()? as usize)
             }
-            "qwen3_moe" => Some(self.map.get("num_experts")?.as_u64()? as usize),
+            "qwen2_moe" | "qwen3_moe" => Some(self.map.get("num_experts")?.as_u64()? as usize),
             "mixtral" => Some(self.map.get("num_local_experts")?.as_u64()? as usize),
             _ => {
                 unimplemented!()
@@ -70,7 +70,7 @@ impl ModelConfig {
     pub fn dim(&self) -> Option<(usize, usize)> {
         let hidden = self.map.get("hidden_size")?.as_u64()? as usize;
         let intermediate = match self.model_type() {
-            "deepseek_v2" | "deepseek_v3" | "qwen3_moe" => {
+            "deepseek_v2" | "deepseek_v3" | "qwen2_moe" | "qwen3_moe" => {
                 self.map.get("moe_intermediate_size")?.as_u64()? as usize
             }
             "mixtral" => self.map.get("intermediate_size")?.as_u64()? as usize,
@@ -260,7 +260,7 @@ where
         expert_id: usize,
     ) -> EKResult<Vec<String>> {
         match self.model_config.model_type() {
-            "deepseek_v2" | "deepseek_v3" | "qwen3_moe" => {
+            "deepseek_v2" | "deepseek_v3" | "qwen2_moe" | "qwen3_moe" => {
                 let key_up =
                     format!("model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight");
                 let key_up_scale = format!("{key_up}_scale_inv");
