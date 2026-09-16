@@ -45,7 +45,7 @@ from expertkit_worker.weights import (
     DirectIOWeightDiskCache,
     ExpertStateChange,
     ModelMetadata,
-    ModelMetadataError,
+    ModelMetadataUnavailable,
     WeightManager,
     fetch_model_metadata,
 )
@@ -74,10 +74,30 @@ def _quantization_from_metadata(metadata: ModelMetadata) -> QuantizationConfig |
     if metadata.quantization is None:
         return None
     recipe = metadata.quantization
-    if recipe.method.lower() != QuantizationType.GPTQ.value:
+    method = recipe.method.lower()
+    if (
+        method == "mxfp4"
+        and recipe.bits == 4
+        and recipe.group_size == 32
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(type=QuantizationType.FP4, bits=4, group_size=32, symmetric=True)
+    if (
+        method == "w8a8"
+        and recipe.bits == 8
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(
+            type=QuantizationType.W8A8, bits=8, group_size=recipe.group_size, symmetric=True
+        )
+    if method != QuantizationType.GPTQ.value:
         raise ValueError(f"unsupported model quantization method: {recipe.method}")
     if recipe.bits != 4 or recipe.group_size is None:
         raise ValueError("Weight Server advertised unsupported GPTQ parameters")
+    if recipe.desc_act is True:
+        raise ValueError("GPTQ activation-order groups are unsupported")
     if recipe.symmetric is False:
         raise ValueError("the Torch GPTQ Backend requires symmetric quantization")
     return QuantizationConfig(
@@ -130,11 +150,25 @@ async def _resolve_model_metadata(config: WorkerConfig) -> WorkerConfig:
         configured = config.model.quantization
         if configured is not None and discovered != configured:
             raise ValueError("Worker model.quantization conflicts with Weight Server metadata")
-        if configured is None and discovered is not None:
-            model = config.model.model_copy(update={"quantization": discovered})
-            return config.model_copy(update={"model": model})
-        return config
-    except ModelMetadataError as error:
+        for field in ("expert_compute", "swiglu_limit"):
+            if field in config.model.model_fields_set and getattr(config.model, field) != getattr(
+                metadata, field
+            ):
+                raise ValueError(f"Worker model.{field} conflicts with Weight Server metadata")
+        model_data = config.model.model_dump()
+        model_data.update(
+            quantization=discovered,
+            expert_compute=metadata.expert_compute,
+            swiglu_limit=metadata.swiglu_limit,
+        )
+        if metadata.model_type == "deepseek_v4" and metadata.expert_compute != "deepseek_v4":
+            raise ValueError(
+                "V4 requires expert computation metadata from an updated Weight Server"
+            )
+        data = config.model_dump()
+        data["model"] = model_data
+        return WorkerConfig.model_validate(data)
+    except ModelMetadataUnavailable as error:
         if config.weight_manager.metadata_required:
             raise RuntimeError("required Weight Server model metadata is unavailable") from error
         logger.warning("model_metadata_unavailable", error=str(error))
@@ -329,6 +363,8 @@ async def build_worker_application(
         )
         logger.info(
             "worker_resource_plan",
+            weight_adapter=adapter.backend_name,
+            expert_compute=config.model.expert_compute,
             device=config.worker.device,
             device_total_bytes=total_bytes,
             device_available_bytes=available_bytes,

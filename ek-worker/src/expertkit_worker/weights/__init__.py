@@ -37,6 +37,7 @@ from expertkit_worker.weights.manager import (
 from expertkit_worker.weights.metadata import (
     ModelMetadata,
     ModelMetadataError,
+    ModelMetadataUnavailable,
     QuantizationMetadata,
     fetch_model_metadata,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "ExpertStateKind",
     "ModelMetadata",
     "ModelMetadataError",
+    "ModelMetadataUnavailable",
     "PeerWeightServer",
     "QuantizationMetadata",
     "ReadyWeightLease",

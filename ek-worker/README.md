@@ -204,3 +204,60 @@ uv run --package expertkit-worker pytest ek-worker/tests
 
 CUDA, direct-I/O, and real multi-process checks require the matching hardware or
 filesystem and are marked separately.
+
+## Quantized routed experts
+
+Weight Server reads checkpoint `config.json` and publishes the **routed expert**
+recipe through `/meta/model/{model}`. The Worker selects an adapter at startup and
+validates the tensors against that recipe. Original V4 declares global FP8 but
+stores routed experts in FP4; selecting from the global `quant_method` alone is
+incorrect. Quantization also needs its activation scheme and scale granularity.
+
+Use [`examples/deepseek-v4-flash.torch.yaml`](./examples/deepseek-v4-flash.torch.yaml)
+for either V4 checkpoint, changing `model.name` to the Weight Server directory
+name. Keep `auto_model_metadata: true` and `metadata_required: true`; no manual
+quantization entry is needed. Dimensions and routing settings still belong in
+Worker configuration and are checked against the server. Change `weight_version`
+and the disk-cache directory when replacing a checkpoint.
+
+| Checkpoint format | Torch execution | Ready GPU weights |
+| --- | --- | --- |
+| Original DeepSeek-V4-Flash, packed E2M1 FP4 + E8M0 scales | A100 compatibility path: decode at placement, emulate block FP8 activation rounding, use floating GEMMs | BF16 with the example configuration |
+| `sgl-npu/DeepSeek-V4-Flash-W8A8`, compressed-tensors `int-quantized` | Dynamic per-token symmetric INT8 activation quantization, INT8 GEMM with INT32 accumulation, per-channel rescaling | INT8 matrices + FP32 scales |
+| Symmetric canonical AutoGPTQ v1 INT4 | Decode at placement, floating GEMMs | FP16/BF16 |
+
+The W8A8 adapter accepts per-channel `weight_scale` shaped `[output, 1]` in
+FP16/BF16/FP32, and optional INT8 zero-valued `weight_zero_point`. It rejects
+static or asymmetric activations, grouped weights, transforms, regex targets,
+partially ignored routed experts, and unexpected auxiliary tensors. The name
+“W8A8” alone does not establish checkpoint compatibility. Older `blockwise_int8`
+exports, QuaRot transforms, and Ascend execution require their own validated
+format or backend support.
+
+Both V4 paths apply the configured SwiGLU clipping, calculate the intermediate
+activation in FP32, and apply routing weights **before** the down projection.
+The FP4 compatibility path uses different GEMM accumulation from the native V4
+kernels; it is not a claim of bitwise equality or native FP4 acceleration. Its
+expanded weights do not save GPU weight memory. W8A8 keeps weights compressed,
+but the eager quantization and scaling operations can cost more time for small
+batches; no end-to-end speedup has been established.
+
+These changes support **routed expert computation**. The current Frontend
+loader does not implement the complete V4 model, including its attention,
+routing, shared experts, and hyper-connections. Full-model generation requires
+that integration and separate accuracy and performance validation. A100 tests
+use synthetic expert tensors with the official 4096/2048 dimensions; no V4
+checkpoint weights are downloaded for these tests.
+
+Run CPU tests and the CUDA qualification from the repository root:
+
+```bash
+uv run pytest ek-worker/tests/unit
+uv run pytest ek-worker/tests/integration/weights/test_v4_quantized_cuda.py -v
+cargo test -p ek-db --lib
+```
+
+CUDA qualification must report two passed tests, not skips. The metadata and
+layout fixtures were taken from the [original V4 configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json)
+and [the selected W8A8 export](https://modelscope.cn/models/sgl-npu/DeepSeek-V4-Flash-W8A8).
+Expert arithmetic follows the [official inference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py).
