@@ -11,8 +11,9 @@ import torch
 from expertkit_transport.controller import ResolvedDefaultInstance
 
 from expertkit_worker.config import WorkerConfig
-from expertkit_worker.factory import build_worker_application
+from expertkit_worker.factory import _resolve_model_metadata, build_worker_application
 from expertkit_worker.weights import DirectIOWeightDiskCache
+from expertkit_worker.weights.metadata import ModelMetadata, QuantizationMetadata
 
 
 def _config(
@@ -179,3 +180,35 @@ def test_factory_resolves_an_omitted_instance_before_device_setup(
 
     asyncio.run(scenario())
     assert calls == [None]
+
+
+def test_factory_discovers_gptq_from_weight_server_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = ModelMetadata(
+        schema_version=1,
+        model_type="qwen2_moe",
+        num_layers=2,
+        moe_layer_start=0,
+        moe_layer_end=2,
+        experts_per_layer=4,
+        hidden_dim=4,
+        expert_intermediate_dim=8,
+        top_k=2,
+        activation_dtype="bfloat16",
+        quantization=QuantizationMetadata("gptq", 4, 128, True, False),
+    )
+
+    async def discover(*_args: object, **_kwargs: object) -> ModelMetadata:
+        return metadata
+
+    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+
+    async def scenario() -> None:
+        resolved = await _resolve_model_metadata(_config(tmp_path))
+        assert resolved.model.quantization is not None
+        assert resolved.model.quantization.type.value == "gptq"
+        assert resolved.model.quantization.group_size == 128
+
+    asyncio.run(scenario())

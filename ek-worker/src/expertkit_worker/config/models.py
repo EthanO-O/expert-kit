@@ -257,6 +257,8 @@ class WeightManagerConfig(_StrictModel):
     disk_cache: DiskCacheConfig
     peer: PeerWeightConfig
     weight_server_endpoint: AnyHttpUrl
+    auto_model_metadata: bool = True
+    metadata_required: bool = False
     state_report: StateReportConfig = Field(default_factory=StateReportConfig)
 
 

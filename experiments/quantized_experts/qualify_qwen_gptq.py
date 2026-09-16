@@ -26,13 +26,13 @@ def _pack_symmetric(weight: torch.Tensor, group_size: int) -> tuple[torch.Tensor
     values = values.round().clamp(-8, 7).add(8).to(torch.int64)
     values = values.reshape(output, input_width // 8, 8).permute(1, 0, 2)
     shifts = torch.arange(8, dtype=torch.int64) * 4
-    qweight = (values << shifts).sum(-1)
+    qweight = (values << shifts).sum(-1).to(torch.int32)
     qzeros = torch.full(
-        ((input_width // group_size + 7) // 8, output),
-        int("88888888", 16),
-        dtype=torch.int64,
+        (input_width // group_size, output // 8),
+        int("77777777", 16),
+        dtype=torch.int32,
     )
-    return qweight, qzeros, scales.reshape(output, -1).T.contiguous()
+    return qweight, qzeros, scales.reshape(output, -1).T.contiguous().half()
 
 
 def main() -> None:
@@ -57,6 +57,8 @@ def main() -> None:
                 f"{role}_proj.qweight": qweight,
                 f"{role}_proj.qzeros": qzeros,
                 f"{role}_proj.scales": scales,
+                f"{role}_proj.g_idx": torch.arange(weight.shape[1], dtype=torch.int32)
+                // 128,
             }
         )
     adapter = TorchGPTQWeightAdapter(

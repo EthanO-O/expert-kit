@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from transformers.models.qwen2_moe import modeling_qwen2_moe
 
 from expertkit_torch.client import RoutedMoEClient
 from expertkit_torch.models._common import RoutedLayerIds
@@ -16,24 +17,24 @@ def create_routed_moe_class(client: RoutedMoEClient, layer_ids: RoutedLayerIds) 
         def __init__(self, config) -> None:
             super().__init__()
             self.layer_id = layer_ids.take()
-            self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-            self.top_k = config.num_experts_per_tok
-            self.norm_topk_prob = config.norm_topk_prob
+            self.gate = modeling_qwen2_moe.Qwen2MoeTopKRouter(config)
+            self.shared_expert = modeling_qwen2_moe.Qwen2MoeMLP(
+                config, intermediate_size=config.shared_expert_intermediate_size
+            )
+            self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             flattened = hidden_states.reshape(-1, hidden_dim)
-            router_logits = self.gate(flattened)
-            weights = torch.softmax(router_logits, dim=1, dtype=torch.float32)
-            weights, expert_ids = torch.topk(weights, self.top_k, dim=-1)
-            if self.norm_topk_prob:
-                weights = weights / weights.sum(dim=-1, keepdim=True)
+            shared = self.shared_expert(flattened)
+            _, weights, expert_ids = self.gate(flattened)
             routed = client.forward_layer(
                 layer_id=self.layer_id,
                 hidden_states=flattened,
                 expert_ids=expert_ids,
-                routing_weights=weights.to(hidden_states.dtype),
+                routing_weights=weights,
             )
-            return routed.reshape(batch_size, sequence_length, hidden_dim)
+            shared = torch.sigmoid(self.shared_expert_gate(flattened)) * shared
+            return (routed + shared).reshape(batch_size, sequence_length, hidden_dim)
 
     return RoutedQwen2MoeSparseMoeBlock

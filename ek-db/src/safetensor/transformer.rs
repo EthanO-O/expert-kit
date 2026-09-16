@@ -21,6 +21,30 @@ pub struct VitalMeta {
     pub inter_dim: usize,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct QuantizationMeta {
+    pub method: String,
+    pub bits: Option<u32>,
+    pub group_size: Option<u32>,
+    pub symmetric: Option<bool>,
+    pub desc_act: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMeta {
+    pub schema_version: u32,
+    pub model_type: String,
+    pub num_layers: usize,
+    pub moe_layer_start: usize,
+    pub moe_layer_end: usize,
+    pub experts_per_layer: usize,
+    pub hidden_dim: usize,
+    pub expert_intermediate_dim: usize,
+    pub top_k: Option<usize>,
+    pub activation_dtype: Option<String>,
+    pub quantization: Option<QuantizationMeta>,
+}
+
 impl ModelConfig {
     fn try_from_desc(desc: &TransformerModelDesc) -> EKResult<Self> {
         let path = desc.root.join(&desc.config_name);
@@ -33,6 +57,22 @@ impl ModelConfig {
     }
     pub fn model_type(&self) -> &str {
         self.map.get("model_type").unwrap().as_str().unwrap()
+    }
+
+    fn quantization_method(&self) -> Option<&str> {
+        self.map
+            .get("quantization_config")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|config| {
+                config
+                    .get("quant_method")
+                    .or_else(|| config.get("quantization_method"))
+            })
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn is_gptq(&self) -> bool {
+        self.quantization_method() == Some("gptq")
     }
 
     pub fn moe_layers(&self) -> Option<(usize, usize)> {
@@ -91,6 +131,74 @@ impl ModelConfig {
             ))?,
             hidden_dim: dim.0,
             inter_dim: dim.1,
+        })
+    }
+
+    pub fn runtime_meta(&self) -> EKResult<RuntimeMeta> {
+        let (moe_start, moe_end) = self.moe_layers().ok_or(EKError::InvalidInput(
+            "can not determine moe layers".to_string(),
+        ))?;
+        let (hidden_dim, expert_intermediate_dim) = self.dim().ok_or(EKError::InvalidInput(
+            "can not determine hidden_dim and inter_dim".to_string(),
+        ))?;
+        let num_layers = moe_end;
+        let experts_per_layer = self.routed_experts().ok_or(EKError::InvalidInput(
+            "can not determine routed_experts".to_string(),
+        ))?;
+        let top_k = self
+            .map
+            .get("num_experts_per_tok")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .or_else(|| {
+                self.map
+                    .get("num_selected_experts")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+            });
+        let activation_dtype = self
+            .map
+            .get("torch_dtype")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let quantization = self
+            .map
+            .get("quantization_config")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|config| {
+                let method = config
+                    .get("quant_method")
+                    .or_else(|| config.get("quantization_method"))
+                    .and_then(serde_json::Value::as_str)?;
+                Some(QuantizationMeta {
+                    method: method.to_owned(),
+                    bits: config
+                        .get("bits")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value as u32),
+                    group_size: config
+                        .get("group_size")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value as u32),
+                    symmetric: config
+                        .get("sym")
+                        .or_else(|| config.get("symmetric"))
+                        .and_then(serde_json::Value::as_bool),
+                    desc_act: config.get("desc_act").and_then(serde_json::Value::as_bool),
+                })
+            });
+        Ok(RuntimeMeta {
+            schema_version: 1,
+            model_type: self.model_type().to_owned(),
+            num_layers,
+            moe_layer_start: moe_start,
+            moe_layer_end: moe_end,
+            experts_per_layer,
+            hidden_dim,
+            expert_intermediate_dim,
+            top_k,
+            activation_dtype,
+            quantization,
         })
     }
 }
@@ -261,6 +369,21 @@ where
     ) -> EKResult<Vec<String>> {
         match self.model_config.model_type() {
             "deepseek_v2" | "deepseek_v3" | "qwen2_moe" | "qwen3_moe" => {
+                if self.model_config.is_gptq() {
+                    let names = ["gate_proj", "up_proj", "down_proj"];
+                    let mut keys = Vec::with_capacity(12);
+                    for projection in names {
+                        let base =
+                            format!("model.layers.{layer_id}.mlp.experts.{expert_id}.{projection}");
+                        keys.extend([
+                            format!("{base}.qweight"),
+                            format!("{base}.qzeros"),
+                            format!("{base}.scales"),
+                            format!("{base}.g_idx"),
+                        ]);
+                    }
+                    return Ok(keys);
+                }
                 let key_up =
                     format!("model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight");
                 let key_up_scale = format!("{key_up}_scale_inv");

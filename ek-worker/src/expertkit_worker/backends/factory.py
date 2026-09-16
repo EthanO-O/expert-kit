@@ -44,6 +44,7 @@ def create_weight_adapter(
                 intermediate_dim=config.model.expert_intermediate_dim,
                 group_size=config.model.quantization.group_size,
                 device=device,
+                compute_dtype=compute_dtype,
             )
 
         return TorchWeightAdapter(
