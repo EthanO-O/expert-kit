@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable
 
@@ -20,12 +21,16 @@ from expertkit_worker.backends.base import (
     ComputeBackend,
     InvalidBackendInput,
 )
+from expertkit_worker.backends.torch.fp4 import fp8_activation_reference
+from expertkit_worker.backends.torch.w8a8 import TorchW8A8Weights, w8a8_linear
 from expertkit_worker.backends.torch.weights import TorchExpertWeights
 from expertkit_worker.weights import ReadyWeightLease, WeightsNotReady
 
+type TorchReadyWeights = TorchExpertWeights | TorchW8A8Weights
+
 type AcquireTorchWeights = Callable[
     [int, tuple[int, ...]],
-    ReadyWeightLease[TorchExpertWeights],
+    ReadyWeightLease[TorchReadyWeights],
 ]
 
 
@@ -34,7 +39,7 @@ class _TorchCompletion(BackendCompletion):
 
     def __init__(
         self,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
         stream: torch.cuda.Stream | None,
     ) -> None:
         self._lease = lease
@@ -93,6 +98,10 @@ class TorchBackend(ComputeBackend):
         dtype: torch.dtype,
         device: torch.device | str,
         acquire_many: AcquireTorchWeights,
+        expert_compute: str = "swiglu",
+        swiglu_limit: float = 0.0,
+        fp8_activations: bool = False,
+        w8a8: bool = False,
     ) -> None:
         for name, value in (
             ("hidden_dim", hidden_dim),
@@ -111,6 +120,20 @@ class TorchBackend(ComputeBackend):
         if not callable(acquire_many):
             raise TypeError("acquire_many must be callable")
 
+        if (
+            expert_compute not in {"swiglu", "deepseek_v4"}
+            or not math.isfinite(swiglu_limit)
+            or swiglu_limit < 0
+        ):
+            raise ValueError("unsupported expert computation policy")
+        if fp8_activations and w8a8:
+            raise ValueError("only one activation quantization recipe may be selected")
+        if fp8_activations and (hidden_dim % 128 or intermediate_dim % 128):
+            raise ValueError("V4 FP8 activation widths must be divisible by 128")
+        self._expert_compute = expert_compute
+        self._swiglu_limit = swiglu_limit
+        self._fp8_activations = fp8_activations
+        self._w8a8 = w8a8
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
@@ -153,6 +176,12 @@ class TorchBackend(ComputeBackend):
                 + intermediate
                 + weighted_output
                 + accumulator
+                # Bound quantization, INT32 products, FP32 activation work, and row padding.
+                + (
+                    (max_batch_tokens + 32) * (self._hidden_dim + self._intermediate_dim) * 64
+                    if self._fp8_activations or self._w8a8 or self._expert_compute == "deepseek_v4"
+                    else 0
+                )
             )
         )
 
@@ -203,7 +232,7 @@ class TorchBackend(ComputeBackend):
     def _acquire(
         self,
         batch: BackendBatch,
-    ) -> ReadyWeightLease[TorchExpertWeights]:
+    ) -> ReadyWeightLease[TorchReadyWeights]:
         try:
             return self._acquire_many(batch.layer_id, batch.distinct_expert_ids)
         except WeightsNotReady as error:
@@ -211,7 +240,7 @@ class TorchBackend(ComputeBackend):
 
     def _validate_weights(
         self,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
         batch: BackendBatch,
     ) -> None:
         if lease.expert_ids != batch.distinct_expert_ids:
@@ -219,8 +248,10 @@ class TorchBackend(ComputeBackend):
         if len(lease.objects) != len(batch.distinct_expert_ids):
             raise RuntimeError("ready weight lookup returned the wrong object count")
         for weight in lease.objects:
-            if not isinstance(weight, TorchExpertWeights):
+            if not isinstance(weight, (TorchExpertWeights, TorchW8A8Weights)):
                 raise RuntimeError("ready weight lookup returned a non-Torch object")
+            if isinstance(weight, TorchW8A8Weights) != self._w8a8:
+                raise RuntimeError("ready weight quantization differs from the Backend recipe")
             if (
                 weight.hidden_dim != self._hidden_dim
                 or weight.intermediate_dim != self._intermediate_dim
@@ -240,11 +271,18 @@ class TorchBackend(ComputeBackend):
                     "ready expert weight device does not match the Torch Backend",
                 )
 
-    @staticmethod
+    def _linear(self, x: torch.Tensor, weight: TorchReadyWeights, projection: int) -> torch.Tensor:
+        if isinstance(weight, TorchW8A8Weights):
+            return w8a8_linear(x, weight.matrices[projection], weight.scales[projection])
+        if self._fp8_activations:
+            x = fp8_activation_reference(x)
+        return functional.linear(x, weight.tensors[projection])
+
     def _compute(
+        self,
         batch: BackendBatch,
         prepared_output: torch.Tensor,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
     ) -> None:
         if not lease.objects:
             prepared_output.zero_()
@@ -260,20 +298,25 @@ class TorchBackend(ComputeBackend):
             token_indices = coordinates[:, 0]
             route_indices = coordinates[:, 1]
             expert_input = torch.index_select(batch.hidden_states, 0, token_indices)
-            gate = functional.linear(expert_input, weight.gate_proj)
-            up = functional.linear(expert_input, weight.up_proj)
-            expert_output = functional.linear(functional.silu(gate) * up, weight.down_proj)
-            routing = batch.routing_weights[token_indices, route_indices]
-            accumulator.index_add_(
-                0,
-                token_indices,
-                expert_output.to(torch.float32) * routing.unsqueeze(1),
-            )
+            gate = self._linear(expert_input, weight, 0)
+            up = self._linear(expert_input, weight, 1)
+            routing = batch.routing_weights[token_indices, route_indices].unsqueeze(1)
+            if self._expert_compute == "deepseek_v4":
+                gate, up = gate.float(), up.float()
+                if self._swiglu_limit > 0:
+                    gate = gate.clamp(max=self._swiglu_limit)
+                    up = up.clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
+                intermediate = (functional.silu(gate) * up * routing).to(expert_input.dtype)
+                weighted = self._linear(intermediate, weight, 2).float()
+            else:
+                intermediate = functional.silu(gate) * up
+                weighted = self._linear(intermediate, weight, 2).float() * routing
+            accumulator.index_add_(0, token_indices, weighted)
         prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
 
     def _finish_failed_submission(
         self,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
     ) -> None:
         synchronization_error: BaseException | None = None
         if self._device.type == "cuda":

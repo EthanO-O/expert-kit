@@ -212,3 +212,76 @@ def test_factory_discovers_gptq_from_weight_server_metadata(
         assert resolved.model.quantization.group_size == 128
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "method,bits,group,expected", [("mxfp4", 4, 32, "fp4"), ("w8a8", 8, None, "w8a8")]
+)
+def test_v4_metadata_selects_recipe_and_expert_math(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    bits: int,
+    group: int | None,
+    expected: str,
+) -> None:
+    metadata = ModelMetadata(
+        1,
+        "deepseek_v4",
+        2,
+        0,
+        2,
+        4,
+        4,
+        8,
+        2,
+        "bfloat16",
+        QuantizationMetadata(method, bits, group, True, False),
+        "deepseek_v4",
+        10.0,
+    )
+
+    async def discover(*args: object, **kwargs: object) -> ModelMetadata:
+        return metadata
+
+    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+    resolved = asyncio.run(_resolve_model_metadata(_config(tmp_path)))
+    assert resolved.model.quantization.type.value == expected
+    assert resolved.model.expert_compute == "deepseek_v4"
+    assert resolved.model.swiglu_limit == 10
+
+
+def test_invalid_metadata_never_falls_back_to_unquantized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from expertkit_worker.weights import ModelMetadataError
+
+    async def discover(*args: object, **kwargs: object) -> ModelMetadata:
+        raise ModelMetadataError("unsupported quantization recipe")
+
+    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+    with pytest.raises(ModelMetadataError, match="unsupported quantization"):
+        asyncio.run(_resolve_model_metadata(_config(tmp_path)))
+
+
+@pytest.mark.parametrize("method", ["fp8", "blockwise_int8", "int8", "compressed-tensors"])
+def test_worker_rejects_unnormalized_quantization(method: str) -> None:
+    from expertkit_worker.factory import _quantization_from_metadata
+
+    metadata = ModelMetadata(
+        1,
+        "deepseek_v4",
+        1,
+        0,
+        1,
+        2,
+        128,
+        256,
+        1,
+        "bfloat16",
+        QuantizationMetadata(method, 8, None, True, False),
+        "deepseek_v4",
+        10.0,
+    )
+    with pytest.raises(ValueError, match="unsupported model quantization"):
+        _quantization_from_metadata(metadata)

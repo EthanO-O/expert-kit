@@ -34,9 +34,28 @@ def create_weight_adapter(
     """Create the weight conversion and device-placement implementation for the Backend."""
 
     if config.worker.backend is BackendName.TORCH:
-        from expertkit_worker.backends.torch import TorchGPTQWeightAdapter, TorchWeightAdapter
+        from expertkit_worker.backends.torch import (
+            TorchFP4WeightAdapter,
+            TorchGPTQWeightAdapter,
+            TorchW8A8WeightAdapter,
+            TorchWeightAdapter,
+        )
 
         if config.model.quantization is not None:
+            if config.model.quantization.type is QuantizationType.W8A8:
+                return TorchW8A8WeightAdapter(
+                    hidden_dim=config.model.hidden_dim,
+                    intermediate_dim=config.model.expert_intermediate_dim,
+                    device=device,
+                    compute_dtype=compute_dtype,
+                )
+            if config.model.quantization.type is QuantizationType.FP4:
+                return TorchFP4WeightAdapter(
+                    hidden_dim=config.model.hidden_dim,
+                    intermediate_dim=config.model.expert_intermediate_dim,
+                    device=device,
+                    compute_dtype=compute_dtype,
+                )
             if config.model.quantization.type is not QuantizationType.GPTQ:
                 raise ValueError("unsupported Torch quantization type")
             return TorchGPTQWeightAdapter(
@@ -105,6 +124,16 @@ def create_compute_backend(
             dtype=dtype,
             device=device,
             acquire_many=acquire_many,
+            w8a8=(
+                config.model.quantization is not None
+                and config.model.quantization.type is QuantizationType.W8A8
+            ),
+            expert_compute=config.model.expert_compute,
+            swiglu_limit=config.model.swiglu_limit,
+            fp8_activations=(
+                config.model.quantization is not None
+                and config.model.quantization.type is QuantizationType.FP4
+            ),
         )
     if config.worker.backend is BackendName.GGML:
         from expertkit_worker.backends.ggml import GgmlBackend

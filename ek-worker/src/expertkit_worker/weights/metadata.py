@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -11,6 +12,10 @@ import aiohttp
 
 class ModelMetadataError(RuntimeError):
     """The Weight Server returned unavailable or invalid model metadata."""
+
+
+class ModelMetadataUnavailable(ModelMetadataError):
+    """A legacy or unreachable server cannot supply model metadata."""
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,8 @@ class ModelMetadata:
     top_k: int | None
     activation_dtype: str | None
     quantization: QuantizationMetadata | None
+    expert_compute: str = "swiglu"
+    swiglu_limit: float = 0.0
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -57,6 +64,8 @@ def _parse_payload(payload: Any) -> ModelMetadata:
     if not isinstance(payload, dict):
         raise ModelMetadataError("model metadata response must be a JSON object")
     schema_version = _positive_int(payload.get("schema_version"), "schema_version")
+    if schema_version != 1:
+        raise ModelMetadataError("unsupported model metadata schema version")
     model_type = payload.get("model_type")
     if not isinstance(model_type, str) or not model_type:
         raise ModelMetadataError("model metadata field 'model_type' must be a non-empty string")
@@ -76,6 +85,13 @@ def _parse_payload(payload: Any) -> ModelMetadata:
         method = quantization_payload.get("method")
         if not isinstance(method, str) or not method:
             raise ModelMetadataError("quantization.method must be a non-empty string")
+        for field in ("bits", "group_size"):
+            if quantization_payload.get(field) is not None:
+                _positive_int(quantization_payload[field], f"quantization.{field}")
+        for field in ("symmetric", "desc_act"):
+            value = quantization_payload.get(field)
+            if value is not None and not isinstance(value, bool):
+                raise ModelMetadataError(f"quantization.{field} must be a boolean")
         quantization = QuantizationMetadata(
             method=method,
             bits=quantization_payload.get("bits"),
@@ -83,6 +99,19 @@ def _parse_payload(payload: Any) -> ModelMetadata:
             symmetric=quantization_payload.get("symmetric"),
             desc_act=quantization_payload.get("desc_act"),
         )
+    expert_compute = payload.get("expert_compute", "swiglu")
+    if not isinstance(expert_compute, str) or expert_compute not in {"swiglu", "deepseek_v4"}:
+        raise ModelMetadataError("unsupported expert_compute metadata")
+    limit = payload.get("swiglu_limit")
+    if limit is None:
+        limit = 0.0
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, (int, float))
+        or not math.isfinite(limit)
+        or limit < 0
+    ):
+        raise ModelMetadataError("swiglu_limit must be finite and nonnegative")
     return ModelMetadata(
         schema_version=schema_version,
         model_type=model_type,
@@ -97,6 +126,8 @@ def _parse_payload(payload: Any) -> ModelMetadata:
         top_k=top_k,
         activation_dtype=activation_dtype,
         quantization=quantization,
+        expert_compute=expert_compute,
+        swiglu_limit=float(limit),
     )
 
 
@@ -121,16 +152,18 @@ async def fetch_model_metadata(
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as response:
+            if response.status in {404, 501}:
+                raise ModelMetadataUnavailable("Weight Server has no model metadata endpoint")
             if response.status != 200:
                 raise ModelMetadataError(
                     f"Weight Server metadata request returned HTTP {response.status}"
                 )
             try:
                 payload = await response.json()
-            except (TypeError, ValueError) as error:
+            except (TypeError, ValueError, aiohttp.ContentTypeError) as error:
                 raise ModelMetadataError("Weight Server metadata response is not JSON") from error
     except ModelMetadataError:
         raise
     except (aiohttp.ClientError, TimeoutError) as error:
-        raise ModelMetadataError(f"cannot fetch model metadata from {url}") from error
+        raise ModelMetadataUnavailable(f"cannot fetch model metadata from {url}") from error
     return _parse_payload(payload)

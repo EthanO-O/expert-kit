@@ -1,0 +1,60 @@
+# The model name must match the Weight Server directory name.
+# Use DeepSeek-V4-Flash for the original checkpoint; metadata selects the recipe.
+# Replace addresses, device, and memory budget for each Worker process.
+model:
+  name: DeepSeek-V4-Flash-W8A8
+  weight_version: main
+  num_layers: 43
+  experts_per_layer: 256
+  hidden_dim: 4096
+  expert_intermediate_dim: 2048
+  top_k: 6
+  activation_dtype: bf16
+  weight_dtype: bf16
+
+worker:
+  id: v4-worker-0
+  backend: torch
+  device: cuda:0
+  max_batch_tokens: 512
+  max_active_batches_per_device: 1
+  device_memory_limit: 32GiB
+  shutdown_grace_secs: 30
+
+transport:
+  type: grpc
+  max_pending_batches_per_device: 1
+  listen: 0.0.0.0:51051
+  advertise: 127.0.0.1:51051
+
+controller:
+  endpoint: 127.0.0.1:5001
+  heartbeat_interval_secs: 3
+  heartbeat_timeout_secs: 10
+
+weight_manager:
+  auto_model_metadata: true
+  metadata_required: true
+  max_concurrent_loads: 2
+  dram_cache:
+    max_bytes: 16GiB
+  disk_cache:
+    path: /var/cache/expert-kit/worker-weights/v4-worker-0
+    writeback: true
+  peer:
+    listen: 0.0.0.0:51052
+    advertise: http://127.0.0.1:51052
+  weight_server_endpoint: http://127.0.0.1:6543
+  state_report:
+    max_updates: 64
+    max_delay_ms: 50
+
+logging:
+  level: INFO
+  format: console
+
+observability:
+  prometheus:
+    enabled: false
+  tracing:
+    enabled: false
