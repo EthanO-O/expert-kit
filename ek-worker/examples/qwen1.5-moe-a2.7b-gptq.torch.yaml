@@ -10,11 +10,6 @@ model:
   top_k: 4
   activation_dtype: fp16
   weight_dtype: fp16
-  quantization:
-    type: gptq
-    bits: 4
-    group_size: 128
-    symmetric: true
 
 worker:
   id: qwen1.5-moe-gptq-worker-0
@@ -45,6 +40,8 @@ weight_manager:
     listen: 0.0.0.0:51052
     advertise: http://127.0.0.1:51052
   weight_server_endpoint: http://127.0.0.1:6543
+  auto_model_metadata: true
+  metadata_required: true
   state_report:
     max_updates: 64
     max_delay_ms: 50

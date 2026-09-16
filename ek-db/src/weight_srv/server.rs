@@ -18,6 +18,17 @@ async fn load_meta_vital(
     Ok(web::Json(vital))
 }
 
+#[get("/meta/model/{model}")]
+async fn load_meta_model(
+    req: HttpRequest,
+    wm: web::Data<&'static WeightManager<'static>>,
+) -> EKResult<impl Responder> {
+    let model = req.match_info().get("model").unwrap();
+    let pretrained = wm.load_pretrained(model.to_owned()).await?;
+    let lg = pretrained.read().await;
+    Ok(web::Json(lg.config().runtime_meta()?))
+}
+
 #[get("/expert/{model}/{layer}/{expert}")]
 async fn load_expert(
     req: HttpRequest,
@@ -70,6 +81,7 @@ pub async fn listen<A: ToSocketAddrs>(
             .service(load_layer)
             .service(load_expert)
             .service(load_meta_vital)
+            .service(load_meta_model)
     })
     .bind(addr.as_slice())?
     .run()
@@ -167,5 +179,30 @@ mod test {
         assert_eq!(vital.moe_layers, (0, 10));
         assert_eq!(vital.hidden_dim, 16);
         assert_eq!(vital.inter_dim, 8);
+    }
+
+    #[actix_web::test]
+    async fn test_load_meta_model() {
+        let wm = test_wm().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(wm))
+                .service(load_meta_model),
+        )
+        .await;
+        let req = test::TestRequest::default()
+            .uri("/meta/model/qwen-test")
+            .insert_header(ContentType::plaintext())
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let meta: crate::safetensor::transformer::RuntimeMeta =
+            serde_json::from_slice(body.as_ref()).unwrap();
+        assert_eq!(meta.schema_version, 1);
+        assert_eq!(meta.model_type, "qwen3_moe");
+        assert_eq!(meta.experts_per_layer, 256);
+        assert_eq!(meta.hidden_dim, 16);
+        assert_eq!(meta.expert_intermediate_dim, 8);
     }
 }

@@ -111,19 +111,21 @@ def dequantize_gptq(
     kernel can replace it without changing the Worker contract.
     """
 
-    if in_features % 8 or in_features % group_size:
+    if group_size <= 0 or min(in_features, out_features) <= 0:
+        raise ValueError("GPTQ dimensions and group_size must be positive")
+    if in_features % 8 or out_features % 8 or in_features % group_size:
         raise ValueError("GPTQ input width must be divisible by 8 and group_size")
     if tuple(qweight.shape) != (in_features // 8, out_features):
         raise ValueError("unexpected GPTQ qweight shape")
     groups = in_features // group_size
-    if tuple(qzeros.shape) != ((groups + 7) // 8, out_features):
+    if tuple(qzeros.shape) != (groups, out_features // 8):
         raise ValueError("unexpected GPTQ qzeros shape")
     if tuple(scales.shape) != (groups, out_features):
         raise ValueError("unexpected GPTQ scales shape")
     shifts = torch.arange(8, device=qweight.device, dtype=torch.int32) * 4
     values = (qweight.to(torch.int32).unsqueeze(-1) >> shifts) & 0xF
-    values = values.permute(1, 2, 0).reshape(in_features, out_features)
+    values = values.permute(0, 2, 1).reshape(in_features, out_features)
     zero_values = (qzeros.to(torch.int32).unsqueeze(-1) >> shifts) & 0xF
-    zero_values = zero_values.permute(1, 2, 0).reshape(-1, out_features)[:groups]
+    zero_values = zero_values.expand(-1, -1, 8).reshape(groups, out_features) + 1
     group_ids = torch.arange(in_features, device=qweight.device) // group_size
     return ((values - zero_values[group_ids]).to(scales.dtype) * scales[group_ids]).T.contiguous()
