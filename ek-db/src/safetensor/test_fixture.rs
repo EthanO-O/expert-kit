@@ -64,7 +64,7 @@ pub(crate) fn synthetic_qwen_model() -> PathBuf {
 
             safetensors::tensor::serialize_to_file(
                 &tensors,
-                &None,
+                None,
                 &model_root.join("model.safetensors"),
             )
             .unwrap();
@@ -81,4 +81,81 @@ pub(crate) fn synthetic_qwen_model() -> PathBuf {
             model_root
         })
         .clone()
+}
+
+/// Build one small expert in the published V4 FP4 or compressed-tensors layout.
+pub(crate) fn synthetic_v4_model(fp4: bool) -> PathBuf {
+    static FP4_ROOT: OnceLock<PathBuf> = OnceLock::new();
+    static INT8_ROOT: OnceLock<PathBuf> = OnceLock::new();
+    let cell = if fp4 { &FP4_ROOT } else { &INT8_ROOT };
+    cell.get_or_init(|| {
+        let root =
+            std::env::temp_dir().join(format!("expert-kit-v4-tests-{}-{fp4}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = if fp4 {
+            include_str!("../../tests/fixtures/deepseek_v4_fp4_config.json")
+        } else {
+            include_str!("../../tests/fixtures/deepseek_v4_w8a8_config.json")
+        };
+        let mut config: serde_json::Value = serde_json::from_str(raw).unwrap();
+        config["hidden_size"] = 128.into();
+        config["moe_intermediate_size"] = 256.into();
+        config["num_hidden_layers"] = 1.into();
+        config["n_routed_experts"] = 2.into();
+        config["num_experts_per_tok"] = 1.into();
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut owned = Vec::new();
+        for expert in 0..2 {
+            for (role, rows, cols) in [("w1", 256, 128), ("w2", 128, 256), ("w3", 256, 128)] {
+                let base = format!("layers.0.ffn.experts.{expert}.{role}");
+                let width = if fp4 { cols / 2 } else { cols };
+                owned.push((
+                    format!("{base}.weight"),
+                    Dtype::I8,
+                    vec![rows, width],
+                    vec![0x11; rows * width],
+                ));
+                if fp4 {
+                    owned.push((
+                        format!("{base}.scale"),
+                        Dtype::F8_E8M0,
+                        vec![rows, cols / 32],
+                        vec![127; rows * cols / 32],
+                    ));
+                } else {
+                    owned.push((
+                        format!("{base}.weight_scale"),
+                        Dtype::F32,
+                        vec![rows, 1],
+                        0.125_f32.to_le_bytes().repeat(rows),
+                    ));
+                }
+            }
+        }
+        let views: Vec<_> = owned
+            .iter()
+            .map(|(name, dtype, shape, data)| {
+                (
+                    name.clone(),
+                    TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(views, None, &root.join("model.safetensors")).unwrap();
+        let weight_map: BTreeMap<_, _> = owned
+            .iter()
+            .map(|(name, _, _, _)| (name, "model.safetensors"))
+            .collect();
+        std::fs::write(
+            root.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap(),
+        )
+        .unwrap();
+        root
+    })
+    .clone()
 }
