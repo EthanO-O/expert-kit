@@ -237,7 +237,11 @@ class ControllerConfig(_StrictModel):
 
 
 class DramCacheConfig(_StrictModel):
-    """Application-managed Host weight-cache byte budget."""
+    """Total Host weight budget including concurrent conversion capacity.
+
+    A null limit derives full-model cache capacity plus conversion capacity.
+    Explicit limits must fit one cache entry and all concurrent conversions.
+    """
 
     max_bytes: PositiveByteSize | None = None
 

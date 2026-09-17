@@ -49,12 +49,20 @@ def _dram_cache_limit(config: WorkerConfig, adapter: WeightAdapter[Any, Any]) ->
     one_entry = (
         max_safetensors_file_bytes(adapter.source_tensor_bytes()) + adapter.cpu_extra_bytes()
     )
+    # The whole loading pipeline holds a bounded slot until conversion finishes,
+    # including after cancellation. Cache references cannot consume this reserve.
+    conversion_bytes = (
+        config.weight_manager.max_concurrent_loads * adapter.host_conversion_temporary_bytes()
+    )
     configured = config.weight_manager.dram_cache.max_bytes
     if configured is not None:
         resolved = int(configured)
-        if resolved < one_entry:
-            raise ValueError("weight_manager.dram_cache.max_bytes cannot fit one expert")
-        return resolved
+        if resolved < one_entry + conversion_bytes:
+            raise ValueError(
+                "weight_manager.dram_cache.max_bytes cannot fit one expert "
+                "and concurrent Host conversion capacity"
+            )
+        return resolved - conversion_bytes
     expert_count = config.model.num_layers * config.model.experts_per_layer
     return one_entry * expert_count
 

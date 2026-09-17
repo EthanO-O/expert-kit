@@ -571,3 +571,63 @@ def test_whole_worker_shutdown_removes_current_targets_after_drain() -> None:
         await _await_with_loop_yields(manager.close())
 
     run(scenario())
+
+
+@pytest.mark.parametrize("fail_conversion", [False, True])
+def test_conversion_capacity_remains_bounded_after_cancellation(fail_conversion: bool) -> None:
+    import threading
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        started: asyncio.Queue[int] = asyncio.Queue()
+        releases = [threading.Event() for _ in range(3)]
+        lock = threading.Lock()
+
+        class BlockingAdapter(_FakeAdapter):
+            active = 0
+            peak = 0
+
+            def make_ready_weight(
+                self, cpu_weight: object, *, layer_id: int, expert_id: int
+            ) -> object:
+                with lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                loop.call_soon_threadsafe(started.put_nowait, expert_id)
+                try:
+                    if not releases[expert_id].wait(timeout=5):
+                        raise RuntimeError("test conversion was not released")
+                    if fail_conversion and expert_id == 1:
+                        raise ValueError("test conversion failure")
+                    return super().make_ready_weight(
+                        cpu_weight, layer_id=layer_id, expert_id=expert_id
+                    )
+                finally:
+                    with lock:
+                        self.active -= 1
+
+        adapter = BlockingAdapter()
+        manager, _ = _make_manager(_FakeLoader(), adapter=adapter, max_concurrent_loads=2)
+        manager.start()
+        try:
+            async with asyncio.timeout(3):
+                await manager.apply_targets(1, [_target(0, 0), _target(0, 1)])
+                assert {await started.get(), await started.get()} == {0, 1}
+                # Removing a target cancels its task, but its running conversion
+                # must retain the slot until the executor actually finishes.
+                await manager.apply_targets(2, [_target(0, 1), _target(0, 2)])
+                releases[0].set()
+                assert await started.get() == 2
+                releases[1].set()
+                releases[2].set()
+                await manager.wait_for_idle()
+                assert adapter.peak == 2
+                assert adapter.active == 0
+                lease = manager.acquire_many(0, (2,))
+                lease.close()
+        finally:
+            for release in releases:
+                release.set()
+            await manager.close()
+
+    run(scenario())

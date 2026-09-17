@@ -285,3 +285,36 @@ def test_worker_rejects_unnormalized_quantization(method: str) -> None:
     )
     with pytest.raises(ValueError, match="unsupported model quantization"):
         _quantization_from_metadata(metadata)
+
+
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+@pytest.mark.parametrize("recipe", ["fp4", "gptq"])
+def test_host_budget_reserves_conversion_capacity(
+    tmp_path: Path, concurrency: int, recipe: str
+) -> None:
+    from expertkit_worker.backends.torch import TorchFP4WeightAdapter, TorchGPTQWeightAdapter
+    from expertkit_worker.weights.factory import _dram_cache_limit
+    from expertkit_worker.weights.format import max_safetensors_file_bytes
+
+    if recipe == "fp4":
+        adapter = TorchFP4WeightAdapter(hidden_dim=128, intermediate_dim=256, device="cpu")
+    else:
+        adapter = TorchGPTQWeightAdapter(
+            hidden_dim=128, intermediate_dim=256, group_size=128, device="cpu"
+        )
+    document = _config(tmp_path).model_dump()
+    document["weight_manager"]["max_concurrent_loads"] = concurrency
+    entry = max_safetensors_file_bytes(adapter.source_tensor_bytes()) + adapter.cpu_extra_bytes()
+    conversion = concurrency * adapter.host_conversion_temporary_bytes()
+    assert conversion > 0
+    document["weight_manager"]["dram_cache"]["max_bytes"] = entry + conversion
+    assert _dram_cache_limit(WorkerConfig.model_validate(document), adapter) == entry
+    document["weight_manager"]["dram_cache"]["max_bytes"] -= 1
+    with pytest.raises(ValueError, match="concurrent Host conversion"):
+        _dram_cache_limit(WorkerConfig.model_validate(document), adapter)
+    document["weight_manager"]["dram_cache"]["max_bytes"] = None
+    config = WorkerConfig.model_validate(document)
+    assert (
+        _dram_cache_limit(config, adapter)
+        == entry * config.model.num_layers * config.model.experts_per_layer
+    )

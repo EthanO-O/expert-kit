@@ -100,8 +100,7 @@ class TorchBackend(ComputeBackend):
         acquire_many: AcquireTorchWeights,
         expert_compute: str = "swiglu",
         swiglu_limit: float = 0.0,
-        fp8_activations: bool = False,
-        w8a8: bool = False,
+        linear_compute: str = "float",
     ) -> None:
         for name, value in (
             ("hidden_dim", hidden_dim),
@@ -126,14 +125,23 @@ class TorchBackend(ComputeBackend):
             or swiglu_limit < 0
         ):
             raise ValueError("unsupported expert computation policy")
-        if fp8_activations and w8a8:
-            raise ValueError("only one activation quantization recipe may be selected")
-        if fp8_activations and (hidden_dim % 128 or intermediate_dim % 128):
+        linear_implementations = {
+            "float": self._float_linear,
+            "fp8_reference": self._fp8_linear,
+            "w8a8": self._w8a8_linear,
+        }
+        if linear_compute not in linear_implementations:
+            raise ValueError("unsupported linear computation recipe")
+        if linear_compute == "fp8_reference" and (hidden_dim % 128 or intermediate_dim % 128):
             raise ValueError("V4 FP8 activation widths must be divisible by 128")
         self._expert_compute = expert_compute
         self._swiglu_limit = swiglu_limit
-        self._fp8_activations = fp8_activations
-        self._w8a8 = w8a8
+        self._linear = linear_implementations[linear_compute]
+        self._weight_type = TorchW8A8Weights if linear_compute == "w8a8" else TorchExpertWeights
+        self._finish_expert = (
+            self._v4_output if expert_compute == "deepseek_v4" else self._swiglu_output
+        )
+        self._quantized_linear = linear_compute != "float"
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
@@ -179,7 +187,7 @@ class TorchBackend(ComputeBackend):
                 # Bound quantization, INT32 products, FP32 activation work, and row padding.
                 + (
                     (max_batch_tokens + 32) * (self._hidden_dim + self._intermediate_dim) * 64
-                    if self._fp8_activations or self._w8a8 or self._expert_compute == "deepseek_v4"
+                    if self._quantized_linear or self._expert_compute == "deepseek_v4"
                     else 0
                 )
             )
@@ -250,7 +258,7 @@ class TorchBackend(ComputeBackend):
         for weight in lease.objects:
             if not isinstance(weight, (TorchExpertWeights, TorchW8A8Weights)):
                 raise RuntimeError("ready weight lookup returned a non-Torch object")
-            if isinstance(weight, TorchW8A8Weights) != self._w8a8:
+            if not isinstance(weight, self._weight_type):
                 raise RuntimeError("ready weight quantization differs from the Backend recipe")
             if (
                 weight.hidden_dim != self._hidden_dim
@@ -271,12 +279,34 @@ class TorchBackend(ComputeBackend):
                     "ready expert weight device does not match the Torch Backend",
                 )
 
-    def _linear(self, x: torch.Tensor, weight: TorchReadyWeights, projection: int) -> torch.Tensor:
-        if isinstance(weight, TorchW8A8Weights):
-            return w8a8_linear(x, weight.matrices[projection], weight.scales[projection])
-        if self._fp8_activations:
-            x = fp8_activation_reference(x)
+    @staticmethod
+    def _float_linear(x: torch.Tensor, weight: TorchExpertWeights, projection: int) -> torch.Tensor:
         return functional.linear(x, weight.tensors[projection])
+
+    @staticmethod
+    def _fp8_linear(x: torch.Tensor, weight: TorchExpertWeights, projection: int) -> torch.Tensor:
+        return functional.linear(fp8_activation_reference(x), weight.tensors[projection])
+
+    @staticmethod
+    def _w8a8_linear(x: torch.Tensor, weight: TorchW8A8Weights, projection: int) -> torch.Tensor:
+        return w8a8_linear(x, weight.matrices[projection], weight.scales[projection])
+
+    def _swiglu_output(
+        self, gate: torch.Tensor, up: torch.Tensor, routing: torch.Tensor, weight: TorchReadyWeights
+    ) -> torch.Tensor:
+        intermediate = functional.silu(gate) * up
+        return self._linear(intermediate, weight, 2).float() * routing
+
+    def _v4_output(
+        self, gate: torch.Tensor, up: torch.Tensor, routing: torch.Tensor, weight: TorchReadyWeights
+    ) -> torch.Tensor:
+        dtype = gate.dtype
+        gate, up = gate.float(), up.float()
+        if self._swiglu_limit > 0:
+            gate = gate.clamp(max=self._swiglu_limit)
+            up = up.clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
+        intermediate = (functional.silu(gate) * up * routing).to(dtype)
+        return self._linear(intermediate, weight, 2).float()
 
     def _compute(
         self,
@@ -301,16 +331,7 @@ class TorchBackend(ComputeBackend):
             gate = self._linear(expert_input, weight, 0)
             up = self._linear(expert_input, weight, 1)
             routing = batch.routing_weights[token_indices, route_indices].unsqueeze(1)
-            if self._expert_compute == "deepseek_v4":
-                gate, up = gate.float(), up.float()
-                if self._swiglu_limit > 0:
-                    gate = gate.clamp(max=self._swiglu_limit)
-                    up = up.clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
-                intermediate = (functional.silu(gate) * up * routing).to(expert_input.dtype)
-                weighted = self._linear(intermediate, weight, 2).float()
-            else:
-                intermediate = functional.silu(gate) * up
-                weighted = self._linear(intermediate, weight, 2).float() * routing
+            weighted = self._finish_expert(gate, up, routing, weight)
             accumulator.index_add_(0, token_indices, weighted)
         prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
 

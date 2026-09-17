@@ -142,7 +142,7 @@ def test_v4_w8a8_backend_weighting_clipping_and_completion(
         acquire_many=table.acquire_many,
         expert_compute=expert_compute,
         swiglu_limit=1.0,
-        w8a8=True,
+        linear_compute="w8a8",
     )
     torch.manual_seed(5)
     x = torch.randn(3, 32, device=device) * 4

@@ -168,6 +168,16 @@ class TorchGPTQWeightAdapter(WeightAdapter[TorchGPTQCpuWeight, TorchExpertWeight
         """Use the ordinary adapter's device conversion reservation."""
         return self._float_adapter.conversion_temporary_bytes()
 
+    def host_conversion_temporary_bytes(self) -> int:
+        """Bound retained FP16 matrices, integer expansion, scales, and group indices."""
+        elements = self._hidden_dim * self._intermediate_dim
+        return (
+            3 * elements * 2
+            + 64 * elements
+            + 16 * max(self._hidden_dim, self._intermediate_dim)
+            + 128
+        )
+
 
 class TorchWeightAdapter(WeightAdapter[TorchExpertWeights, TorchExpertWeights]):
     """Build zero-copy CPU views and final-device Torch expert objects."""
