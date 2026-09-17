@@ -23,6 +23,9 @@ pub struct VitalMeta {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 /// Normalized storage and activation recipe for routed expert projections.
+/// `w8a8` fixes symmetric channel INT8 weights and dynamic token INT8
+/// activations with FP32 scales. `mxfp4` fixes E2M1 weights with E8M0 scales
+/// per 32 values and E4M3 activations with power-of-two scales per 128 values.
 pub struct QuantizationMeta {
     pub method: String,
     pub bits: Option<u32>,
@@ -109,8 +112,7 @@ impl ModelConfig {
                     .is_some_and(|v| !v.is_null())
                 || group
                     .get("activation_use_clip")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
+                    .is_some_and(|v| v != &serde_json::json!(false))
             {
                 return Err(unsupported());
             }
@@ -124,6 +126,7 @@ impl ModelConfig {
                     || q["symmetric"] != true
                     || q["strategy"] != strategy
                     || q["dynamic"] != dynamic
+                    || (field == "input_activations" && !q["scale_dtype"].is_null())
                     || ["group_size", "block_structure", "actorder"]
                         .iter()
                         .any(|key| !q[key].is_null())
@@ -473,22 +476,34 @@ where
         Ok(serialized)
     }
 
+    fn expert_prefix(&self, layer_id: usize, expert_id: usize) -> EKResult<String> {
+        let layer = match self.model_config.model_type() {
+            "deepseek_v4" => format!("layers.{layer_id}.ffn"),
+            "deepseek_v2" | "deepseek_v3" | "qwen2_moe" | "qwen3_moe" => {
+                format!("model.layers.{layer_id}.mlp")
+            }
+            "mixtral" => format!("model.layers.{layer_id}.block_sparse_moe"),
+            model => {
+                return Err(EKError::InvalidInput(format!(
+                    "unsupported expert layout: {model}"
+                )));
+            }
+        };
+        Ok(format!("{layer}.experts.{expert_id}."))
+    }
+
     async fn construct_expert_key(
         &self,
         layer_id: usize,
         expert_id: usize,
     ) -> EKResult<Vec<String>> {
+        let prefix = self.expert_prefix(layer_id, expert_id)?;
         let is_v4 = self.model_config.model_type() == "deepseek_v4";
         let is_w8a8 = self
             .model_config
             .expert_quantization()?
             .is_some_and(|q| q.method == "w8a8");
         if is_v4 || is_w8a8 {
-            let prefix = if is_v4 {
-                format!("layers.{layer_id}.ffn.experts.{expert_id}.")
-            } else {
-                format!("model.layers.{layer_id}.mlp.experts.{expert_id}.")
-            };
             // Preserve auxiliary tensors so adapters can reject unsupported formats explicitly.
             let keys: Vec<_> = self
                 .weight_map
@@ -508,8 +523,7 @@ where
                     let names = ["gate_proj", "up_proj", "down_proj"];
                     let mut keys = Vec::with_capacity(12);
                     for projection in names {
-                        let base =
-                            format!("model.layers.{layer_id}.mlp.experts.{expert_id}.{projection}");
+                        let base = format!("{prefix}{projection}");
                         keys.extend([
                             format!("{base}.qweight"),
                             format!("{base}.qzeros"),
@@ -519,16 +533,13 @@ where
                     }
                     return Ok(keys);
                 }
-                let key_up =
-                    format!("model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight");
+                let key_up = format!("{prefix}up_proj.weight");
                 let key_up_scale = format!("{key_up}_scale_inv");
 
-                let key_gate =
-                    format!("model.layers.{layer_id}.mlp.experts.{expert_id}.down_proj.weight");
+                let key_gate = format!("{prefix}down_proj.weight");
                 let key_gate_scale = format!("{key_gate}_scale_inv");
 
-                let key_down =
-                    format!("model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight");
+                let key_down = format!("{prefix}gate_proj.weight");
                 let key_down_scale = format!("{key_down}_scale_inv");
 
                 Ok(vec![
@@ -541,19 +552,13 @@ where
                 ])
             }
             "mixtral" => {
-                let key_up = format!(
-                    "model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.w1.weight"
-                );
+                let key_up = format!("{prefix}w1.weight");
                 let key_up_scale = String::new();
 
-                let key_gate = format!(
-                    "model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.w3.weight"
-                );
+                let key_gate = format!("{prefix}w3.weight");
                 let key_gate_scale = String::new();
 
-                let key_down = format!(
-                    "model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.w2.weight"
-                );
+                let key_down = format!("{prefix}w2.weight");
                 let key_down_scale = String::new();
 
                 Ok(vec![
@@ -706,6 +711,16 @@ mod test {
             ("weights", "num_bits", serde_json::json!(4)),
             ("input_activations", "dynamic", serde_json::json!(false)),
             ("input_activations", "type", serde_json::json!("float")),
+            (
+                "input_activations",
+                "scale_dtype",
+                serde_json::json!("float16"),
+            ),
+            (
+                "input_activations",
+                "scale_dtype",
+                serde_json::json!("float32"),
+            ),
         ] {
             let mut config = v4_config(false);
             config.map.get_mut("quantization_config").unwrap()["config_groups"]["group_0"][field]
@@ -717,6 +732,49 @@ mod test {
             config.map.get_mut("quantization_config").unwrap()["ignore"] =
                 serde_json::json!([ignore]);
             assert!(config.runtime_meta().is_err());
+        }
+        for clip in [
+            serde_json::json!(true),
+            serde_json::json!("false"),
+            serde_json::Value::Null,
+        ] {
+            let mut config = v4_config(false);
+            config.map.get_mut("quantization_config").unwrap()["config_groups"]["group_0"]["activation_use_clip"] =
+                clip;
+            assert!(config.runtime_meta().is_err());
+        }
+        let mut config = v4_config(false);
+        config.map.get_mut("quantization_config").unwrap()["config_groups"]["group_0"]["input_activations"]
+            ["scale_dtype"] = serde_json::Value::Null;
+        assert!(config.runtime_meta().is_ok());
+    }
+
+    #[tokio::test]
+    async fn w8a8_tensor_selection_uses_model_layout() {
+        for (model, prefix) in [
+            ("deepseek_v4", "layers.0.ffn.experts.0."),
+            ("qwen3_moe", "model.layers.0.mlp.experts.0."),
+            ("mixtral", "model.layers.0.block_sparse_moe.experts.0."),
+        ] {
+            let desc = TransformerModelDesc {
+                root: crate::safetensor::test_fixture::synthetic_v4_model(false),
+                ..Default::default()
+            };
+            let mut pretrained = TransformerPretrained::try_from_desc(&desc).unwrap();
+            pretrained
+                .model_config
+                .map
+                .insert("model_type".into(), serde_json::json!(model));
+            pretrained.weight_map.map = pretrained
+                .weight_map
+                .map
+                .into_iter()
+                .map(|(name, file)| (name.replace("layers.0.ffn.experts.0.", prefix), file))
+                .collect();
+            let keys = pretrained.construct_expert_key(0, 0).await.unwrap();
+            assert_eq!(keys.len(), 6);
+            assert!(keys.iter().all(|key| key.starts_with(prefix)));
+            assert!(pretrained.construct_expert_key(0, 999).await.is_err());
         }
     }
 
