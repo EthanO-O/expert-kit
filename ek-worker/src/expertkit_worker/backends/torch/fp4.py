@@ -9,6 +9,8 @@ from expertkit_worker.backends.torch.weights import TorchExpertWeights
 from expertkit_worker.weights.adapter import WeightAdapter
 from expertkit_worker.weights.format import SafeTensorData, SafeTensorDType
 
+_DECODE_BLOCK_ELEMENTS = 65536
+
 
 def dequantize_fp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Decode low-nibble-first E2M1 weights and E8M0 scale bytes on CPU.
@@ -17,18 +19,22 @@ def dequantize_fp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dtyp
     Return a new contiguous [output, input] tensor in the requested floating dtype.
     """
     outputs, columns = packed.shape
-    nibble = torch.stack((packed & 15, packed >> 4), dim=-1).long()
-    magnitude = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    values = magnitude[nibble & 7] * torch.where((nibble & 8) != 0, -1.0, 1.0)
-    factors = torch.ldexp(torch.ones_like(scales, dtype=torch.float32), scales.int() - 127)
-    result = (
-        (values.reshape(outputs, -1, 32) * factors.unsqueeze(-1))
-        .reshape(outputs, columns * 2)
-        .to(dtype)
-    )
-    if not torch.all(torch.isfinite(result)):
-        raise ValueError("FP4 weights overflow the selected compute dtype")
-    return result.contiguous()
+    result = torch.empty((outputs, columns * 2), dtype=dtype)
+    flat_result, flat_packed, flat_scales = result.view(-1), packed.reshape(-1), scales.reshape(-1)
+    magnitude = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+    for start in range(0, flat_packed.numel(), _DECODE_BLOCK_ELEMENTS // 2):
+        block = flat_packed[start : start + _DECODE_BLOCK_ELEMENTS // 2]
+        nibble = torch.stack((block & 15, block >> 4), dim=-1).long()
+        values = magnitude[nibble & 7] * torch.where((nibble & 8) != 0, -1.0, 1.0)
+        scale_block = flat_scales[start // 16 : (start + block.numel()) // 16]
+        factors = torch.ldexp(
+            torch.ones_like(scale_block, dtype=torch.float32), scale_block.int() - 127
+        )
+        destination = flat_result[2 * start : 2 * (start + block.numel())]
+        destination.copy_((values.reshape(-1, 32) * factors.unsqueeze(-1)).reshape(-1))
+        if not torch.all(torch.isfinite(destination)):
+            raise ValueError("FP4 weights overflow the selected compute dtype")
+    return result
 
 
 def fp8_activation_reference(x: torch.Tensor) -> torch.Tensor:
@@ -136,3 +142,8 @@ class TorchFP4WeightAdapter(
     def conversion_temporary_bytes(self) -> int:
         """Return device conversion scratch, excluding transient CPU decoding."""
         return self._float_adapter.conversion_temporary_bytes()
+
+    def host_conversion_temporary_bytes(self) -> int:
+        """Bound three decoded matrices plus overlapping block decode temporaries."""
+        elements = self._hidden_dim * self._intermediate_dim
+        return self.ready_weight_bytes() + 64 * min(elements, _DECODE_BLOCK_ELEMENTS) + 1024

@@ -55,8 +55,11 @@ Important settings:
   allowed to wait outside the fixed execution slots. It defaults to
   `worker.max_active_batches_per_device` when omitted.
 - `weight_manager.max_concurrent_loads` defaults to `64`.
-- The DRAM cache limit defaults to enough bytes for the model's complete expert
-  set. Set `weight_manager.dram_cache.max_bytes` to impose a smaller LRU cache.
+- The Host weight budget defaults to enough bytes for the model's complete expert
+  cache plus concurrent conversion capacity. An explicit
+  `weight_manager.dram_cache.max_bytes` includes both; startup subtracts
+  `max_concurrent_loads * adapter.host_conversion_temporary_bytes()` before sizing
+  the LRU cache. See [quantization implementation](./QUANTIZATION.md) for details.
 - Disk-cache writeback defaults to enabled. A remote weight is validated before
   it is published in the cache.
 - Heartbeats default to every 3 seconds with a 10-second Controller timeout.

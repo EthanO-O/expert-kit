@@ -20,7 +20,13 @@ class ModelMetadataUnavailable(ModelMetadataError):
 
 @dataclass(frozen=True)
 class QuantizationMetadata:
-    """Normalized quantization recipe advertised by the Weight Server."""
+    """Closed quantization recipes advertised by the Weight Server.
+
+    W8A8 means symmetric channel INT8 weights and dynamic token INT8 activations
+    with FP32 scales. MXFP4 means E2M1/E8M0 weights in groups of 32 and E4M3
+    activation rounding in groups of 128 with power-of-two scales. These method
+    names do not imply support for arbitrary exports with the same bit widths.
+    """
 
     method: str
     bits: int | None

@@ -55,8 +55,7 @@ def test_v4_dimensions_place_and_execute_bf16(recipe: str) -> None:
         acquire_many=table.acquire_many,
         expert_compute="deepseek_v4",
         swiglu_limit=10.0,
-        fp8_activations=recipe == "fp4",
-        w8a8=recipe == "w8a8",
+        linear_compute="fp8_reference" if recipe == "fp4" else "w8a8",
     )
     x = torch.ones(1, hidden, dtype=torch.bfloat16, device="cuda:0")
     batch = BackendBatch(

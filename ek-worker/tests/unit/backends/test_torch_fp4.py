@@ -89,3 +89,42 @@ def test_fp8_activation_rounding_and_zero_rows(device: str) -> None:
     expected = x.clone()
     expected[0, 2], expected[0, 130] = -1.25, -2.5
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_fp4_chunk_boundaries_and_partial_last_block(dtype: torch.dtype) -> None:
+    from expertkit_worker.backends.torch.fp4 import dequantize_fp4
+
+    rows, cols = 513, 256
+    packed = torch.tensor([0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE], dtype=torch.uint8)
+    packed = packed.repeat(rows * cols // 16).reshape(rows, cols // 2)
+    scale_bytes = (torch.arange(rows * cols // 32) % 5 + 125).to(torch.uint8).reshape(rows, -1)
+    decoded = dequantize_fp4(packed, scale_bytes, dtype)
+    values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    expected = values.repeat(rows * cols // 16).reshape(rows, cols)
+    expected *= torch.pow(2.0, scale_bytes.float() - 127).repeat_interleave(32, dim=1)
+    torch.testing.assert_close(decoded, expected.to(dtype), rtol=0, atol=0)
+
+
+def test_fp4_decode_avoids_full_matrix_integer_temporaries() -> None:
+    from expertkit_worker.backends.torch.fp4 import dequantize_fp4
+
+    packed = torch.full((1024, 512), 0x22, dtype=torch.uint8)
+    scales = torch.full((1024, 32), 127, dtype=torch.uint8)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True
+    ) as profile:
+        decoded = dequantize_fp4(packed, scales, torch.bfloat16)
+    assert decoded.eq(1).all()
+    largest_allocation = max(event.self_cpu_memory_usage for event in profile.events())
+    assert largest_allocation < decoded.numel() * torch.int64.itemsize
+
+
+def test_fp4_rejects_compute_dtype_overflow() -> None:
+    a = TorchFP4WeightAdapter(
+        hidden_dim=128, intermediate_dim=256, device="cpu", compute_dtype=torch.float16
+    )
+    with pytest.raises(ValueError, match="overflow"):
+        a.make_ready_weight(
+            a.make_cpu_weight(parse_safetensors(bundle(145))), layer_id=0, expert_id=0
+        )

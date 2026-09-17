@@ -124,15 +124,16 @@ def create_compute_backend(
             dtype=dtype,
             device=device,
             acquire_many=acquire_many,
-            w8a8=(
-                config.model.quantization is not None
-                and config.model.quantization.type is QuantizationType.W8A8
-            ),
             expert_compute=config.model.expert_compute,
             swiglu_limit=config.model.swiglu_limit,
-            fp8_activations=(
-                config.model.quantization is not None
-                and config.model.quantization.type is QuantizationType.FP4
+            linear_compute=(
+                {
+                    QuantizationType.W8A8: "w8a8",
+                    QuantizationType.FP4: "fp8_reference",
+                    QuantizationType.GPTQ: "float",
+                }[config.model.quantization.type]
+                if config.model.quantization is not None
+                else "float"
             ),
         )
     if config.worker.backend is BackendName.GGML:
