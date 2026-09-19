@@ -7,6 +7,7 @@ from importlib import import_module
 from typing import Protocol, cast
 
 import torch
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
@@ -115,6 +116,31 @@ class AscendExpertSelector:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         options = self._options
         config = options.moe_config
+        if self._tid2eid is not None and options.scoring_func == "sqrtsoftplus":
+            if not options.renormalize:
+                raise ValueError("Ascend V4 hash routing requires normalized top-k weights")
+            if input_ids is None:
+                input_ids = getattr(get_forward_context(), "input_ids", None)
+            if input_ids is None or input_ids.numel() != hidden_states.shape[0]:
+                raise ValueError("Ascend V4 hash routing requires one input ID per local token")
+            # EK owns expert dispatch, so native MoE token collectives must not run.
+            input_ids = torch.where(input_ids == -1, 0, input_ids).to(torch.int64)
+            weights, ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+                x=router_logits,
+                k=options.top_k,
+                bias=options.e_score_correction_bias,
+                input_ids=input_ids,
+                tid2eid=self._tid2eid.to(torch.int32),
+                k_group=options.topk_group or 1,
+                group_count=options.num_expert_group or 1,
+                routed_scaling_factor=options.routed_scaling_factor,
+                eps=1e-20,
+                group_select_mode=1,
+                renorm=0,
+                norm_type=2,
+                out_flag=False,
+            )
+            return weights, ids
         return self._select(
             hidden_states=hidden_states,
             router_logits=router_logits,

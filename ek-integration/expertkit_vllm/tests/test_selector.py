@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
@@ -146,3 +148,57 @@ def test_factory_uses_ascend_only_for_the_npu_platform(monkeypatch) -> None:
     )
 
     assert selector.create_expert_selector(router, options) is sentinel
+
+
+@pytest.mark.skipif(os.getenv("EK_TEST_NPU") != "1", reason="requires an assigned Ascend NPU")
+@pytest.mark.parametrize("hashed", [False, True])
+def test_v4_npu_routing_matches_local_reference_without_collectives(monkeypatch, hashed):
+    pytest.importorskip("torch_npu")
+    from vllm_ascend.ops.fused_moe import experts_selector
+    from vllm_ascend.utils import enable_custom_op
+
+    assert enable_custom_op()
+    torch.npu.set_device(0)
+    logits = torch.linspace(-3, 3, 256).repeat(3, 1)
+    logits[1] = logits[1].flip(0)
+    bias = torch.linspace(0, 0.2, 256)
+    table = torch.tensor([[7, 3, 11, 29, 47, 53], [4, 6, 8, 10, 12, 14]], dtype=torch.int32)
+    input_ids = torch.tensor([0, 1, -1], device="npu:0")
+    context = SimpleNamespace(input_ids=input_ids)
+    # Remote experts use local tokens; no native expert collective is initialized.
+    monkeypatch.setattr(experts_selector, "get_forward_context", lambda: context)
+    if hasattr(selector, "get_forward_context"):
+        monkeypatch.setattr(selector, "get_forward_context", lambda: context)
+    options = _options()
+    options.top_k = 6
+    options.topk_group = options.num_expert_group = 1
+    options.scoring_func = "sqrtsoftplus"
+    options.routed_scaling_factor = 1.5
+    options.e_score_correction_bias = None if hashed else bias.npu()
+    options.moe_config.num_logical_experts = options.moe_config.num_experts = 256
+    adapter = selector.AscendExpertSelector(options, tid2eid=table.npu() if hashed else None)
+    weights, ids = adapter.select_experts(torch.zeros(3, 4096, device="npu:0"), logits.npu())
+    scores = torch.nn.functional.softplus(logits).sqrt()
+    expected_ids = table[[0, 1, 0]].long() if hashed else (scores + bias).topk(6, dim=-1).indices
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights = expected_weights / expected_weights.sum(-1, keepdim=True) * 1.5
+    actual = torch.zeros(3, 256).scatter_(1, ids.cpu().long(), weights.cpu())
+    expected = torch.zeros(3, 256).scatter_(1, expected_ids, expected_weights)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "renormalize,input_ids",
+    [(False, torch.tensor([0])), (True, None), (True, torch.tensor([0, 1]))],
+)
+def test_v4_hash_routing_rejects_invalid_local_contract(monkeypatch, renormalize, input_ids):
+    monkeypatch.setattr(selector, "_load_ascend_select_experts", lambda: None)
+    monkeypatch.setattr(
+        selector, "get_forward_context", lambda: SimpleNamespace(input_ids=input_ids)
+    )
+    options = _options()
+    options.scoring_func = "sqrtsoftplus"
+    options.renormalize = renormalize
+    adapter = selector.AscendExpertSelector(options, tid2eid=torch.zeros(2, 2, dtype=torch.int32))
+    with pytest.raises(ValueError, match="hash routing requires"):
+        adapter.select_experts(torch.zeros(1, 4), torch.zeros(1, 8))
