@@ -385,3 +385,25 @@ def test_auto_loader_reports_only_consumed_parameters(monkeypatch):
     assert runner.load_weights(iter([("0.down_proj.weight", torch.ones(2, 2))])) == {
         "routed_experts.w2_weight"
     }
+
+
+def test_runner_uses_precast_fp32_router_weights(monkeypatch):
+    runner, gate, _ = _make_remote_runner(monkeypatch)
+    gate.to(dtype=torch.bfloat16)
+    gate.weight_fp32 = torch.tensor([[1.003, 0.001], [0.002, 1.007]])
+    hidden = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    observed = []
+
+    class Selector:
+        def select_experts(self, hidden_states, router_logits, *, input_ids):
+            observed.append(router_logits)
+            return torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32)
+
+    runner.expert_selector = Selector()
+    runner._shared_experts_module = None
+    monkeypatch.setattr(
+        remote_moe, "_client_for", lambda *_: SimpleNamespace(execute=lambda **_: hidden)
+    )
+    runner._forward_impl(hidden, hidden, None)
+    assert observed[0].dtype == torch.float32
+    torch.testing.assert_close(observed[0], hidden.float() @ gate.weight_fp32.T, rtol=0, atol=0)

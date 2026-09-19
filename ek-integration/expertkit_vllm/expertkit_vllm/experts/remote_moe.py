@@ -324,7 +324,13 @@ class RemoteMoERunner(MoERunnerInterface):
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.gate is not None:
-            router_logits = _unwrap_tensor(self.gate(hidden_states))
+            if hasattr(self.gate, "weight_fp32"):
+                # Ascend preserves FP32 gate weights for stable expert selection.
+                router_logits = torch.nn.functional.linear(
+                    hidden_states.float(), self.gate.weight_fp32
+                )
+            else:
+                router_logits = _unwrap_tensor(self.gate(hidden_states))
         # Expert selector (in vLLM or vLLM-Ascend) will select experts
         # under different platform and runtime
         routing_weights, expert_ids = self.expert_selector.select_experts(
