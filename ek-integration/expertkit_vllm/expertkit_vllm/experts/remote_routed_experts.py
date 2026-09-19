@@ -70,8 +70,7 @@ class RemoteRoutedExperts(nn.Module):
         # experts are discarded and recomputed by EK, so this quantization
         # configuration is compatible with the remote placeholder.
         modelslim_quantization = (
-            quant_config is not None
-            and quant_config.__class__.__name__ == "AscendModelSlimConfig"
+            quant_config is not None and quant_config.__class__.__name__ == "AscendModelSlimConfig"
         )
 
         unsupported = {
@@ -97,31 +96,41 @@ class RemoteRoutedExperts(nn.Module):
         if enabled:
             raise ValueError(f"Expert Kit remote MoE does not support: {', '.join(enabled)}")
 
-        self._load_weight_sink()
+        self._load_weight_sink(modelslim_quantization=modelslim_quantization)
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         raise AssertionError("RemoteRoutedExperts must be executed through RemoteMoERunner")
 
-    def _load_weight_sink(self) -> None:
-        for name in ("w13_weight", "w2_weight"):
+    def _load_weight_sink(self, *, modelslim_quantization: bool) -> None:
+        suffixes = (
+            ("weight", "weight_scale", "weight_offset") if modelslim_quantization else ("weight",)
+        )
+        for name in (
+            f"{projection}_{suffix}" for projection in ("w13", "w2") for suffix in suffixes
+        ):
             param = nn.Parameter(torch.empty(0), requires_grad=False)
-            # 1. Weight loader is required by vLLM fused moe
-            # when loading expert weights. Expert Kit should discard weights
-            # and delegate it to workers
-            # 2. `set_weight_attrs` essentially does param.weight_loader = _discard_weight
-            # but in a dynamic way
+            # Model loaders resolve parameters before invoking their loaders.
+            # Empty parameters acknowledge remote weights without allocating storage.
             set_weight_attrs(param, {"weight_loader": _discard_weight})
             self.register_parameter(name, param)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Consume remote expert checkpoint entries without retaining local weights."""
-        consumed = False
-
-        # Consume iterator
-        for _ in weights:
-            consumed = True
-
-        return {"w13_weight", "w2_weight"} if consumed else set()
+        projections = {
+            self.ckpt_gate_proj_name: "w13",
+            self.ckpt_up_proj_name: "w13",
+            self.ckpt_down_proj_name: "w2",
+        }
+        loaded = set()
+        for name, _ in weights:
+            parts = name.split(".")
+            if len(parts) != 3 or not parts[0].isdigit() or parts[1] not in projections:
+                raise ValueError(f"unsupported remote expert checkpoint parameter: {name}")
+            destination = f"{projections[parts[1]]}_{parts[2]}"
+            if destination not in self._parameters:
+                raise ValueError(f"unsupported remote expert checkpoint parameter: {name}")
+            loaded.add(destination)
+        return loaded
 
 
 def _discard_weight(

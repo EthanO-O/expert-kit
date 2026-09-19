@@ -59,7 +59,9 @@ class _AutoLoaderHarness(nn.Module):
         )
 
 
-def _make_remote_runner(monkeypatch) -> tuple[remote_moe.RemoteMoERunner, nn.Linear, nn.Linear]:
+def _make_remote_runner(
+    monkeypatch, quant_config=None
+) -> tuple[remote_moe.RemoteMoERunner, nn.Linear, nn.Linear]:
     compilation = SimpleNamespace(
         static_forward_context={},
         static_all_moe_layers=[],
@@ -114,7 +116,7 @@ def _make_remote_runner(monkeypatch) -> tuple[remote_moe.RemoteMoERunner, nn.Lin
         "layers.1.mlp.experts",
         torch.float32,
         moe_config,
-        None,
+        quant_config,
         expert_map_manager,
     )
     runner = remote_moe.RemoteMoERunner(
@@ -244,3 +246,142 @@ def test_client_creation_uses_model_metadata_captured_during_layer_init(monkeypa
     assert isinstance(client, FakeClient)
     assert created[0]["num_layers"] == 27
     remote_moe.close_clients()
+
+
+@pytest.fixture
+def v4_model(monkeypatch):
+    """Provide a small module tree and single-rank distributed boundaries."""
+    pytest.importorskip("vllm_ascend")
+    from vllm_ascend.models import deepseek_v4
+    from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
+
+    monkeypatch.setattr(
+        deepseek_v4, "get_ascend_config", lambda: SimpleNamespace(mix_placement=False)
+    )
+    monkeypatch.setattr(deepseek_v4, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(deepseek_v4, "get_tensor_model_parallel_world_size", lambda: 1)
+    runner, gate, _ = _make_remote_runner(monkeypatch, AscendModelSlimConfig())
+    shared = nn.Module()
+    shared.down_proj = nn.Linear(2, 2, bias=False)
+    layer = nn.Module()
+    layer.self_attn = nn.Linear(2, 2, bias=False)
+    for module in (layer.self_attn, shared.down_proj):
+        for suffix in ("weight_scale", "weight_offset"):
+            module.register_parameter(suffix, nn.Parameter(torch.zeros(2, 1), requires_grad=False))
+    layer.mlp = nn.Module()
+    layer.mlp.gate = gate
+    layer.mlp.shared_experts = shared
+    layer.mlp.experts = runner
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([layer])
+    model.config = SimpleNamespace(n_routed_experts=2, n_shared_experts=1, num_attention_heads=1)
+    model.num_redundant_experts = 0
+    return model
+
+
+def _load(model, weights):
+    from vllm_ascend.models import deepseek_v4
+
+    return deepseek_v4.AscendDeepseekV4ForCausalLM.load_weights(model, iter(weights))
+
+
+@pytest.mark.parametrize("projection,target", [("w1", "w13"), ("w3", "w13"), ("w2", "w2")])
+@pytest.mark.parametrize("suffix", ["weight_offset", "weight_scale", "weight"])
+def test_v4_loader_consumes_modelslim_routed_parameters(v4_model, projection, target, suffix):
+    source = f"layers.0.ffn.experts.0.{projection}.{suffix}"
+    destination = f"model.layers.0.mlp.experts.routed_experts.{target}_{suffix}"
+    dtype = torch.int8 if suffix == "weight" else torch.float32
+    loaded = _load(v4_model, [(source, torch.ones(2, 2, dtype=dtype))])
+    assert loaded == {destination}
+    parameters = dict(v4_model.named_parameters())
+    assert parameters[destination].untyped_storage().nbytes() == 0
+
+
+def test_v4_loader_preserves_all_local_weights(v4_model):
+    local = {
+        "layers.0.attn.weight": "model.layers.0.self_attn.weight",
+        "layers.0.ffn.gate.weight": "model.layers.0.mlp.gate.weight",
+        "layers.0.ffn.shared_experts.w2.weight": (
+            "model.layers.0.mlp.shared_experts.down_proj.weight"
+        ),
+    }
+    weights = [(source, torch.full((2, 2), float(index + 3))) for index, source in enumerate(local)]
+    assert _load(v4_model, weights) == set(local.values())
+    parameters = dict(v4_model.named_parameters())
+    for source, value in weights:
+        torch.testing.assert_close(parameters[local[source]], value)
+
+
+@pytest.mark.parametrize("suffix", ["weight_scale", "weight_offset"])
+def test_v4_loader_preserves_local_quantization_parameters(v4_model, suffix):
+    weights = [
+        (f"layers.0.attn.{suffix}", torch.full((2, 1), 2.0)),
+        (f"layers.0.ffn.shared_experts.w2.{suffix}", torch.full((2, 1), 3.0)),
+    ]
+    names = [
+        f"model.layers.0.self_attn.{suffix}",
+        f"model.layers.0.mlp.shared_experts.down_proj.{suffix}",
+    ]
+    assert _load(v4_model, weights) == set(names)
+    parameters = dict(v4_model.named_parameters())
+    for name, (_, value) in zip(names, weights, strict=True):
+        torch.testing.assert_close(parameters[name], value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "layers.0.ffn.experts.0.w1.unknown",
+        "layers.0.attn.missing",
+        "layers.0.ffn.shared_experts.w2.missing",
+    ],
+)
+def test_v4_loader_rejects_unknown_parameters(v4_model, name):
+    with pytest.raises(KeyError):
+        _load(v4_model, [(name, torch.zeros(2, 2))])
+
+
+def test_modelslim_auto_loader_reports_auxiliary_parameters(monkeypatch):
+    pytest.importorskip("vllm_ascend")
+    from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
+
+    runner, _, _ = _make_remote_runner(monkeypatch, AscendModelSlimConfig())
+    weights = [
+        (f"0.{projection}.{suffix}", torch.ones(2, 2))
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for suffix in ("weight", "weight_scale", "weight_offset")
+    ]
+    loaded = runner.load_weights(iter(weights))
+    expected = {
+        f"routed_experts.{projection}_{suffix}"
+        for projection in ("w13", "w2")
+        for suffix in ("weight", "weight_scale", "weight_offset")
+    }
+    assert loaded == expected
+    assert all(
+        parameter.untyped_storage().nbytes() == 0
+        for parameter in runner.routed_experts.parameters()
+    )
+
+
+def test_remote_experts_reject_other_quantization(monkeypatch):
+    with pytest.raises(ValueError, match="quantization"):
+        _make_remote_runner(monkeypatch, SimpleNamespace())
+
+
+@pytest.mark.parametrize(
+    "name", ["0.gate_proj.unknown", "shared_experts.weight", "0.down_proj.weight_scale"]
+)
+def test_unquantized_auto_loader_rejects_unrecognized_parameters(monkeypatch, name):
+    runner, _, _ = _make_remote_runner(monkeypatch)
+    with pytest.raises(ValueError, match="unsupported remote expert checkpoint parameter"):
+        runner.load_weights(iter([(name, torch.zeros(2, 2))]))
+
+
+def test_auto_loader_reports_only_consumed_parameters(monkeypatch):
+    runner, _, _ = _make_remote_runner(monkeypatch)
+    assert runner.load_weights(iter([])) == set()
+    assert runner.load_weights(iter([("0.down_proj.weight", torch.ones(2, 2))])) == {
+        "routed_experts.w2_weight"
+    }
