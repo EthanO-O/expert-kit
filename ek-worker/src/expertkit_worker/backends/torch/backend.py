@@ -274,7 +274,9 @@ class TorchBackend(ComputeBackend):
         if len(lease.objects) != len(batch.distinct_expert_ids):
             raise RuntimeError("ready weight lookup returned the wrong object count")
         for weight in lease.objects:
-            if not isinstance(weight, (TorchExpertWeights, TorchW8A8Weights, TorchModelSlimW8A8Weights)):
+            if not isinstance(
+                weight, TorchExpertWeights | TorchW8A8Weights | TorchModelSlimW8A8Weights
+            ):
                 raise RuntimeError("ready weight lookup returned a non-Torch object")
             if not isinstance(weight, self._weight_type):
                 raise RuntimeError("ready weight quantization differs from the Backend recipe")

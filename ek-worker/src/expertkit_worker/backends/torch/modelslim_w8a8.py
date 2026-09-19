@@ -75,8 +75,7 @@ class TorchModelSlimW8A8Weights:
         """Return resident matrix and scale bytes."""
 
         return sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in (*self.matrices, *self.scales)
+            tensor.numel() * tensor.element_size() for tensor in (*self.matrices, *self.scales)
         )
 
 
@@ -130,9 +129,9 @@ class TorchModelSlimW8A8WeightAdapter(
                 raise ValueError("ModelSlim scales must be BF16 or F32 with shape [output, 1]")
             if offset is None or offset.dtype is not scale.dtype or offset.shape != scale.shape:
                 raise ValueError("ModelSlim offsets must match scale dtype and shape")
-            scale_tensor = torch.frombuffer(
-                scale.data, dtype=_SCALE_DTYPES[scale.dtype]
-            ).reshape(scale.shape)
+            scale_tensor = torch.frombuffer(scale.data, dtype=_SCALE_DTYPES[scale.dtype]).reshape(
+                scale.shape
+            )
             offset_tensor = torch.frombuffer(
                 offset.data, dtype=_SCALE_DTYPES[offset.dtype]
             ).reshape(offset.shape)
@@ -175,9 +174,13 @@ class TorchModelSlimW8A8WeightAdapter(
             self._runtime.capture_current_work().wait_host()
             return ready
         except torch.OutOfMemoryError as error:
-            raise WeightPlacementFatalError(WeightPlacementFatalReason.DEVICE_OOM, str(error)) from error
+            raise WeightPlacementFatalError(
+                WeightPlacementFatalReason.DEVICE_OOM, str(error)
+            ) from error
         except RuntimeError as error:
-            raise WeightPlacementFatalError(WeightPlacementFatalReason.DEVICE_FAILURE, str(error)) from error
+            raise WeightPlacementFatalError(
+                WeightPlacementFatalReason.DEVICE_FAILURE, str(error)
+            ) from error
 
     def cpu_extra_bytes(self) -> int:
         """Return zero because CPU tensors view the retained source buffer."""

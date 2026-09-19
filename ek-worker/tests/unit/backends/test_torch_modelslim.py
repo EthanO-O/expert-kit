@@ -45,7 +45,13 @@ def _adapter() -> TorchModelSlimW8A8WeightAdapter:
 
 def test_modelslim_accepts_qwen_and_v4_projection_suffixes() -> None:
     a = _adapter()
-    for values in (_values(), {k.replace("w1", "gate_proj").replace("w2", "down_proj").replace("w3", "up_proj"): v for k, v in _values().items()}):
+    for values in (
+        _values(),
+        {
+            k.replace("w1", "gate_proj").replace("w2", "down_proj").replace("w3", "up_proj"): v
+            for k, v in _values().items()
+        },
+    ):
         cpu = a.make_cpu_weight(parse_safetensors(bytearray(save(values))))
         assert cpu.matrices[0].shape == (8, 4)
         assert a.ready_weight_bytes() == 3 * 4 * 8 + 3 * (2 * 8 + 4) * 4
@@ -69,15 +75,25 @@ def test_modelslim_rejects_nonzero_offsets() -> None:
 def test_modelslim_rejects_cpu_startup() -> None:
     raw = {
         "model": {
-            "name": "m", "weight_version": "v", "num_layers": 1,
-            "experts_per_layer": 1, "hidden_dim": 4, "expert_intermediate_dim": 8,
-            "top_k": 1, "activation_dtype": "bf16", "weight_dtype": "bf16",
+            "name": "m",
+            "weight_version": "v",
+            "num_layers": 1,
+            "experts_per_layer": 1,
+            "hidden_dim": 4,
+            "expert_intermediate_dim": 8,
+            "top_k": 1,
+            "activation_dtype": "bf16",
+            "weight_dtype": "bf16",
             "quantization": {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None},
         },
         "worker": {"id": "w", "backend": "torch", "device": "cpu", "device_memory_limit": "1GiB"},
         "transport": {"type": "grpc", "listen": "127.0.0.1:1", "advertise": "w:1"},
         "controller": {"endpoint": "c:1"},
-        "weight_manager": {"disk_cache": {"path": "/tmp/cache"}, "peer": {"listen": "127.0.0.1:2", "advertise": "http://w:2"}, "weight_server_endpoint": "http://s:1"},
+        "weight_manager": {
+            "disk_cache": {"path": "/tmp/cache"},
+            "peer": {"listen": "127.0.0.1:2", "advertise": "http://w:2"},
+            "weight_server_endpoint": "http://s:1",
+        },
     }
     with pytest.raises(ValueError, match="requires an indexed NPU"):
         WorkerConfig.model_validate(raw)
@@ -87,13 +103,16 @@ def test_modelslim_linear_uses_pinned_operator(monkeypatch: pytest.MonkeyPatch) 
     calls: list[tuple[object, ...]] = []
     module = SimpleNamespace(
         npu_dynamic_quant=lambda x, dst_type: (x.to(torch.int8), torch.ones(x.shape[0])),
-        npu_quant_matmul=lambda *args, **kwargs: calls.append(args) or torch.zeros(
-            (args[0].shape[0], args[1].shape[1]), dtype=kwargs["output_dtype"]
-        ),
+        npu_quant_matmul=lambda *args, **kwargs: calls.append(args)
+        or torch.zeros((args[0].shape[0], args[1].shape[1]), dtype=kwargs["output_dtype"]),
     )
     monkeypatch.setitem(__import__("sys").modules, "torch_npu", module)
     weight = TorchModelSlimW8A8Weights(
-        (torch.ones((4, 8), dtype=torch.int8), torch.ones((4, 8), dtype=torch.int8), torch.ones((8, 4), dtype=torch.int8)),
+        (
+            torch.ones((4, 8), dtype=torch.int8),
+            torch.ones((4, 8), dtype=torch.int8),
+            torch.ones((8, 4), dtype=torch.int8),
+        ),
         (torch.ones(8), torch.ones(8), torch.ones(4)),
         torch.float32,
     )

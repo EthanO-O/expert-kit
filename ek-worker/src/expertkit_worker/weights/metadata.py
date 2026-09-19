@@ -113,7 +113,7 @@ def _parse_payload(payload: Any) -> ModelMetadata:
         limit = 0.0
     if (
         isinstance(limit, bool)
-        or not isinstance(limit, (int, float))
+        or not isinstance(limit, int | float)
         or not math.isfinite(limit)
         or limit < 0
     ):
