@@ -407,3 +407,28 @@ def test_runner_uses_precast_fp32_router_weights(monkeypatch):
     runner._forward_impl(hidden, hidden, None)
     assert observed[0].dtype == torch.float32
     torch.testing.assert_close(observed[0], hidden.float() @ gate.weight_fp32.T, rtol=0, atol=0)
+
+
+def test_runner_combines_shared_and_remote_experts_once(monkeypatch):
+    runner, _, shared = _make_remote_runner(monkeypatch)
+    hidden = torch.tensor([[1.0, 2.0]])
+    original = hidden.clone()
+    calls = []
+    shared.register_forward_hook(lambda *_: calls.append("shared"))
+    runner.expert_selector = SimpleNamespace(
+        select_experts=lambda *_args, **_kwargs: (
+            torch.tensor([[1.5]]),
+            torch.zeros(1, 1, dtype=torch.int32),
+        )
+    )
+
+    def execute(**kwargs):
+        calls.append("remote")
+        torch.testing.assert_close(kwargs["routing_weights"], torch.tensor([[1.5]]))
+        return torch.full_like(hidden, 3.0)
+
+    monkeypatch.setattr(remote_moe, "_client_for", lambda *_: SimpleNamespace(execute=execute))
+    output = runner._forward_impl(hidden, hidden, None)
+    assert calls == ["remote", "shared"]
+    torch.testing.assert_close(output, 3.0 + torch.nn.functional.linear(original, shared.weight))
+    torch.testing.assert_close(hidden, original)
