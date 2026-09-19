@@ -66,8 +66,16 @@ class RemoteRoutedExperts(nn.Module):
 
         vllm_config = get_current_vllm_config()
 
+        # ModelSlim quantizes local attention and checkpoint experts. Remote
+        # experts are discarded and recomputed by EK, so this quantization
+        # configuration is compatible with the remote placeholder.
+        modelslim_quantization = (
+            quant_config is not None
+            and quant_config.__class__.__name__ == "AscendModelSlimConfig"
+        )
+
         unsupported = {
-            "quantization": quant_config is not None,
+            "quantization": quant_config is not None and not modelslim_quantization,
             "prefill_context_parallel": moe_config.pcp_size != 1,
             "sequence_parallel": moe_config.is_sequence_parallel,
             # The wrapper forces the injected MoE's parallel sizes to one so

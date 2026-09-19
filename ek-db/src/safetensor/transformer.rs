@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use actix_web::{HttpResponse, Responder, body::BoxBody, http::header::ContentType};
 use ek_base::error::{EKError, EKResult};
@@ -11,6 +11,7 @@ use super::memcache::{SafeTensorWithData, SafetensorCache};
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     map: std::collections::HashMap<String, serde_json::Value>,
+    modelslim: Option<ModelSlimDescription>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -53,6 +54,113 @@ pub struct RuntimeMeta {
     pub swiglu_limit: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct ModelSlimDescription {
+    model_quant_type: String,
+    entries: HashMap<String, String>,
+}
+
+impl ModelSlimDescription {
+    fn try_from_root(root: &PathBuf) -> EKResult<Option<Self>> {
+        let path = root.join("quant_model_description.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_reader(fs::File::open(&path)?)?;
+        let object = value.as_object().ok_or_else(|| {
+            EKError::InvalidInput("ModelSlim description must be a JSON object".into())
+        })?;
+        if object.get("version").and_then(serde_json::Value::as_str) != Some("1.0.0") {
+            return Err(EKError::InvalidInput(
+                "unsupported ModelSlim description version".into(),
+            ));
+        }
+        let model_quant_type = object
+            .get("model_quant_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                EKError::InvalidInput("ModelSlim global quantization type is missing".into())
+            })?;
+        if !matches!(model_quant_type, "W8A8" | "W8A8_DYNAMIC") {
+            return Err(EKError::InvalidInput(
+                "unsupported ModelSlim global quantization type".into(),
+            ));
+        }
+        if object.get("group_size").and_then(serde_json::Value::as_u64) != Some(0) {
+            return Err(EKError::InvalidInput(
+                "ModelSlim group_size must be zero for dynamic per-channel weights".into(),
+            ));
+        }
+        let mut entries = HashMap::new();
+        for (name, value) in object {
+            if matches!(
+                name.as_str(),
+                "version"
+                    | "model_quant_type"
+                    | "group_size"
+                    | "kv_quant_type"
+                    | "fa_quant_type"
+                    | "metadata"
+                    | "optional"
+            ) {
+                continue;
+            }
+            let kind = value.as_str().ok_or_else(|| {
+                EKError::InvalidInput("ModelSlim tensor descriptions must be strings".into())
+            })?;
+            entries.insert(name.clone(), kind.to_owned());
+        }
+        let expert_entries: Vec<_> = entries
+            .iter()
+            .filter(|(name, _)| name.contains(".experts."))
+            .collect();
+        if expert_entries.is_empty()
+            || expert_entries
+                .iter()
+                .any(|(_, kind)| kind.as_str() != "W8A8_DYNAMIC")
+        {
+            return Err(EKError::InvalidInput(
+                "ModelSlim routed expert entries must use W8A8_DYNAMIC".into(),
+            ));
+        }
+        let mut projections: HashMap<String, [bool; 3]> = HashMap::new();
+        for (name, _) in expert_entries {
+            let (base, slot) = if let Some(base) = name.strip_suffix(".weight") {
+                (base, 0)
+            } else if let Some(base) = name.strip_suffix(".weight_scale") {
+                (base, 1)
+            } else if let Some(base) = name.strip_suffix(".weight_offset") {
+                (base, 2)
+            } else {
+                return Err(EKError::InvalidInput(
+                    "ModelSlim expert entries must be weight/scale/offset triples".into(),
+                ));
+            };
+            if ![".gate_proj", ".up_proj", ".down_proj", ".w1", ".w2", ".w3"]
+                .iter()
+                .any(|suffix| base.ends_with(suffix))
+            {
+                return Err(EKError::InvalidInput(
+                    "unsupported ModelSlim expert projection name".into(),
+                ));
+            }
+            projections.entry(base.to_owned()).or_default()[slot] = true;
+        }
+        if projections
+            .values()
+            .any(|slots| slots != &[true, true, true])
+        {
+            return Err(EKError::InvalidInput(
+                "ModelSlim expert projections require weight, scale, and offset".into(),
+            ));
+        }
+        Ok(Some(Self {
+            model_quant_type: model_quant_type.to_owned(),
+            entries,
+        }))
+    }
+}
+
 impl ModelConfig {
     fn try_from_desc(desc: &TransformerModelDesc) -> EKResult<Self> {
         let path = desc.root.join(&desc.config_name);
@@ -61,7 +169,8 @@ impl ModelConfig {
             EKError::IoError(e)
         })?;
         let map: HashMap<_, _> = serde_json::from_reader(file)?;
-        Ok(Self { map })
+        let modelslim = ModelSlimDescription::try_from_root(&desc.root)?;
+        Ok(Self { map, modelslim })
     }
     pub fn model_type(&self) -> &str {
         self.map.get("model_type").unwrap().as_str().unwrap()
@@ -83,7 +192,30 @@ impl ModelConfig {
         self.quantization_method() == Some("gptq")
     }
 
+    fn is_modelslim(&self) -> bool {
+        self.modelslim.is_some()
+    }
+
     fn expert_quantization(&self) -> EKResult<Option<QuantizationMeta>> {
+        if let Some(description) = &self.modelslim {
+            if description.entries.is_empty()
+                || !matches!(
+                    description.model_quant_type.as_str(),
+                    "W8A8" | "W8A8_DYNAMIC"
+                )
+            {
+                return Err(EKError::InvalidInput(
+                    "unsupported ModelSlim global quantization type".into(),
+                ));
+            }
+            return Ok(Some(QuantizationMeta {
+                method: "modelslim-w8a8-dynamic".into(),
+                bits: Some(8),
+                group_size: None,
+                symmetric: Some(true),
+                desc_act: Some(false),
+            }));
+        }
         let Some(config) = self.map.get("quantization_config") else {
             return Ok(None);
         };
@@ -324,7 +456,32 @@ struct WeightMap {
 impl WeightMap {
     fn try_from_desc(desc: &TransformerModelDesc) -> EKResult<Self> {
         let mut map = HashMap::new();
-        let path = desc.root.join(&desc.weight_map_name);
+        let mut path = desc.root.join(&desc.weight_map_name);
+        if !path.exists() {
+            if !desc.root.join("quant_model_description.json").exists() {
+                return Err(EKError::NotFound(format!(
+                    "weight map not found: {}",
+                    path.to_string_lossy()
+                )));
+            }
+            let mut candidates = fs::read_dir(&desc.root)?
+                .filter_map(|entry| entry.ok().map(|item| item.path()))
+                .filter(|candidate| {
+                    candidate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort();
+            if candidates.len() != 1 {
+                return Err(EKError::InvalidInput(format!(
+                    "expected exactly one alternate SafeTensors index, found {}",
+                    candidates.len()
+                )));
+            }
+            path = candidates.pop().unwrap();
+        }
         let file = std::fs::File::open(path.clone()).map_err(move |e| {
             log::error!(
                 "can not found weight_map_file at {}",
@@ -503,7 +660,7 @@ where
             .model_config
             .expert_quantization()?
             .is_some_and(|q| q.method == "w8a8");
-        if is_v4 || is_w8a8 {
+        if is_v4 || is_w8a8 || self.model_config.is_modelslim() {
             // Preserve auxiliary tensors so adapters can reject unsupported formats explicitly.
             let keys: Vec<_> = self
                 .weight_map
@@ -678,6 +835,7 @@ mod test {
         };
         super::ModelConfig {
             map: serde_json::from_str(raw).unwrap(),
+            modelslim: None,
         }
     }
 

@@ -44,6 +44,7 @@ class QuantizationType(StrEnum):
 
     GPTQ = "gptq"
     W8A8 = "w8a8"
+    MODELSLIM_W8A8_DYNAMIC = "modelslim-w8a8-dynamic"
     FP4 = "fp4"
 
 
@@ -65,6 +66,12 @@ class QuantizationConfig(_StrictModel):
             raise ValueError("GPTQ requires a positive group_size")
         if self.type is QuantizationType.W8A8 and (self.bits != 8 or self.group_size is not None):
             raise ValueError("W8A8 requires 8-bit per-channel weights with group_size null")
+        if self.type is QuantizationType.MODELSLIM_W8A8_DYNAMIC and (
+            self.bits != 8 or self.group_size is not None
+        ):
+            raise ValueError(
+                "ModelSlim W8A8_DYNAMIC requires 8-bit per-channel weights with group_size null"
+            )
         if self.type is QuantizationType.FP4 and self.group_size != 32:
             raise ValueError("FP4 requires group_size 32")
         if not self.symmetric:
@@ -373,6 +380,13 @@ class WorkerConfig(_StrictModel):
         # TODO: NPU support on SHM?
         if self.worker.device.startswith("npu:") and isinstance(self.transport, ShmTransportConfig):
             raise ValueError("NPU workers currently require the gRPC transport")
+
+        if (
+            self.model.quantization is not None
+            and self.model.quantization.type is QuantizationType.MODELSLIM_W8A8_DYNAMIC
+            and not self.worker.device.startswith("npu:")
+        ):
+            raise ValueError("ModelSlim W8A8_DYNAMIC requires an indexed NPU device")
 
         if self.worker.backend is not BackendName.TORCH and (
             self.model.quantization is not None or self.model.expert_compute != "swiglu"

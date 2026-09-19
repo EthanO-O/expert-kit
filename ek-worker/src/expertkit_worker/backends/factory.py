@@ -50,6 +50,17 @@ def create_weight_adapter(
                     device=runtime.device,
                     compute_dtype=compute_dtype,
                 )
+            if config.model.quantization.type is QuantizationType.MODELSLIM_W8A8_DYNAMIC:
+                if runtime.device.type != "npu":
+                    raise ValueError("ModelSlim W8A8_DYNAMIC requires an indexed NPU device")
+                from expertkit_worker.backends.torch import TorchModelSlimW8A8WeightAdapter
+
+                return TorchModelSlimW8A8WeightAdapter(
+                    hidden_dim=config.model.hidden_dim,
+                    intermediate_dim=config.model.expert_intermediate_dim,
+                    runtime=runtime,
+                    compute_dtype=compute_dtype,
+                )
             if config.model.quantization.type is QuantizationType.FP4:
                 return TorchFP4WeightAdapter(
                     hidden_dim=config.model.hidden_dim,
@@ -130,6 +141,7 @@ def create_compute_backend(
             linear_compute=(
                 {
                     QuantizationType.W8A8: "w8a8",
+                    QuantizationType.MODELSLIM_W8A8_DYNAMIC: "modelslim_w8a8_dynamic",
                     QuantizationType.FP4: "fp8_reference",
                     QuantizationType.GPTQ: "float",
                 }[config.model.quantization.type]

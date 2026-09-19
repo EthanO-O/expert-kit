@@ -22,13 +22,17 @@ from expertkit_worker.backends.base import (
     InvalidBackendInput,
 )
 from expertkit_worker.backends.torch.fp4 import fp8_activation_reference
+from expertkit_worker.backends.torch.modelslim_w8a8 import (
+    TorchModelSlimW8A8Weights,
+    modelslim_w8a8_linear,
+)
 from expertkit_worker.backends.torch.w8a8 import TorchW8A8Weights, w8a8_linear
 from expertkit_worker.backends.torch.weights import TorchExpertWeights
 from expertkit_worker.device import CpuWorkerRuntime, CudaWorkerRuntime, WorkerDeviceRuntime
 from expertkit_worker.device.runtime import DeviceWork
 from expertkit_worker.weights import ReadyWeightLease, WeightsNotReady
 
-type TorchReadyWeights = TorchExpertWeights | TorchW8A8Weights
+type TorchReadyWeights = TorchExpertWeights | TorchW8A8Weights | TorchModelSlimW8A8Weights
 
 type AcquireTorchWeights = Callable[
     [int, tuple[int, ...]],
@@ -137,6 +141,7 @@ class TorchBackend(ComputeBackend):
             "float": self._float_linear,
             "fp8_reference": self._fp8_linear,
             "w8a8": self._w8a8_linear,
+            "modelslim_w8a8_dynamic": self._modelslim_w8a8_linear,
         }
         if linear_compute not in linear_implementations:
             raise ValueError("unsupported linear computation recipe")
@@ -145,7 +150,10 @@ class TorchBackend(ComputeBackend):
         self._expert_compute = expert_compute
         self._swiglu_limit = swiglu_limit
         self._linear = linear_implementations[linear_compute]
-        self._weight_type = TorchW8A8Weights if linear_compute == "w8a8" else TorchExpertWeights
+        self._weight_type = {
+            "w8a8": TorchW8A8Weights,
+            "modelslim_w8a8_dynamic": TorchModelSlimW8A8Weights,
+        }.get(linear_compute, TorchExpertWeights)
         self._finish_expert = (
             self._v4_output if expert_compute == "deepseek_v4" else self._swiglu_output
         )
@@ -266,7 +274,7 @@ class TorchBackend(ComputeBackend):
         if len(lease.objects) != len(batch.distinct_expert_ids):
             raise RuntimeError("ready weight lookup returned the wrong object count")
         for weight in lease.objects:
-            if not isinstance(weight, (TorchExpertWeights, TorchW8A8Weights)):
+            if not isinstance(weight, (TorchExpertWeights, TorchW8A8Weights, TorchModelSlimW8A8Weights)):
                 raise RuntimeError("ready weight lookup returned a non-Torch object")
             if not isinstance(weight, self._weight_type):
                 raise RuntimeError("ready weight quantization differs from the Backend recipe")
@@ -300,6 +308,12 @@ class TorchBackend(ComputeBackend):
     @staticmethod
     def _w8a8_linear(x: torch.Tensor, weight: TorchW8A8Weights, projection: int) -> torch.Tensor:
         return w8a8_linear(x, weight.matrices[projection], weight.scales[projection])
+
+    @staticmethod
+    def _modelslim_w8a8_linear(
+        x: torch.Tensor, weight: TorchModelSlimW8A8Weights, projection: int
+    ) -> torch.Tensor:
+        return modelslim_w8a8_linear(x, weight, projection)
 
     def _swiglu_output(
         self, gate: torch.Tensor, up: torch.Tensor, routing: torch.Tensor, weight: TorchReadyWeights

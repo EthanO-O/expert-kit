@@ -164,6 +164,19 @@ def _quantization_from_metadata(metadata: ModelMetadata) -> QuantizationConfig |
         return QuantizationConfig(
             type=QuantizationType.W8A8, bits=8, group_size=recipe.group_size, symmetric=True
         )
+    if (
+        method == QuantizationType.MODELSLIM_W8A8_DYNAMIC.value
+        and recipe.bits == 8
+        and recipe.group_size is None
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(
+            type=QuantizationType.MODELSLIM_W8A8_DYNAMIC,
+            bits=8,
+            group_size=None,
+            symmetric=True,
+        )
     if method != QuantizationType.GPTQ.value:
         raise ValueError(f"unsupported model quantization method: {recipe.method}")
     if recipe.bits != 4 or recipe.group_size is None:
