@@ -18,6 +18,17 @@ async fn load_meta_vital(
     Ok(web::Json(vital))
 }
 
+#[get("/meta/model/{model}")]
+async fn load_meta_model(
+    req: HttpRequest,
+    wm: web::Data<&'static WeightManager<'static>>,
+) -> EKResult<impl Responder> {
+    let model = req.match_info().get("model").unwrap();
+    let pretrained = wm.load_pretrained(model.to_owned()).await?;
+    let lg = pretrained.read().await;
+    Ok(web::Json(lg.config().runtime_meta()?))
+}
+
 #[get("/expert/{model}/{layer}/{expert}")]
 async fn load_expert(
     req: HttpRequest,
@@ -70,6 +81,7 @@ pub async fn listen<A: ToSocketAddrs>(
             .service(load_layer)
             .service(load_expert)
             .service(load_meta_vital)
+            .service(load_meta_model)
     })
     .bind(addr.as_slice())?
     .run()
@@ -136,7 +148,7 @@ mod test {
         ];
 
         for name in expected {
-            assert!(names.contains(&&name.to_string()));
+            assert!(names.contains(&name));
         }
         let tensor = st
             .tensor("model.layers.3.mlp.experts.32.down_proj.weight")
@@ -167,5 +179,73 @@ mod test {
         assert_eq!(vital.moe_layers, (0, 10));
         assert_eq!(vital.hidden_dim, 16);
         assert_eq!(vital.inter_dim, 8);
+    }
+
+    #[actix_web::test]
+    async fn test_load_meta_model() {
+        let wm = test_wm().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(wm))
+                .service(load_meta_model),
+        )
+        .await;
+        let req = test::TestRequest::default()
+            .uri("/meta/model/qwen-test")
+            .insert_header(ContentType::plaintext())
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let meta: crate::safetensor::transformer::RuntimeMeta =
+            serde_json::from_slice(body.as_ref()).unwrap();
+        assert_eq!(meta.schema_version, 1);
+        assert_eq!(meta.model_type, "qwen3_moe");
+        assert_eq!(meta.experts_per_layer, 256);
+        assert_eq!(meta.hidden_dim, 16);
+        assert_eq!(meta.expert_intermediate_dim, 8);
+    }
+    #[actix_web::test]
+    async fn v4_metadata_and_expert_endpoints_agree() {
+        for fp4 in [true, false] {
+            let root = crate::safetensor::test_fixture::synthetic_v4_model(fp4);
+            let name = root.file_name().unwrap().to_str().unwrap().to_owned();
+            let roots = Box::leak(Box::new([root]));
+            let wm: &'static WeightManager<'static> =
+                Box::leak(Box::new(WeightManager::new(roots, None).await.unwrap()));
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(wm))
+                    .service(load_meta_model)
+                    .service(load_expert),
+            )
+            .await;
+            let meta_request = test::TestRequest::get()
+                .uri(&format!("/meta/model/{name}"))
+                .to_request();
+            let response = test::call_service(&app, meta_request).await;
+            assert!(response.status().is_success());
+            let meta: crate::safetensor::transformer::RuntimeMeta =
+                test::read_body_json(response).await;
+            assert_eq!(
+                meta.quantization.unwrap().method,
+                if fp4 { "mxfp4" } else { "w8a8" }
+            );
+            assert_eq!(meta.expert_compute, "deepseek_v4");
+            let expert_request = test::TestRequest::get()
+                .uri(&format!("/expert/{name}/0/0"))
+                .to_request();
+            let response = test::call_service(&app, expert_request).await;
+            assert!(response.status().is_success());
+            let body = test::read_body(response).await;
+            let tensors = safetensors::SafeTensors::deserialize(&body).unwrap();
+            assert_eq!(tensors.names().len(), 6);
+            let suffix = if fp4 { "scale" } else { "weight_scale" };
+            assert!(
+                tensors
+                    .tensor(&format!("layers.0.ffn.experts.0.w2.{suffix}"))
+                    .is_ok()
+            );
+        }
     }
 }

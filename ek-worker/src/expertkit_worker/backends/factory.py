@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from expertkit_worker.backends.base import ComputeBackend
-from expertkit_worker.config import ActivationDType, BackendName, WorkerConfig
+from expertkit_worker.config import ActivationDType, BackendName, QuantizationType, WorkerConfig
 from expertkit_worker.device import WorkerDeviceRuntime
 from expertkit_worker.weights.adapter import WeightAdapter
 
@@ -35,7 +35,37 @@ def create_weight_adapter(
     """Create the weight conversion and device-placement implementation for the Backend."""
 
     if config.worker.backend is BackendName.TORCH:
-        from expertkit_worker.backends.torch import TorchWeightAdapter
+        from expertkit_worker.backends.torch import (
+            TorchFP4WeightAdapter,
+            TorchGPTQWeightAdapter,
+            TorchW8A8WeightAdapter,
+            TorchWeightAdapter,
+        )
+
+        if config.model.quantization is not None:
+            if config.model.quantization.type is QuantizationType.W8A8:
+                return TorchW8A8WeightAdapter(
+                    hidden_dim=config.model.hidden_dim,
+                    intermediate_dim=config.model.expert_intermediate_dim,
+                    device=runtime.device,
+                    compute_dtype=compute_dtype,
+                )
+            if config.model.quantization.type is QuantizationType.FP4:
+                return TorchFP4WeightAdapter(
+                    hidden_dim=config.model.hidden_dim,
+                    intermediate_dim=config.model.expert_intermediate_dim,
+                    device=runtime.device,
+                    compute_dtype=compute_dtype,
+                )
+            if config.model.quantization.type is not QuantizationType.GPTQ:
+                raise ValueError("unsupported Torch quantization type")
+            return TorchGPTQWeightAdapter(
+                hidden_dim=config.model.hidden_dim,
+                intermediate_dim=config.model.expert_intermediate_dim,
+                group_size=config.model.quantization.group_size,
+                device=runtime.device,
+                compute_dtype=compute_dtype,
+            )
 
         return TorchWeightAdapter(
             hidden_dim=config.model.hidden_dim,
@@ -95,6 +125,17 @@ def create_compute_backend(
             dtype=dtype,
             runtime=runtime,
             acquire_many=acquire_many,
+            expert_compute=config.model.expert_compute,
+            swiglu_limit=config.model.swiglu_limit,
+            linear_compute=(
+                {
+                    QuantizationType.W8A8: "w8a8",
+                    QuantizationType.FP4: "fp8_reference",
+                    QuantizationType.GPTQ: "float",
+                }[config.model.quantization.type]
+                if config.model.quantization is not None
+                else "float"
+            ),
         )
     if config.worker.backend is BackendName.GGML:
         from expertkit_worker.backends.ggml import GgmlBackend

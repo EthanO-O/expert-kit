@@ -21,9 +21,11 @@ from expertkit_worker.execution import AsyncExecutionSlot, CpuExecutionSlot
 from expertkit_worker.factory import (
     _async_wiring,
     _create_device_wiring,
+    _resolve_model_metadata,
     build_worker_application,
 )
 from expertkit_worker.weights import DirectIOWeightDiskCache
+from expertkit_worker.weights.metadata import ModelMetadata, QuantizationMetadata
 
 
 def _config(
@@ -293,3 +295,141 @@ def test_npu_selection_lazily_loads_ascend_runtime(
 
     assert _create_device_wiring("npu:2") is wiring
     assert selected == ["parsed:npu:2"]
+
+
+def test_factory_discovers_gptq_from_weight_server_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = ModelMetadata(
+        schema_version=1,
+        model_type="qwen2_moe",
+        num_layers=2,
+        moe_layer_start=0,
+        moe_layer_end=2,
+        experts_per_layer=4,
+        hidden_dim=4,
+        expert_intermediate_dim=8,
+        top_k=2,
+        activation_dtype="bfloat16",
+        quantization=QuantizationMetadata("gptq", 4, 128, True, False),
+    )
+
+    async def discover(*_args: object, **_kwargs: object) -> ModelMetadata:
+        return metadata
+
+    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+
+    async def scenario() -> None:
+        resolved = await _resolve_model_metadata(_config(tmp_path))
+        assert resolved.model.quantization is not None
+        assert resolved.model.quantization.type.value == "gptq"
+        assert resolved.model.quantization.group_size == 128
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "method,bits,group,expected", [("mxfp4", 4, 32, "fp4"), ("w8a8", 8, None, "w8a8")]
+)
+def test_v4_metadata_selects_recipe_and_expert_math(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    bits: int,
+    group: int | None,
+    expected: str,
+) -> None:
+    metadata = ModelMetadata(
+        1,
+        "deepseek_v4",
+        2,
+        0,
+        2,
+        4,
+        4,
+        8,
+        2,
+        "bfloat16",
+        QuantizationMetadata(method, bits, group, True, False),
+        "deepseek_v4",
+        10.0,
+    )
+
+    async def discover(*args: object, **kwargs: object) -> ModelMetadata:
+        return metadata
+
+    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+    resolved = asyncio.run(_resolve_model_metadata(_config(tmp_path)))
+    assert resolved.model.quantization.type.value == expected
+    assert resolved.model.expert_compute == "deepseek_v4"
+    assert resolved.model.swiglu_limit == 10
+
+
+def test_invalid_metadata_never_falls_back_to_unquantized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from expertkit_worker.weights import ModelMetadataError
+
+    async def discover(*args: object, **kwargs: object) -> ModelMetadata:
+        raise ModelMetadataError("unsupported quantization recipe")
+
+    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+    with pytest.raises(ModelMetadataError, match="unsupported quantization"):
+        asyncio.run(_resolve_model_metadata(_config(tmp_path)))
+
+
+@pytest.mark.parametrize("method", ["fp8", "blockwise_int8", "int8", "compressed-tensors"])
+def test_worker_rejects_unnormalized_quantization(method: str) -> None:
+    from expertkit_worker.factory import _quantization_from_metadata
+
+    metadata = ModelMetadata(
+        1,
+        "deepseek_v4",
+        1,
+        0,
+        1,
+        2,
+        128,
+        256,
+        1,
+        "bfloat16",
+        QuantizationMetadata(method, 8, None, True, False),
+        "deepseek_v4",
+        10.0,
+    )
+    with pytest.raises(ValueError, match="unsupported model quantization"):
+        _quantization_from_metadata(metadata)
+
+
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+@pytest.mark.parametrize("recipe", ["fp4", "gptq"])
+def test_host_budget_reserves_conversion_capacity(
+    tmp_path: Path, concurrency: int, recipe: str
+) -> None:
+    from expertkit_worker.backends.torch import TorchFP4WeightAdapter, TorchGPTQWeightAdapter
+    from expertkit_worker.weights.factory import _dram_cache_limit
+    from expertkit_worker.weights.format import max_safetensors_file_bytes
+
+    if recipe == "fp4":
+        adapter = TorchFP4WeightAdapter(hidden_dim=128, intermediate_dim=256, device="cpu")
+    else:
+        adapter = TorchGPTQWeightAdapter(
+            hidden_dim=128, intermediate_dim=256, group_size=128, device="cpu"
+        )
+    document = _config(tmp_path).model_dump()
+    document["weight_manager"]["max_concurrent_loads"] = concurrency
+    entry = max_safetensors_file_bytes(adapter.source_tensor_bytes()) + adapter.cpu_extra_bytes()
+    conversion = concurrency * adapter.host_conversion_temporary_bytes()
+    assert conversion > 0
+    document["weight_manager"]["dram_cache"]["max_bytes"] = entry + conversion
+    assert _dram_cache_limit(WorkerConfig.model_validate(document), adapter) == entry
+    document["weight_manager"]["dram_cache"]["max_bytes"] -= 1
+    with pytest.raises(ValueError, match="concurrent Host conversion"):
+        _dram_cache_limit(WorkerConfig.model_validate(document), adapter)
+    document["weight_manager"]["dram_cache"]["max_bytes"] = None
+    config = WorkerConfig.model_validate(document)
+    assert (
+        _dram_cache_limit(config, adapter)
+        == entry * config.model.num_layers * config.model.experts_per_layer
+    )

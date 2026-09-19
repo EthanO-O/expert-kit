@@ -34,6 +34,13 @@ from expertkit_worker.weights.manager import (
     WeightManagerFatalError,
     WeightManagerStats,
 )
+from expertkit_worker.weights.metadata import (
+    ModelMetadata,
+    ModelMetadataError,
+    ModelMetadataUnavailable,
+    QuantizationMetadata,
+    fetch_model_metadata,
+)
 from expertkit_worker.weights.peer_server import PeerWeightServer
 from expertkit_worker.weights.ready import (
     ReadyWeightLease,
@@ -52,7 +59,11 @@ __all__ = [
     "ExpertState",
     "ExpertStateChange",
     "ExpertStateKind",
+    "ModelMetadata",
+    "ModelMetadataError",
+    "ModelMetadataUnavailable",
     "PeerWeightServer",
+    "QuantizationMetadata",
     "ReadyWeightLease",
     "ReadyWeightTable",
     "SafeTensorDType",
@@ -73,6 +84,7 @@ __all__ = [
     "WeightPlacementFatalReason",
     "WeightSource",
     "WeightsNotReady",
+    "fetch_model_metadata",
     "max_safetensors_file_bytes",
     "parse_safetensors",
 ]

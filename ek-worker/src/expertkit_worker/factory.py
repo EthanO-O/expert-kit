@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -29,6 +30,8 @@ from expertkit_worker.backends.factory import (
 )
 from expertkit_worker.config import (
     GrpcTransportConfig,
+    QuantizationConfig,
+    QuantizationType,
     ShmTransportConfig,
     WorkerConfig,
     plan_device_resources,
@@ -55,7 +58,10 @@ from expertkit_worker.observability import create_observability
 from expertkit_worker.weights import (
     DirectIOWeightDiskCache,
     ExpertStateChange,
+    ModelMetadata,
+    ModelMetadataUnavailable,
     WeightManager,
+    fetch_model_metadata,
 )
 from expertkit_worker.weights.factory import (
     WeightServices,
@@ -134,6 +140,130 @@ def _async_wiring[StreamT, EventT](
     return _DeviceWiring(runtime=runtime, create_slot=create_slot)
 
 
+def _quantization_from_metadata(metadata: ModelMetadata) -> QuantizationConfig | None:
+    """Convert the normalized server recipe into the Worker's validated recipe."""
+
+    if metadata.quantization is None:
+        return None
+    recipe = metadata.quantization
+    method = recipe.method.lower()
+    if (
+        method == "mxfp4"
+        and recipe.bits == 4
+        and recipe.group_size == 32
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(type=QuantizationType.FP4, bits=4, group_size=32, symmetric=True)
+    if (
+        method == "w8a8"
+        and recipe.bits == 8
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(
+            type=QuantizationType.W8A8, bits=8, group_size=recipe.group_size, symmetric=True
+        )
+    if method != QuantizationType.GPTQ.value:
+        raise ValueError(f"unsupported model quantization method: {recipe.method}")
+    if recipe.bits != 4 or recipe.group_size is None:
+        raise ValueError("Weight Server advertised unsupported GPTQ parameters")
+    if recipe.desc_act is True:
+        raise ValueError("GPTQ activation-order groups are unsupported")
+    if recipe.symmetric is False:
+        raise ValueError("the Torch GPTQ Backend requires symmetric quantization")
+    return QuantizationConfig(
+        type=QuantizationType.GPTQ,
+        bits=recipe.bits,
+        group_size=recipe.group_size,
+        symmetric=True,
+    )
+
+
+def _validate_model_metadata(config: WorkerConfig, metadata: ModelMetadata) -> None:
+    """Reject a model endpoint whose dimensions disagree with Worker routing."""
+
+    expected = config.model
+    fields = (
+        ("num_layers", expected.num_layers, metadata.num_layers),
+        ("experts_per_layer", expected.experts_per_layer, metadata.experts_per_layer),
+        ("hidden_dim", expected.hidden_dim, metadata.hidden_dim),
+        (
+            "expert_intermediate_dim",
+            expected.expert_intermediate_dim,
+            metadata.expert_intermediate_dim,
+        ),
+    )
+    for name, configured, advertised in fields:
+        if configured != advertised:
+            raise ValueError(
+                f"Weight Server model metadata mismatch for {name}: "
+                f"Worker has {configured}, server has {advertised}"
+            )
+    if metadata.top_k is not None and expected.top_k != metadata.top_k:
+        raise ValueError(
+            f"Weight Server model metadata mismatch for top_k: "
+            f"Worker has {expected.top_k}, server has {metadata.top_k}"
+        )
+
+
+async def _resolve_model_metadata(config: WorkerConfig) -> WorkerConfig:
+    """Resolve quantization from Weight Server metadata while preserving legacy fallback."""
+
+    if not config.weight_manager.auto_model_metadata:
+        return config
+    try:
+        metadata = await fetch_model_metadata(
+            str(config.weight_manager.weight_server_endpoint),
+            config.model.name,
+        )
+        _validate_model_metadata(config, metadata)
+        discovered = _quantization_from_metadata(metadata)
+        configured = config.model.quantization
+        if configured is not None and discovered != configured:
+            raise ValueError("Worker model.quantization conflicts with Weight Server metadata")
+        for field in ("expert_compute", "swiglu_limit"):
+            if field in config.model.model_fields_set and getattr(config.model, field) != getattr(
+                metadata, field
+            ):
+                raise ValueError(f"Worker model.{field} conflicts with Weight Server metadata")
+        model_data = config.model.model_dump()
+        model_data.update(
+            quantization=discovered,
+            expert_compute=metadata.expert_compute,
+            swiglu_limit=metadata.swiglu_limit,
+        )
+        if metadata.model_type == "deepseek_v4" and metadata.expert_compute != "deepseek_v4":
+            raise ValueError(
+                "V4 requires expert computation metadata from an updated Weight Server"
+            )
+        data = config.model_dump()
+        data["model"] = model_data
+        return WorkerConfig.model_validate(data)
+    except ModelMetadataUnavailable as error:
+        if config.weight_manager.metadata_required:
+            raise RuntimeError("required Weight Server model metadata is unavailable") from error
+        logger.warning("model_metadata_unavailable", error=str(error))
+        return config
+
+
+def _memory_info(device: torch.device) -> tuple[int, int]:
+    if device.type == "cuda":
+        available, total = torch.cuda.mem_get_info(device)
+        return int(available), int(total)
+    if device.type != "cpu":
+        raise ValueError("Worker device must be CPU or CUDA")
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        available_pages = os.sysconf("SC_AVPHYS_PAGES")
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError) as error:
+        raise RuntimeError("cannot query available CPU memory") from error
+    if min(page_size, available_pages, total_pages) <= 0:
+        raise RuntimeError("the operating system returned invalid CPU memory information")
+    return int(available_pages * page_size), int(total_pages * page_size)
+
+
 async def build_worker_application(
     config: WorkerConfig,
     *,
@@ -152,6 +282,7 @@ async def build_worker_application(
 
     if not isinstance(config, WorkerConfig):
         raise TypeError("config must be a WorkerConfig")
+    config = await _resolve_model_metadata(config)
     resolved_instance = await instance_resolver(
         config.controller.endpoint,
         requested_instance_id=config.model.instance_id,
@@ -307,6 +438,8 @@ async def build_worker_application(
         )
         logger.info(
             "worker_resource_plan",
+            weight_adapter=adapter.backend_name,
+            expert_compute=config.model.expert_compute,
             device=config.worker.device,
             device_total_bytes=total_bytes,
             device_available_bytes=available_bytes,

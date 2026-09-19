@@ -39,6 +39,39 @@ class ActivationDType(StrEnum):
     FP32 = "fp32"
 
 
+class QuantizationType(StrEnum):
+    """Weight quantization recipes implemented by the Torch Backend."""
+
+    GPTQ = "gptq"
+    W8A8 = "w8a8"
+    FP4 = "fp4"
+
+
+class QuantizationConfig(_StrictModel):
+    """Static quantization metadata required to decode stored expert weights."""
+
+    type: QuantizationType
+    bits: Literal[4, 8] = 4
+    group_size: int | None = Field(default=128, gt=0)
+    symmetric: bool = True
+
+    @model_validator(mode="after")
+    def validate_supported_recipe(self) -> QuantizationConfig:
+        """Reject recipes whose bit width, grouping, or zero points are unsupported."""
+
+        if self.type in {QuantizationType.GPTQ, QuantizationType.FP4} and self.bits != 4:
+            raise ValueError("GPTQ and FP4 require 4-bit weights")
+        if self.type is QuantizationType.GPTQ and self.group_size is None:
+            raise ValueError("GPTQ requires a positive group_size")
+        if self.type is QuantizationType.W8A8 and (self.bits != 8 or self.group_size is not None):
+            raise ValueError("W8A8 requires 8-bit per-channel weights with group_size null")
+        if self.type is QuantizationType.FP4 and self.group_size != 32:
+            raise ValueError("FP4 requires group_size 32")
+        if not self.symmetric:
+            raise ValueError("the Torch quantized Backend requires symmetric weights")
+        return self
+
+
 class LogLevel(StrEnum):
     """Supported process log thresholds."""
 
@@ -118,11 +151,16 @@ class ModelConfig(_StrictModel):
     activation_dtype: ActivationDType
     weight_dtype: ActivationDType
     activation: Literal["silu"] = "silu"
+    expert_compute: Literal["swiglu", "deepseek_v4"] = "swiglu"
+    swiglu_limit: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    quantization: QuantizationConfig | None = None
 
     @model_validator(mode="after")
     def validate_routing_shape(self) -> ModelConfig:
         """Ensure the fixed top-k is representable by the configured expert set."""
 
+        if self.expert_compute == "swiglu" and self.swiglu_limit != 0:
+            raise ValueError("swiglu_limit requires deepseek_v4 expert computation")
         if self.top_k > self.experts_per_layer:
             raise ValueError("model.top_k cannot exceed model.experts_per_layer")
         return self
@@ -217,7 +255,11 @@ class ControllerConfig(_StrictModel):
 
 
 class DramCacheConfig(_StrictModel):
-    """Application-managed Host weight-cache byte budget."""
+    """Total Host weight budget including concurrent conversion capacity.
+
+    A null limit derives full-model cache capacity plus conversion capacity.
+    Explicit limits must fit one cache entry and all concurrent conversions.
+    """
 
     max_bytes: PositiveByteSize | None = None
 
@@ -251,6 +293,8 @@ class WeightManagerConfig(_StrictModel):
     disk_cache: DiskCacheConfig
     peer: PeerWeightConfig
     weight_server_endpoint: AnyHttpUrl
+    auto_model_metadata: bool = True
+    metadata_required: bool = False
     state_report: StateReportConfig = Field(default_factory=StateReportConfig)
 
 
@@ -330,6 +374,10 @@ class WorkerConfig(_StrictModel):
         if self.worker.device.startswith("npu:") and isinstance(self.transport, ShmTransportConfig):
             raise ValueError("NPU workers currently require the gRPC transport")
 
+        if self.worker.backend is not BackendName.TORCH and (
+            self.model.quantization is not None or self.model.expert_compute != "swiglu"
+        ):
+            raise ValueError("quantization and V4 expert computation require the Torch backend")
         if self.worker.backend is BackendName.FUSED:
             supported = {ActivationDType.FP16, ActivationDType.BF16}
             if (

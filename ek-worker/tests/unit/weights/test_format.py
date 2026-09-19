@@ -95,8 +95,8 @@ def test_parser_rejects_duplicate_json_keys() -> None:
     ("entry", "data", "match"),
     [
         (
-            {"dtype": "I8", "shape": [4], "data_offsets": [0, 4]},
-            b"1234",
+            {"dtype": "I64X", "shape": [1], "data_offsets": [0, 8]},
+            b"12345678",
             "unsupported dtype",
         ),
         (
