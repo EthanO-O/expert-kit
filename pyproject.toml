@@ -46,7 +46,7 @@ torch = [
     { index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 
-# Speed up downloads in CN using mirrors 
+# Speed up downloads in CN using mirrors
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
