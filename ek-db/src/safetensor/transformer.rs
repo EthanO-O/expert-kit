@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use actix_web::{HttpResponse, Responder, body::BoxBody, http::header::ContentType};
 use ek_base::error::{EKError, EKResult};
@@ -61,7 +65,7 @@ struct ModelSlimDescription {
 }
 
 impl ModelSlimDescription {
-    fn try_from_root(root: &PathBuf) -> EKResult<Option<Self>> {
+    fn try_from_root(root: &Path) -> EKResult<Option<Self>> {
         let path = root.join("quant_model_description.json");
         if !path.exists() {
             return Ok(None);
@@ -123,7 +127,8 @@ impl ModelSlimDescription {
                 "ModelSlim routed expert entries must use W8A8_DYNAMIC".into(),
             ));
         }
-        let mut projections: HashMap<String, [bool; 3]> = HashMap::new();
+        let mut projection_slots: HashMap<String, [bool; 3]> = HashMap::new();
+        let mut projection_roles: HashMap<String, HashSet<&'static str>> = HashMap::new();
         for (name, _) in expert_entries {
             let (base, slot) = if let Some(base) = name.strip_suffix(".weight") {
                 (base, 0)
@@ -144,14 +149,34 @@ impl ModelSlimDescription {
                     "unsupported ModelSlim expert projection name".into(),
                 ));
             }
-            projections.entry(base.to_owned()).or_default()[slot] = true;
+            let projection = [".gate_proj", ".up_proj", ".down_proj", ".w1", ".w2", ".w3"]
+                .iter()
+                .find_map(|suffix| base.strip_suffix(suffix).map(|root| (root, *suffix)))
+                .ok_or_else(|| {
+                    EKError::InvalidInput("unsupported ModelSlim expert projection name".into())
+                })?;
+            projection_roles
+                .entry(projection.0.to_owned())
+                .or_default()
+                .insert(projection.1);
+            projection_slots.entry(base.to_owned()).or_default()[slot] = true;
         }
-        if projections
+        let required_roles = [
+            [".gate_proj", ".up_proj", ".down_proj"].as_slice(),
+            [".w1", ".w2", ".w3"].as_slice(),
+        ];
+        if projection_slots
             .values()
             .any(|slots| slots != &[true, true, true])
+            || projection_roles.values().any(|roles| {
+                !required_roles.iter().any(|required| {
+                    roles.len() == required.len()
+                        && required.iter().all(|role| roles.contains(role))
+                })
+            })
         {
             return Err(EKError::InvalidInput(
-                "ModelSlim expert projections require weight, scale, and offset".into(),
+                "ModelSlim expert projections require a complete projection set".into(),
             ));
         }
         Ok(Some(Self {
@@ -750,6 +775,7 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::fs;
     use std::sync::Arc;
 
     use tokio::task::JoinSet;
@@ -837,6 +863,30 @@ mod test {
             map: serde_json::from_str(raw).unwrap(),
             modelslim: None,
         }
+    }
+
+    #[test]
+    fn reject_incomplete_modelslim_projection_set() {
+        let root =
+            std::env::temp_dir().join(format!("ek-modelslim-description-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let description = serde_json::json!({
+            "version": "1.0.0",
+            "model_quant_type": "W8A8_DYNAMIC",
+            "group_size": 0,
+            "layers.0.ffn.experts.0.gate_proj.weight": "W8A8_DYNAMIC",
+            "layers.0.ffn.experts.0.gate_proj.weight_scale": "W8A8_DYNAMIC",
+            "layers.0.ffn.experts.0.gate_proj.weight_offset": "W8A8_DYNAMIC"
+        });
+        fs::write(
+            root.join("quant_model_description.json"),
+            serde_json::to_vec(&description).unwrap(),
+        )
+        .unwrap();
+
+        assert!(super::ModelSlimDescription::try_from_root(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

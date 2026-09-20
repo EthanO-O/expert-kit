@@ -200,13 +200,14 @@ def execute_rank(
             before_measurement=start_measurement,
             on_progress=on_progress,
         )
+        measured_end = clock()
 
     if measured_start[0] is None:
         raise RuntimeError("benchmark did not enter its measured phase")
     return RankBenchmarkReport(
         assignment=assignment,
         started_at=measured_start[0],
-        ended_at=clock(),
+        ended_at=measured_end,
         benchmark=benchmark,
     )
 

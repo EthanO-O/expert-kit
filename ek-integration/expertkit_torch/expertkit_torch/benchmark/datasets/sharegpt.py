@@ -1,3 +1,5 @@
+"""ShareGPT conversation dataset adapter."""
+
 from __future__ import annotations
 
 import random
@@ -14,11 +16,15 @@ from .dataset import BenchmarkSample, ModelInputBatch
 
 
 class ShareGPTTurn(BaseModel):
+    """One role-tagged conversation turn from the ShareGPT export."""
+
     role: str | None = Field(default=None, alias="from")
     value: str
 
 
 class ShareGPTEntry(BaseModel):
+    """A ShareGPT conversation with a prompt and completion pair."""
+
     conversations: list[ShareGPTTurn]
 
     @property
@@ -40,6 +46,8 @@ class _TokenizedSample:
 
 
 class ShareGPTDataset:
+    """Deterministically select usable ShareGPT prompts for each rank."""
+
     def __init__(self, dataset: Path, *, seed: int = 0, offset: int = 0) -> None:
         if isinstance(offset, bool) or offset < 0:
             raise ValueError("offset must not be negative")

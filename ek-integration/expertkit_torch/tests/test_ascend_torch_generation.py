@@ -79,12 +79,12 @@ def _generate(cluster: Path, experiment: Path, output: Path) -> None:
     [
         (
             "qwen3-30b-a3b",
-            "/home/<USER>/expert-kit/local/models/Qwen3-30B-A3B",
+            "<QWEN3_30B_A3B_MODEL_DIR>",
             "20GiB",
         ),
         (
             "deepseek-v3",
-            "/home/<USER>/models/DeepSeek-V3-bf16",
+            "<DEEPSEEK_V3_BF16_DIR>",
             "52GiB",
         ),
     ],
@@ -109,9 +109,7 @@ def test_sharegpt_generation_emits_host_native_torch_config(
     assert config["device-ids"] == [0, 1, 2, 3, 4, 5, 6, 7]
     assert config["num-prompts"] == 16
     assert config["max-concurrency"] == 1
-    assert config["dataset-path"] == (
-        "/home/<USER>/expert-kit/local/datasets/sharegpt/ShareGPT.json"
-    )
+    assert config["dataset-path"] == ("<SHAREGPT_DATASET_DIR>/ShareGPT.json")
     assert config["model-path"] == expected_model_path
 
     worker = yaml.safe_load((output / "worker-pool1" / "workers" / "worker-00.yaml").read_text())

@@ -1,5 +1,8 @@
+"""Typer entry point for Ascend deployment configuration generation."""
+
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Annotated
@@ -53,6 +56,8 @@ def prepare_output_directory(output: Path) -> None:
 @app.callback()
 def main() -> None:
     """Validate and render Ascend deployment configuration."""
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 @app.command()

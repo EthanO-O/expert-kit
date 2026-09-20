@@ -21,11 +21,15 @@ from expertkit_worker.execution import AsyncExecutionSlot, CpuExecutionSlot
 from expertkit_worker.factory import (
     _async_wiring,
     _create_device_wiring,
-    _resolve_model_metadata,
     build_worker_application,
 )
 from expertkit_worker.weights import DirectIOWeightDiskCache
-from expertkit_worker.weights.metadata import ModelMetadata, QuantizationMetadata
+from expertkit_worker.weights.metadata import (
+    ModelMetadata,
+    QuantizationMetadata,
+    _quantization_from_metadata,
+    resolve_model_metadata,
+)
 
 
 def _config(
@@ -318,10 +322,10 @@ def test_factory_discovers_gptq_from_weight_server_metadata(
     async def discover(*_args: object, **_kwargs: object) -> ModelMetadata:
         return metadata
 
-    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+    monkeypatch.setattr("expertkit_worker.weights.metadata.fetch_model_metadata", discover)
 
     async def scenario() -> None:
-        resolved = await _resolve_model_metadata(_config(tmp_path))
+        resolved = await resolve_model_metadata(_config(tmp_path))
         assert resolved.model.quantization is not None
         assert resolved.model.quantization.type.value == "gptq"
         assert resolved.model.quantization.group_size == 128
@@ -359,8 +363,8 @@ def test_v4_metadata_selects_recipe_and_expert_math(
     async def discover(*args: object, **kwargs: object) -> ModelMetadata:
         return metadata
 
-    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
-    resolved = asyncio.run(_resolve_model_metadata(_config(tmp_path)))
+    monkeypatch.setattr("expertkit_worker.weights.metadata.fetch_model_metadata", discover)
+    resolved = asyncio.run(resolve_model_metadata(_config(tmp_path)))
     assert resolved.model.quantization.type.value == expected
     assert resolved.model.expert_compute == "deepseek_v4"
     assert resolved.model.swiglu_limit == 10
@@ -374,15 +378,13 @@ def test_invalid_metadata_never_falls_back_to_unquantized(
     async def discover(*args: object, **kwargs: object) -> ModelMetadata:
         raise ModelMetadataError("unsupported quantization recipe")
 
-    monkeypatch.setattr("expertkit_worker.factory.fetch_model_metadata", discover)
+    monkeypatch.setattr("expertkit_worker.weights.metadata.fetch_model_metadata", discover)
     with pytest.raises(ModelMetadataError, match="unsupported quantization"):
-        asyncio.run(_resolve_model_metadata(_config(tmp_path)))
+        asyncio.run(resolve_model_metadata(_config(tmp_path)))
 
 
 @pytest.mark.parametrize("method", ["fp8", "blockwise_int8", "int8", "compressed-tensors"])
 def test_worker_rejects_unnormalized_quantization(method: str) -> None:
-    from expertkit_worker.factory import _quantization_from_metadata
-
     metadata = ModelMetadata(
         1,
         "deepseek_v4",

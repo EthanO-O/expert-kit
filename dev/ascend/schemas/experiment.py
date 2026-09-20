@@ -1,3 +1,5 @@
+"""Experiment, model, dataset, and serving configuration models."""
+
 from __future__ import annotations
 import yaml
 from typing import Self
@@ -9,20 +11,26 @@ from .config import ConfigModel
 
 
 class DatasetType(StrEnum):
+    """Dataset source supported by the benchmark generator."""
+
     RANDOM = "random"
     SHAREGPT = "sharegpt"
     CUSTOM = "custom"
 
 
 class Dtype(StrEnum):
+    """Activation or weight dtype label emitted in generated configs."""
+
     FP16 = "fp16"
     BF16 = "bf16"
-    # TODO: Add support for fp4 / fp8 later
+    # FP4 and FP8 are accepted as configuration labels for generated benchmarks.
     FP8 = "fp8"
     FP4 = "fp4"
 
 
 class ExperimentConfig(ConfigModel):
+    """Complete model, dataset, serving, and run configuration."""
+
     model: ModelConfig
     dataset: DatasetConfig
     serve: ServeConfig
@@ -47,6 +55,8 @@ class ExperimentConfig(ConfigModel):
 
 
 class ModelConfig(ConfigModel):
+    """Model artifact and frontend execution settings."""
+
     name: str
     path_ref: str
     weight_version: str
@@ -60,6 +70,8 @@ class ModelConfig(ConfigModel):
 
 
 class DatasetConfig(ConfigModel):
+    """Dataset artifact and sampling settings."""
+
     type: DatasetType
     name: str
     path_ref: str | None = None
@@ -88,11 +100,15 @@ class DatasetConfig(ConfigModel):
 
 
 class ServeConfig(ConfigModel):
+    """Serving frontend options for generated deployment files."""
+
     gpu_memory_utilization: float
     max_model_len: int
 
 
 class RunConfig(ConfigModel):
+    """Benchmark repetition, concurrency, and output settings."""
+
     num_prompts: int
     max_concurrency: int
     input_len: int | None = None

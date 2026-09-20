@@ -8,6 +8,11 @@ from typing import Any
 from urllib.parse import quote
 
 import aiohttp
+import structlog
+
+from expertkit_worker.config import QuantizationConfig, QuantizationType, WorkerConfig
+
+logger = structlog.get_logger(__name__)
 
 
 class ModelMetadataError(RuntimeError):
@@ -173,3 +178,126 @@ async def fetch_model_metadata(
     except (aiohttp.ClientError, TimeoutError) as error:
         raise ModelMetadataUnavailable(f"cannot fetch model metadata from {url}") from error
     return _parse_payload(payload)
+
+
+def _quantization_from_metadata(metadata: ModelMetadata) -> QuantizationConfig | None:
+    """Convert a normalized server recipe into the Worker's validated recipe."""
+
+    if metadata.quantization is None:
+        return None
+    recipe = metadata.quantization
+    method = recipe.method.lower()
+    if (
+        method == "mxfp4"
+        and recipe.bits == 4
+        and recipe.group_size == 32
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(type=QuantizationType.FP4, bits=4, group_size=32, symmetric=True)
+    if (
+        method == "w8a8"
+        and recipe.bits == 8
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(
+            type=QuantizationType.W8A8,
+            bits=8,
+            group_size=recipe.group_size,
+            symmetric=True,
+        )
+    if (
+        method == QuantizationType.MODELSLIM_W8A8_DYNAMIC.value
+        and recipe.bits == 8
+        and recipe.group_size is None
+        and recipe.symmetric is True
+        and recipe.desc_act is not True
+    ):
+        return QuantizationConfig(
+            type=QuantizationType.MODELSLIM_W8A8_DYNAMIC,
+            bits=8,
+            group_size=None,
+            symmetric=True,
+        )
+    if method != QuantizationType.GPTQ.value:
+        raise ValueError(f"unsupported model quantization method: {recipe.method}")
+    if recipe.bits != 4 or recipe.group_size is None:
+        raise ValueError("Weight Server advertised unsupported GPTQ parameters")
+    if recipe.desc_act is True:
+        raise ValueError("GPTQ activation-order groups are unsupported")
+    if recipe.symmetric is False:
+        raise ValueError("the Torch GPTQ Backend requires symmetric quantization")
+    return QuantizationConfig(
+        type=QuantizationType.GPTQ,
+        bits=recipe.bits,
+        group_size=recipe.group_size,
+        symmetric=True,
+    )
+
+
+def _validate_model_metadata(config: WorkerConfig, metadata: ModelMetadata) -> None:
+    """Reject metadata whose dimensions disagree with Worker routing."""
+
+    expected = config.model
+    fields = (
+        ("num_layers", expected.num_layers, metadata.num_layers),
+        ("experts_per_layer", expected.experts_per_layer, metadata.experts_per_layer),
+        ("hidden_dim", expected.hidden_dim, metadata.hidden_dim),
+        (
+            "expert_intermediate_dim",
+            expected.expert_intermediate_dim,
+            metadata.expert_intermediate_dim,
+        ),
+    )
+    for name, configured, advertised in fields:
+        if configured != advertised:
+            raise ValueError(
+                f"Weight Server model metadata mismatch for {name}: "
+                f"Worker has {configured}, server has {advertised}"
+            )
+    if metadata.top_k is not None and expected.top_k != metadata.top_k:
+        raise ValueError(
+            f"Weight Server model metadata mismatch for top_k: "
+            f"Worker has {expected.top_k}, server has {metadata.top_k}"
+        )
+
+
+async def resolve_model_metadata(config: WorkerConfig) -> WorkerConfig:
+    """Resolve model recipes from Weight Server metadata with legacy fallback."""
+
+    if not config.weight_manager.auto_model_metadata:
+        return config
+    try:
+        metadata = await fetch_model_metadata(
+            str(config.weight_manager.weight_server_endpoint),
+            config.model.name,
+        )
+        _validate_model_metadata(config, metadata)
+        discovered = _quantization_from_metadata(metadata)
+        configured = config.model.quantization
+        if configured is not None and discovered != configured:
+            raise ValueError("Worker model.quantization conflicts with Weight Server metadata")
+        for field in ("expert_compute", "swiglu_limit"):
+            if field in config.model.model_fields_set and getattr(config.model, field) != getattr(
+                metadata, field
+            ):
+                raise ValueError(f"Worker model.{field} conflicts with Weight Server metadata")
+        model_data = config.model.model_dump()
+        model_data.update(
+            quantization=discovered,
+            expert_compute=metadata.expert_compute,
+            swiglu_limit=metadata.swiglu_limit,
+        )
+        if metadata.model_type == "deepseek_v4" and metadata.expert_compute != "deepseek_v4":
+            raise ValueError(
+                "V4 requires expert computation metadata from an updated Weight Server"
+            )
+        data = config.model_dump()
+        data["model"] = model_data
+        return WorkerConfig.model_validate(data)
+    except ModelMetadataUnavailable as error:
+        if config.weight_manager.metadata_required:
+            raise RuntimeError("required Weight Server model metadata is unavailable") from error
+        logger.warning("model_metadata_unavailable", error=str(error))
+        return config

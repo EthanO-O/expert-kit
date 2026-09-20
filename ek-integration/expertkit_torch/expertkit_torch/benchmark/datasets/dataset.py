@@ -1,3 +1,5 @@
+"""Dataset protocol and tensor batch containers for benchmarks."""
+
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -7,12 +9,16 @@ import torch
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkSample:
+    """One prompt and reference completion selected for measurement."""
+
     prompt: str
     completion: str
 
 
 @dataclass(frozen=True, slots=True)
 class ModelInputBatch:
+    """Tokenized, left-padded inputs placed on the benchmark device."""
+
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
 
@@ -26,6 +32,8 @@ class ModelInputBatch:
 
 
 class BenchmarkDataset(Protocol):
+    """Interface implemented by benchmark prompt sources."""
+
     def iter_batches(
         self,
         tokenizer: Any,

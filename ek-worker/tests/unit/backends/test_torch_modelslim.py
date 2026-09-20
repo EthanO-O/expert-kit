@@ -54,7 +54,7 @@ def test_modelslim_accepts_qwen_and_v4_projection_suffixes() -> None:
     ):
         cpu = a.make_cpu_weight(parse_safetensors(bytearray(save(values))))
         assert cpu.matrices[0].shape == (8, 4)
-        assert a.ready_weight_bytes() == 3 * 4 * 8 + 3 * (2 * 8 + 4) * 4
+        assert a.ready_weight_bytes() == 3 * 4 * 8 + (2 * 8 + 4) * 4
 
 
 @pytest.mark.parametrize("field", ["weight_scale", "weight_offset"])
@@ -103,8 +103,10 @@ def test_modelslim_linear_uses_pinned_operator(monkeypatch: pytest.MonkeyPatch) 
     calls: list[tuple[object, ...]] = []
     module = SimpleNamespace(
         npu_dynamic_quant=lambda x, dst_type: (x.to(torch.int8), torch.ones(x.shape[0])),
-        npu_quant_matmul=lambda *args, **kwargs: calls.append(args)
-        or torch.zeros((args[0].shape[0], args[1].shape[1]), dtype=kwargs["output_dtype"]),
+        npu_quant_matmul=lambda *args, **kwargs: (
+            calls.append(args)
+            or torch.zeros((args[0].shape[0], args[1].shape[1]), dtype=kwargs["output_dtype"])
+        ),
     )
     monkeypatch.setitem(__import__("sys").modules, "torch_npu", module)
     weight = TorchModelSlimW8A8Weights(

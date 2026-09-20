@@ -1,3 +1,5 @@
+"""Cluster, node, pool, and path configuration models."""
+
 from __future__ import annotations
 
 from ipaddress import IPv4Address
@@ -11,6 +13,8 @@ from .config import ConfigModel
 
 
 class ClusterConfig(ConfigModel):
+    """Complete deployment topology and artifact path configuration."""
+
     project_name: str = Field(
         min_length=1,
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
@@ -40,10 +44,14 @@ class ClusterConfig(ConfigModel):
 
 
 class Inference(ConfigModel):
+    """Controller instance naming configuration."""
+
     instance_name: str
 
 
 class ImageConfig(ConfigModel):
+    """Container images used by generated services."""
+
     rust: str
     uv: str
     control_base: str
@@ -55,10 +63,14 @@ class ImageConfig(ConfigModel):
 
 
 class NodeConfig(ConfigModel):
+    """Addressable host in the deployment topology."""
+
     address: IPv4Address
 
 
 class AttentionConfig(ConfigModel):
+    """Frontend node, port, and device placement."""
+
     node: str
     vllm_port: int
     devices: list[int]
@@ -81,6 +93,8 @@ class AttentionConfig(ConfigModel):
 
 
 class ControlConfig(ConfigModel):
+    """Controller, database, and control-plane port configuration."""
+
     node: str
     postgres_port: int
     worker_control_port: int
@@ -100,6 +114,8 @@ class ControlConfig(ConfigModel):
 
 
 class DatabaseConfig(ConfigModel):
+    """PostgreSQL credentials and connection limits."""
+
     user: str
     password: str
     name: str
@@ -107,16 +123,22 @@ class DatabaseConfig(ConfigModel):
 
 
 class FaultDetectionConfig(ConfigModel):
+    """Heartbeat and node failure detection thresholds."""
+
     heartbeat_timeout_secs: int
     node_active_threshold_secs: int
     poller_interval_secs: int
 
 
 class ExpertConfig(ConfigModel):
+    """Expert worker runtime configuration."""
+
     runtime: ExpertRuntimeConfig
 
 
 class ExpertRuntimeConfig(ConfigModel):
+    """Resource and lifecycle limits shared by expert workers."""
+
     max_batch_tokens: int
     max_active_batches_per_device: int
     device_memory_limit: str
@@ -128,6 +150,8 @@ class ExpertRuntimeConfig(ConfigModel):
 
 
 class PoolConfig(ConfigModel):
+    """A group of workers placed on one node."""
+
     id: str = Field(
         min_length=1,
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
@@ -167,6 +191,8 @@ class PoolConfig(ConfigModel):
 
 
 class WorkerConfig(ConfigModel):
+    """One generated worker's device and listening ports."""
+
     idx: int
     device: int
     port: int
@@ -184,6 +210,8 @@ class WorkerConfig(ConfigModel):
 
 
 class PathConfig(ConfigModel):
+    """Host paths mounted into generated services."""
+
     models: dict[str, Path]
     datasets: dict[str, Path]
     results: Path

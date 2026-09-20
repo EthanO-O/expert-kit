@@ -1,3 +1,5 @@
+"""Generate role-specific Ascend Compose and runtime configuration files."""
+
 from __future__ import annotations
 from dataclasses import dataclass
 

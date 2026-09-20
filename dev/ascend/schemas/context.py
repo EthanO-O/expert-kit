@@ -1,3 +1,5 @@
+"""Resolved template context built from cluster and experiment inputs."""
+
 from __future__ import annotations
 from typing import Any, Self
 from pydantic import BaseModel, computed_field, model_serializer, model_validator
@@ -21,13 +23,17 @@ from .experiment import (
 )
 
 
-class DuplicateDeviceError(ValueError): ...
+class DuplicateDeviceError(ValueError):
+    """Raised when frontend and expert workers share a device."""
 
 
-class DuplicatePortError(ValueError): ...
+class DuplicatePortError(ValueError):
+    """Raised when two services claim the same host port."""
 
 
 class TemplateContext(BaseModel):
+    """Fully resolved values consumed by deployment templates."""
+
     project_name: str
     inference: Inference
     images: ImageConfig
@@ -149,6 +155,8 @@ class TemplateContext(BaseModel):
 
 
 class ExpertContext(BaseModel):
+    """Resolved expert pools and their shared runtime limits."""
+
     pools: list[NodeBindingContext[PoolConfig]]
     runtime: ExpertRuntimeConfig
 
@@ -182,6 +190,8 @@ class ExpertContext(BaseModel):
 
 
 class NodeBindingContext[T: AttentionConfig | ControlConfig | PoolConfig](BaseModel):
+    """Configuration object bound to a named deployment node."""
+
     node: NodeConfig
     config: T
 
@@ -203,6 +213,8 @@ class NodeBindingContext[T: AttentionConfig | ControlConfig | PoolConfig](BaseMo
 
 
 class ArtifactContext[T: ModelConfig | DatasetConfig](BaseModel):
+    """Experiment artifact resolved through the cluster path registry."""
+
     config: T
     path: Path | None = None
 

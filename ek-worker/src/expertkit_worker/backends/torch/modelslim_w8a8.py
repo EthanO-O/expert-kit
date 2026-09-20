@@ -199,7 +199,7 @@ class TorchModelSlimW8A8WeightAdapter(
 
         elements = 3 * self._hidden_dim * self._intermediate_dim
         channels = 2 * self._intermediate_dim + self._hidden_dim
-        return elements + 3 * channels * 4
+        return elements + channels * 4
 
     def conversion_temporary_bytes(self) -> int:
         """Return zero because final tensors are allocated directly."""

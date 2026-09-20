@@ -18,11 +18,24 @@ _TORCH_DTYPES = {
     ActivationDType.FP32: torch.float32,
 }
 
+_TORCH_LINEAR_COMPUTE = {
+    QuantizationType.W8A8: "w8a8",
+    QuantizationType.MODELSLIM_W8A8_DYNAMIC: "modelslim_w8a8_dynamic",
+    QuantizationType.FP4: "fp8_reference",
+    QuantizationType.GPTQ: "float",
+}
+
 
 def torch_dtype(value: ActivationDType) -> torch.dtype:
     """Return the Torch dtype selected by one validated Worker configuration value."""
 
     return _TORCH_DTYPES[value]
+
+
+def _torch_linear_compute(quantization: QuantizationType | None) -> str:
+    """Resolve the Torch compute recipe once for the selected quantization."""
+
+    return "float" if quantization is None else _TORCH_LINEAR_COMPUTE[quantization]
 
 
 def create_weight_adapter(
@@ -138,15 +151,8 @@ def create_compute_backend(
             acquire_many=acquire_many,
             expert_compute=config.model.expert_compute,
             swiglu_limit=config.model.swiglu_limit,
-            linear_compute=(
-                {
-                    QuantizationType.W8A8: "w8a8",
-                    QuantizationType.MODELSLIM_W8A8_DYNAMIC: "modelslim_w8a8_dynamic",
-                    QuantizationType.FP4: "fp8_reference",
-                    QuantizationType.GPTQ: "float",
-                }[config.model.quantization.type]
-                if config.model.quantization is not None
-                else "float"
+            linear_compute=_torch_linear_compute(
+                config.model.quantization.type if config.model.quantization is not None else None
             ),
         )
     if config.worker.backend is BackendName.GGML:

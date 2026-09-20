@@ -1,3 +1,5 @@
+"""Dataset adapters for Torch frontend benchmarks."""
+
 from .dataset import BenchmarkDataset, BenchmarkSample, ModelInputBatch
 from .sharegpt import ShareGPTDataset
 

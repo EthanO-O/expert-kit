@@ -1,3 +1,5 @@
+"""Translate generated vLLM benchmark YAML into a local command."""
+
 import subprocess
 from pathlib import Path
 from typing import Any

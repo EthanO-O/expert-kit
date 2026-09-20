@@ -1,3 +1,5 @@
+"""CUDA implementation of the Worker device runtime."""
+
 from __future__ import annotations
 
 from contextlib import AbstractContextManager

@@ -1,3 +1,5 @@
+"""Device runtime protocols shared by CPU, CUDA, and Ascend workers."""
+
 from contextlib import AbstractContextManager
 from typing import Protocol
 
@@ -5,7 +7,12 @@ import torch
 
 
 class DeviceWork(Protocol):
-    def wait_host(self) -> None: ...
+    """Completion handle that makes device work visible to the host."""
+
+    def wait_host(self) -> None:
+        """Block until the associated device work is complete."""
+
+        ...
 
 
 class WorkerDeviceRuntime(Protocol):

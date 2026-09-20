@@ -16,6 +16,7 @@ from expertkit_torch.benchmark.launcher import (
     RankAssignment,
     RankBenchmarkReport,
     SpawnLauncher,
+    execute_rank,
     make_assignments,
     select_launcher,
 )
@@ -103,6 +104,51 @@ def _failing_rank_executor(
     if assignment.rank == 1:
         raise RuntimeError("synthetic rank failure")
     return _fake_rank_executor(config, assignment, on_progress=on_progress)
+
+
+def test_execute_rank_stops_timing_before_model_context_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "sharegpt.json"
+    dataset.write_text(
+        '[{"conversations": [{"from": "human", "value": "hello"}, '
+        '{"from": "gpt", "value": "world"}]}]'
+    )
+    config = _config(
+        device_ids=(0,),
+        max_concurrency=1,
+        dataset_path=dataset,
+        num_prompts=1,
+    )
+    state = {"closed": False}
+
+    class _Loaded:
+        model = object()
+        tokenizer = object()
+        model_type = "fake"
+
+    class _ModelContext:
+        def __enter__(self) -> _Loaded:
+            return _Loaded()
+
+        def __exit__(self, *_: object) -> None:
+            state["closed"] = True
+
+    monkeypatch.setattr(launcher, "load_model", lambda *args, **kwargs: _ModelContext())
+
+    def fake_run_benchmark(*args, **kwargs) -> BenchmarkReport:
+        kwargs["before_measurement"]()
+        return _fake_rank_executor(config, make_assignments(config)[0]).benchmark
+
+    monkeypatch.setattr(launcher, "run_benchmark", fake_run_benchmark)
+
+    def clock() -> float:
+        return 99.0 if state["closed"] else 10.0
+
+    report = execute_rank(config, make_assignments(config)[0], clock=clock)
+
+    assert report.started_at == 10.0
+    assert report.ended_at == 10.0
 
 
 class _FakeBarrier:

@@ -1,3 +1,5 @@
+"""CPU implementation of the Worker device runtime."""
+
 import os
 from contextlib import AbstractContextManager, nullcontext
 

@@ -202,7 +202,7 @@ class WorkerProcessConfig(_StrictModel):
         if self.backend is BackendName.GGML and self.device != "cpu":
             raise ValueError("the MVP GGML backend requires worker.device: cpu")
 
-        # TODO: NPU support on fused backend, and then merge these two if below
+        # The fused backend remains CUDA-only until its NPU kernels are implemented.
         if self.backend is BackendName.TORCH and not (is_cpu or is_cuda or is_npu):
             raise ValueError(
                 f"the MVP {self.backend.value} backend requires cpu, cuda:<id> or npu:<id>"
@@ -377,7 +377,7 @@ class WorkerConfig(_StrictModel):
     @model_validator(mode="after")
     def validate_backend_combination(self) -> WorkerConfig:
         """Reject unused or incomplete Backend-specific configuration."""
-        # TODO: NPU support on SHM?
+        # Shared-memory transport remains disabled for NPU workers.
         if self.worker.device.startswith("npu:") and isinstance(self.transport, ShmTransportConfig):
             raise ValueError("NPU workers currently require the gRPC transport")
 

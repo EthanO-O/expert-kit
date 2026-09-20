@@ -1,3 +1,5 @@
+"""Ascend implementation of the Worker device runtime."""
+
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 

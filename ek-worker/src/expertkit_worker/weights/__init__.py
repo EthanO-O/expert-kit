@@ -40,6 +40,7 @@ from expertkit_worker.weights.metadata import (
     ModelMetadataUnavailable,
     QuantizationMetadata,
     fetch_model_metadata,
+    resolve_model_metadata,
 )
 from expertkit_worker.weights.peer_server import PeerWeightServer
 from expertkit_worker.weights.ready import (
@@ -87,4 +88,5 @@ __all__ = [
     "fetch_model_metadata",
     "max_safetensors_file_bytes",
     "parse_safetensors",
+    "resolve_model_metadata",
 ]
