@@ -26,18 +26,29 @@ def max_safetensors_file_bytes(tensor_bytes: int) -> int:
 
 
 class SafeTensorDType(StrEnum):
-    """Unquantized MVP weight dtypes and their SafeTensors names."""
+    """Supported weight storage dtypes and their SafeTensors names."""
 
     FP16 = "F16"
     BF16 = "BF16"
     FP32 = "F32"
+    INT8 = "I8"
+    INT32 = "I32"
+    INT64 = "I64"
+    F8_E4M3 = "F8_E4M3"
+    F8_E8M0 = "F8_E8M0"
 
     @property
     def element_bytes(self) -> int:
         """Return the fixed encoded element width."""
 
-        if self is SafeTensorDType.FP32:
+        if self is SafeTensorDType.FP32 or self is SafeTensorDType.INT32:
             return 4
+        if self is SafeTensorDType.INT64:
+            return 8
+        if self is SafeTensorDType.INT8:
+            return 1
+        if self in {SafeTensorDType.F8_E4M3, SafeTensorDType.F8_E8M0}:
+            return 1
         return 2
 
 
@@ -178,7 +189,7 @@ def parse_safetensors(buffer: object) -> SafeTensorData:
 
     Raises:
         SafeTensorFormatError: The header, metadata, ranges, dtype, or lengths are
-            malformed or outside the unquantized MVP format.
+            malformed or outside the supported storage dtypes.
     """
 
     try:

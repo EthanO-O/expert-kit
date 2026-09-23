@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use actix_web::{HttpResponse, Responder, body::BoxBody, http::header::ContentType};
 use ek_base::error::{EKError, EKResult};
@@ -11,6 +15,7 @@ use super::memcache::{SafeTensorWithData, SafetensorCache};
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     map: std::collections::HashMap<String, serde_json::Value>,
+    modelslim: Option<ModelSlimDescription>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -21,6 +26,166 @@ pub struct VitalMeta {
     pub inter_dim: usize,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// Normalized storage and activation recipe for routed expert projections.
+/// `w8a8` fixes symmetric channel INT8 weights and dynamic token INT8
+/// activations with FP32 scales. `mxfp4` fixes E2M1 weights with E8M0 scales
+/// per 32 values and E4M3 activations with power-of-two scales per 128 values.
+pub struct QuantizationMeta {
+    pub method: String,
+    pub bits: Option<u32>,
+    pub group_size: Option<u32>,
+    pub symmetric: Option<bool>,
+    pub desc_act: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RuntimeMeta {
+    pub schema_version: u32,
+    pub model_type: String,
+    pub num_layers: usize,
+    pub moe_layer_start: usize,
+    pub moe_layer_end: usize,
+    pub experts_per_layer: usize,
+    pub hidden_dim: usize,
+    pub expert_intermediate_dim: usize,
+    pub top_k: Option<usize>,
+    pub activation_dtype: Option<String>,
+    pub quantization: Option<QuantizationMeta>,
+    /// Selects SwiGLU arithmetic and whether routing weights precede the down projection.
+    pub expert_compute: String,
+    /// V4 gate upper bound and symmetric up-projection bound; zero disables clipping.
+    pub swiglu_limit: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelSlimDescription {
+    model_quant_type: String,
+    entries: HashMap<String, String>,
+}
+
+impl ModelSlimDescription {
+    fn try_from_root(root: &Path) -> EKResult<Option<Self>> {
+        let path = root.join("quant_model_description.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_reader(fs::File::open(&path)?)?;
+        let object = value.as_object().ok_or_else(|| {
+            EKError::InvalidInput("ModelSlim description must be a JSON object".into())
+        })?;
+        if object.get("version").and_then(serde_json::Value::as_str) != Some("1.0.0") {
+            return Err(EKError::InvalidInput(
+                "unsupported ModelSlim description version".into(),
+            ));
+        }
+        let model_quant_type = object
+            .get("model_quant_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                EKError::InvalidInput("ModelSlim global quantization type is missing".into())
+            })?;
+        if !matches!(model_quant_type, "W8A8" | "W8A8_DYNAMIC") {
+            return Err(EKError::InvalidInput(
+                "unsupported ModelSlim global quantization type".into(),
+            ));
+        }
+        if object.get("group_size").and_then(serde_json::Value::as_u64) != Some(0) {
+            return Err(EKError::InvalidInput(
+                "ModelSlim group_size must be zero for dynamic per-channel weights".into(),
+            ));
+        }
+        let mut entries = HashMap::new();
+        for (name, value) in object {
+            if matches!(
+                name.as_str(),
+                "version"
+                    | "model_quant_type"
+                    | "group_size"
+                    | "kv_quant_type"
+                    | "fa_quant_type"
+                    | "metadata"
+                    | "optional"
+            ) {
+                continue;
+            }
+            let kind = value.as_str().ok_or_else(|| {
+                EKError::InvalidInput("ModelSlim tensor descriptions must be strings".into())
+            })?;
+            entries.insert(name.clone(), kind.to_owned());
+        }
+        let expert_entries: Vec<_> = entries
+            .iter()
+            .filter(|(name, _)| name.contains(".experts."))
+            .collect();
+        if expert_entries.is_empty()
+            || expert_entries
+                .iter()
+                .any(|(_, kind)| kind.as_str() != "W8A8_DYNAMIC")
+        {
+            return Err(EKError::InvalidInput(
+                "ModelSlim routed expert entries must use W8A8_DYNAMIC".into(),
+            ));
+        }
+        let mut projection_slots: HashMap<String, [bool; 3]> = HashMap::new();
+        let mut projection_roles: HashMap<String, HashSet<&'static str>> = HashMap::new();
+        for (name, _) in expert_entries {
+            let (base, slot) = if let Some(base) = name.strip_suffix(".weight") {
+                (base, 0)
+            } else if let Some(base) = name.strip_suffix(".weight_scale") {
+                (base, 1)
+            } else if let Some(base) = name.strip_suffix(".weight_offset") {
+                (base, 2)
+            } else {
+                return Err(EKError::InvalidInput(
+                    "ModelSlim expert entries must be weight/scale/offset triples".into(),
+                ));
+            };
+            if ![".gate_proj", ".up_proj", ".down_proj", ".w1", ".w2", ".w3"]
+                .iter()
+                .any(|suffix| base.ends_with(suffix))
+            {
+                return Err(EKError::InvalidInput(
+                    "unsupported ModelSlim expert projection name".into(),
+                ));
+            }
+            let projection = [".gate_proj", ".up_proj", ".down_proj", ".w1", ".w2", ".w3"]
+                .iter()
+                .find_map(|suffix| base.strip_suffix(suffix).map(|root| (root, *suffix)))
+                .ok_or_else(|| {
+                    EKError::InvalidInput("unsupported ModelSlim expert projection name".into())
+                })?;
+            projection_roles
+                .entry(projection.0.to_owned())
+                .or_default()
+                .insert(projection.1);
+            projection_slots.entry(base.to_owned()).or_default()[slot] = true;
+        }
+        let required_roles = [
+            [".gate_proj", ".up_proj", ".down_proj"].as_slice(),
+            [".w1", ".w2", ".w3"].as_slice(),
+        ];
+        if projection_slots
+            .values()
+            .any(|slots| slots != &[true, true, true])
+            || projection_roles.values().any(|roles| {
+                !required_roles.iter().any(|required| {
+                    roles.len() == required.len()
+                        && required.iter().all(|role| roles.contains(role))
+                })
+            })
+        {
+            return Err(EKError::InvalidInput(
+                "ModelSlim expert projections require a complete projection set".into(),
+            ));
+        }
+        Ok(Some(Self {
+            model_quant_type: model_quant_type.to_owned(),
+            entries,
+        }))
+    }
+}
+
 impl ModelConfig {
     fn try_from_desc(desc: &TransformerModelDesc) -> EKResult<Self> {
         let path = desc.root.join(&desc.config_name);
@@ -29,10 +194,167 @@ impl ModelConfig {
             EKError::IoError(e)
         })?;
         let map: HashMap<_, _> = serde_json::from_reader(file)?;
-        Ok(Self { map })
+        let modelslim = ModelSlimDescription::try_from_root(&desc.root)?;
+        Ok(Self { map, modelslim })
     }
     pub fn model_type(&self) -> &str {
         self.map.get("model_type").unwrap().as_str().unwrap()
+    }
+
+    fn quantization_method(&self) -> Option<&str> {
+        self.map
+            .get("quantization_config")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|config| {
+                config
+                    .get("quant_method")
+                    .or_else(|| config.get("quantization_method"))
+            })
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn is_gptq(&self) -> bool {
+        self.quantization_method() == Some("gptq")
+    }
+
+    fn is_modelslim(&self) -> bool {
+        self.modelslim.is_some()
+    }
+
+    fn expert_quantization(&self) -> EKResult<Option<QuantizationMeta>> {
+        if let Some(description) = &self.modelslim {
+            if description.entries.is_empty()
+                || !matches!(
+                    description.model_quant_type.as_str(),
+                    "W8A8" | "W8A8_DYNAMIC"
+                )
+            {
+                return Err(EKError::InvalidInput(
+                    "unsupported ModelSlim global quantization type".into(),
+                ));
+            }
+            return Ok(Some(QuantizationMeta {
+                method: "modelslim-w8a8-dynamic".into(),
+                bits: Some(8),
+                group_size: None,
+                symmetric: Some(true),
+                desc_act: Some(false),
+            }));
+        }
+        let Some(config) = self.map.get("quantization_config") else {
+            return Ok(None);
+        };
+        let method = self.quantization_method().ok_or_else(|| {
+            EKError::InvalidInput("quantization_config requires quant_method".into())
+        })?;
+        if method == "compressed-tensors" {
+            let unsupported = || {
+                EKError::InvalidInput(
+                "only symmetric compressed-tensors int-quantized W8A8 token/channel experts are supported".into())
+            };
+            let groups = config
+                .get("config_groups")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(unsupported)?;
+            if config.get("format").and_then(serde_json::Value::as_str) != Some("int-quantized")
+                || groups.len() != 1
+                || config.get("transform_config").is_some_and(|v| !v.is_null())
+            {
+                return Err(unsupported());
+            }
+            let group = groups.values().next().unwrap();
+            if group.get("targets") != Some(&serde_json::json!(["Linear"]))
+                || group
+                    .get("output_activations")
+                    .is_some_and(|v| !v.is_null())
+                || group
+                    .get("activation_use_clip")
+                    .is_some_and(|v| v != &serde_json::json!(false))
+            {
+                return Err(unsupported());
+            }
+            for (field, strategy, dynamic) in [
+                ("weights", "channel", false),
+                ("input_activations", "token", true),
+            ] {
+                let q = &group[field];
+                if q["num_bits"] != 8
+                    || q["type"] != "int"
+                    || q["symmetric"] != true
+                    || q["strategy"] != strategy
+                    || q["dynamic"] != dynamic
+                    || (field == "input_activations" && !q["scale_dtype"].is_null())
+                    || ["group_size", "block_structure", "actorder"]
+                        .iter()
+                        .any(|key| !q[key].is_null())
+                {
+                    return Err(unsupported());
+                }
+            }
+            // Regex targets and partially quantized routed experts require a separate resolver.
+            if let Some(ignore) = config.get("ignore") {
+                let ignored = ignore.as_array().ok_or_else(unsupported)?;
+                for value in ignored {
+                    let name = value.as_str().ok_or_else(unsupported)?;
+                    if name.contains("experts") || name.starts_with("re:") || name == "Linear" {
+                        return Err(unsupported());
+                    }
+                }
+            }
+            return Ok(Some(QuantizationMeta {
+                method: "w8a8".into(),
+                bits: Some(8),
+                group_size: None,
+                symmetric: Some(true),
+                desc_act: Some(false),
+            }));
+        }
+        if self.model_type() == "deepseek_v4"
+            && method == "fp8"
+            && self
+                .map
+                .get("expert_dtype")
+                .and_then(serde_json::Value::as_str)
+                == Some("fp4")
+        {
+            if config["scale_fmt"] != "ue8m0"
+                || config["activation_scheme"] != "dynamic"
+                || config["fmt"] != "e4m3"
+            {
+                return Err(EKError::InvalidInput(
+                    "unsupported V4 FP4 activation or scale recipe".into(),
+                ));
+            }
+            return Ok(Some(QuantizationMeta {
+                method: "mxfp4".into(),
+                bits: Some(4),
+                group_size: Some(32),
+                symmetric: Some(true),
+                desc_act: Some(false),
+            }));
+        }
+        if matches!(method, "w8a8" | "mxfp4") {
+            return Err(EKError::InvalidInput(
+                "checkpoint requires a validated quantization format, not only a bit-width label"
+                    .into(),
+            ));
+        }
+        Ok(Some(QuantizationMeta {
+            method: method.to_owned(),
+            bits: config
+                .get("bits")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as u32),
+            group_size: config
+                .get("group_size")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as u32),
+            symmetric: config
+                .get("sym")
+                .or_else(|| config.get("symmetric"))
+                .and_then(serde_json::Value::as_bool),
+            desc_act: config.get("desc_act").and_then(serde_json::Value::as_bool),
+        }))
     }
 
     pub fn moe_layers(&self) -> Option<(usize, usize)> {
@@ -47,6 +369,10 @@ impl ModelConfig {
                 let end = self.map.get("num_hidden_layers")?.as_u64()? as usize;
                 Some((start, end))
             }
+            "deepseek_v4" => {
+                let end = self.map.get("num_hidden_layers")?.as_u64()? as usize;
+                Some((0, end))
+            }
             _ => {
                 let end = self.map.get("num_hidden_layers")?.as_u64()? as usize;
                 Some((0, end))
@@ -56,10 +382,10 @@ impl ModelConfig {
 
     pub fn routed_experts(&self) -> Option<usize> {
         match self.model_type() {
-            "deepseek_v2" | "deepseek_v3" => {
+            "deepseek_v2" | "deepseek_v3" | "deepseek_v4" => {
                 Some(self.map.get("n_routed_experts")?.as_u64()? as usize)
             }
-            "qwen3_moe" => Some(self.map.get("num_experts")?.as_u64()? as usize),
+            "qwen2_moe" | "qwen3_moe" => Some(self.map.get("num_experts")?.as_u64()? as usize),
             "mixtral" => Some(self.map.get("num_local_experts")?.as_u64()? as usize),
             _ => {
                 unimplemented!()
@@ -70,7 +396,7 @@ impl ModelConfig {
     pub fn dim(&self) -> Option<(usize, usize)> {
         let hidden = self.map.get("hidden_size")?.as_u64()? as usize;
         let intermediate = match self.model_type() {
-            "deepseek_v2" | "deepseek_v3" | "qwen3_moe" => {
+            "deepseek_v2" | "deepseek_v3" | "deepseek_v4" | "qwen2_moe" | "qwen3_moe" => {
                 self.map.get("moe_intermediate_size")?.as_u64()? as usize
             }
             "mixtral" => self.map.get("intermediate_size")?.as_u64()? as usize,
@@ -93,6 +419,59 @@ impl ModelConfig {
             inter_dim: dim.1,
         })
     }
+
+    pub fn runtime_meta(&self) -> EKResult<RuntimeMeta> {
+        let (moe_start, moe_end) = self.moe_layers().ok_or(EKError::InvalidInput(
+            "can not determine moe layers".to_string(),
+        ))?;
+        let (hidden_dim, expert_intermediate_dim) = self.dim().ok_or(EKError::InvalidInput(
+            "can not determine hidden_dim and inter_dim".to_string(),
+        ))?;
+        let num_layers = moe_end;
+        let experts_per_layer = self.routed_experts().ok_or(EKError::InvalidInput(
+            "can not determine routed_experts".to_string(),
+        ))?;
+        let top_k = self
+            .map
+            .get("num_experts_per_tok")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .or_else(|| {
+                self.map
+                    .get("num_selected_experts")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+            });
+        let activation_dtype = self
+            .map
+            .get("torch_dtype")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let quantization = self.expert_quantization()?;
+        Ok(RuntimeMeta {
+            schema_version: 1,
+            model_type: self.model_type().to_owned(),
+            num_layers,
+            moe_layer_start: moe_start,
+            moe_layer_end: moe_end,
+            experts_per_layer,
+            hidden_dim,
+            expert_intermediate_dim,
+            top_k,
+            activation_dtype,
+            quantization,
+            expert_compute: if self.model_type() == "deepseek_v4" {
+                "deepseek_v4"
+            } else {
+                "swiglu"
+            }
+            .into(),
+            swiglu_limit: self
+                .map
+                .get("swiglu_limit")
+                .and_then(serde_json::Value::as_f64),
+        })
+    }
 }
 
 struct WeightMap {
@@ -102,7 +481,32 @@ struct WeightMap {
 impl WeightMap {
     fn try_from_desc(desc: &TransformerModelDesc) -> EKResult<Self> {
         let mut map = HashMap::new();
-        let path = desc.root.join(&desc.weight_map_name);
+        let mut path = desc.root.join(&desc.weight_map_name);
+        if !path.exists() {
+            if !desc.root.join("quant_model_description.json").exists() {
+                return Err(EKError::NotFound(format!(
+                    "weight map not found: {}",
+                    path.to_string_lossy()
+                )));
+            }
+            let mut candidates = fs::read_dir(&desc.root)?
+                .filter_map(|entry| entry.ok().map(|item| item.path()))
+                .filter(|candidate| {
+                    candidate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort();
+            if candidates.len() != 1 {
+                return Err(EKError::InvalidInput(format!(
+                    "expected exactly one alternate SafeTensors index, found {}",
+                    candidates.len()
+                )));
+            }
+            path = candidates.pop().unwrap();
+        }
         let file = std::fs::File::open(path.clone()).map_err(move |e| {
             log::error!(
                 "can not found weight_map_file at {}",
@@ -249,9 +653,25 @@ where
         let st = self.get_safetensor(key).await?;
         let serialized = {
             let tv = &st.tensor(key).unwrap();
-            safetensors::tensor::serialize([("data", tv)].to_vec(), &None)?
+            safetensors::tensor::serialize([("data", tv)].to_vec(), None)?
         };
         Ok(serialized)
+    }
+
+    fn expert_prefix(&self, layer_id: usize, expert_id: usize) -> EKResult<String> {
+        let layer = match self.model_config.model_type() {
+            "deepseek_v4" => format!("layers.{layer_id}.ffn"),
+            "deepseek_v2" | "deepseek_v3" | "qwen2_moe" | "qwen3_moe" => {
+                format!("model.layers.{layer_id}.mlp")
+            }
+            "mixtral" => format!("model.layers.{layer_id}.block_sparse_moe"),
+            model => {
+                return Err(EKError::InvalidInput(format!(
+                    "unsupported expert layout: {model}"
+                )));
+            }
+        };
+        Ok(format!("{layer}.experts.{expert_id}."))
     }
 
     async fn construct_expert_key(
@@ -259,18 +679,49 @@ where
         layer_id: usize,
         expert_id: usize,
     ) -> EKResult<Vec<String>> {
+        let prefix = self.expert_prefix(layer_id, expert_id)?;
+        let is_v4 = self.model_config.model_type() == "deepseek_v4";
+        let is_w8a8 = self
+            .model_config
+            .expert_quantization()?
+            .is_some_and(|q| q.method == "w8a8");
+        if is_v4 || is_w8a8 || self.model_config.is_modelslim() {
+            // Preserve auxiliary tensors so adapters can reject unsupported formats explicitly.
+            let keys: Vec<_> = self
+                .weight_map
+                .map
+                .keys()
+                .filter(|name| name.starts_with(&prefix))
+                .cloned()
+                .collect();
+            if keys.is_empty() {
+                return Err(EKError::NotFound(format!("no expert tensors for {prefix}")));
+            }
+            return Ok(keys);
+        }
         match self.model_config.model_type() {
-            "deepseek_v2" | "deepseek_v3" | "qwen3_moe" => {
-                let key_up =
-                    format!("model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight");
+            "deepseek_v2" | "deepseek_v3" | "qwen2_moe" | "qwen3_moe" => {
+                if self.model_config.is_gptq() {
+                    let names = ["gate_proj", "up_proj", "down_proj"];
+                    let mut keys = Vec::with_capacity(12);
+                    for projection in names {
+                        let base = format!("{prefix}{projection}");
+                        keys.extend([
+                            format!("{base}.qweight"),
+                            format!("{base}.qzeros"),
+                            format!("{base}.scales"),
+                            format!("{base}.g_idx"),
+                        ]);
+                    }
+                    return Ok(keys);
+                }
+                let key_up = format!("{prefix}up_proj.weight");
                 let key_up_scale = format!("{key_up}_scale_inv");
 
-                let key_gate =
-                    format!("model.layers.{layer_id}.mlp.experts.{expert_id}.down_proj.weight");
+                let key_gate = format!("{prefix}down_proj.weight");
                 let key_gate_scale = format!("{key_gate}_scale_inv");
 
-                let key_down =
-                    format!("model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight");
+                let key_down = format!("{prefix}gate_proj.weight");
                 let key_down_scale = format!("{key_down}_scale_inv");
 
                 Ok(vec![
@@ -283,19 +734,13 @@ where
                 ])
             }
             "mixtral" => {
-                let key_up = format!(
-                    "model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.w1.weight"
-                );
+                let key_up = format!("{prefix}w1.weight");
                 let key_up_scale = String::new();
 
-                let key_gate = format!(
-                    "model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.w3.weight"
-                );
+                let key_gate = format!("{prefix}w3.weight");
                 let key_gate_scale = String::new();
 
-                let key_down = format!(
-                    "model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.w2.weight"
-                );
+                let key_down = format!("{prefix}w2.weight");
                 let key_down_scale = String::new();
 
                 Ok(vec![
@@ -323,13 +768,14 @@ where
             let tensor = st.tensor(key)?;
             tensors.push((key.clone(), tensor));
         }
-        let serialized = safetensors::tensor::serialize(tensors, &None)?;
+        let serialized = safetensors::tensor::serialize(tensors, None)?;
         Ok(serialized)
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::fs;
     use std::sync::Arc;
 
     use tokio::task::JoinSet;
@@ -379,7 +825,7 @@ mod test {
         ];
 
         for name in expected {
-            assert!(names.contains(&&name.to_string()));
+            assert!(names.contains(&name));
         }
         let tensor = st
             .tensor("model.layers.9.mlp.experts.97.down_proj.weight")
@@ -406,5 +852,173 @@ mod test {
             }
         }
         js.join_all().await;
+    }
+    fn v4_config(fp4: bool) -> super::ModelConfig {
+        let raw = if fp4 {
+            include_str!("../../tests/fixtures/deepseek_v4_fp4_config.json")
+        } else {
+            include_str!("../../tests/fixtures/deepseek_v4_w8a8_config.json")
+        };
+        super::ModelConfig {
+            map: serde_json::from_str(raw).unwrap(),
+            modelslim: None,
+        }
+    }
+
+    #[test]
+    fn reject_incomplete_modelslim_projection_set() {
+        let root =
+            std::env::temp_dir().join(format!("ek-modelslim-description-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let description = serde_json::json!({
+            "version": "1.0.0",
+            "model_quant_type": "W8A8_DYNAMIC",
+            "group_size": 0,
+            "layers.0.ffn.experts.0.gate_proj.weight": "W8A8_DYNAMIC",
+            "layers.0.ffn.experts.0.gate_proj.weight_scale": "W8A8_DYNAMIC",
+            "layers.0.ffn.experts.0.gate_proj.weight_offset": "W8A8_DYNAMIC"
+        });
+        fs::write(
+            root.join("quant_model_description.json"),
+            serde_json::to_vec(&description).unwrap(),
+        )
+        .unwrap();
+
+        assert!(super::ModelSlimDescription::try_from_root(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v4_quantization_is_scoped_to_routed_experts() {
+        for fp4 in [true, false] {
+            let meta = v4_config(fp4).runtime_meta().unwrap();
+            assert_eq!(
+                (
+                    meta.hidden_dim,
+                    meta.expert_intermediate_dim,
+                    meta.experts_per_layer,
+                    meta.num_layers
+                ),
+                (4096, 2048, 256, 43)
+            );
+            assert_eq!((meta.moe_layer_start, meta.top_k), (0, Some(6)));
+            assert_eq!(meta.expert_compute, "deepseek_v4");
+            assert_eq!(meta.swiglu_limit, Some(10.0));
+            let q = meta.quantization.unwrap();
+            assert_eq!(q.method, if fp4 { "mxfp4" } else { "w8a8" });
+            assert_eq!(q.bits, Some(if fp4 { 4 } else { 8 }));
+        }
+    }
+
+    #[test]
+    fn reject_unsupported_compressed_tensors_recipes() {
+        for (field, key, value) in [
+            ("weights", "symmetric", serde_json::json!(false)),
+            ("weights", "strategy", serde_json::json!("group")),
+            ("weights", "num_bits", serde_json::json!(4)),
+            ("input_activations", "dynamic", serde_json::json!(false)),
+            ("input_activations", "type", serde_json::json!("float")),
+            (
+                "input_activations",
+                "scale_dtype",
+                serde_json::json!("float16"),
+            ),
+            (
+                "input_activations",
+                "scale_dtype",
+                serde_json::json!("float32"),
+            ),
+        ] {
+            let mut config = v4_config(false);
+            config.map.get_mut("quantization_config").unwrap()["config_groups"]["group_0"][field]
+                [key] = value;
+            assert!(config.runtime_meta().is_err());
+        }
+        for ignore in ["re:.*", "layers.0.ffn.experts.0.w1"] {
+            let mut config = v4_config(false);
+            config.map.get_mut("quantization_config").unwrap()["ignore"] =
+                serde_json::json!([ignore]);
+            assert!(config.runtime_meta().is_err());
+        }
+        for clip in [
+            serde_json::json!(true),
+            serde_json::json!("false"),
+            serde_json::Value::Null,
+        ] {
+            let mut config = v4_config(false);
+            config.map.get_mut("quantization_config").unwrap()["config_groups"]["group_0"]["activation_use_clip"] =
+                clip;
+            assert!(config.runtime_meta().is_err());
+        }
+        let mut config = v4_config(false);
+        config.map.get_mut("quantization_config").unwrap()["config_groups"]["group_0"]["input_activations"]
+            ["scale_dtype"] = serde_json::Value::Null;
+        assert!(config.runtime_meta().is_ok());
+    }
+
+    #[tokio::test]
+    async fn w8a8_tensor_selection_uses_model_layout() {
+        for (model, prefix) in [
+            ("deepseek_v4", "layers.0.ffn.experts.0."),
+            ("qwen3_moe", "model.layers.0.mlp.experts.0."),
+            ("mixtral", "model.layers.0.block_sparse_moe.experts.0."),
+        ] {
+            let desc = TransformerModelDesc {
+                root: crate::safetensor::test_fixture::synthetic_v4_model(false),
+                ..Default::default()
+            };
+            let mut pretrained = TransformerPretrained::try_from_desc(&desc).unwrap();
+            pretrained
+                .model_config
+                .map
+                .insert("model_type".into(), serde_json::json!(model));
+            pretrained.weight_map.map = pretrained
+                .weight_map
+                .map
+                .into_iter()
+                .map(|(name, file)| (name.replace("layers.0.ffn.experts.0.", prefix), file))
+                .collect();
+            let keys = pretrained.construct_expert_key(0, 0).await.unwrap();
+            assert_eq!(keys.len(), 6);
+            assert!(keys.iter().all(|key| key.starts_with(prefix)));
+            assert!(pretrained.construct_expert_key(0, 999).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_extraction_preserves_packed_weights_and_scales() {
+        for fp4 in [true, false] {
+            let desc = TransformerModelDesc {
+                root: crate::safetensor::test_fixture::synthetic_v4_model(fp4),
+                ..Default::default()
+            };
+            let pretrained = TransformerPretrained::try_from_desc(&desc).unwrap();
+            let bytes = pretrained.get_expert(0, 0).await.unwrap();
+            let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            assert_eq!(tensors.names().len(), 6);
+            let weight = tensors.tensor("layers.0.ffn.experts.0.w1.weight").unwrap();
+            assert_eq!(weight.dtype(), safetensors::Dtype::I8);
+            assert_eq!(weight.shape(), &[256, if fp4 { 64 } else { 128 }]);
+            let suffix = if fp4 { "scale" } else { "weight_scale" };
+            let scale = tensors
+                .tensor(&format!("layers.0.ffn.experts.0.w1.{suffix}"))
+                .unwrap();
+            assert_eq!(
+                scale.dtype(),
+                if fp4 {
+                    safetensors::Dtype::F8_E8M0
+                } else {
+                    safetensors::Dtype::F32
+                }
+            );
+            assert_eq!(scale.shape(), &[256, if fp4 { 4 } else { 1 }]);
+            assert!(
+                tensors
+                    .names()
+                    .iter()
+                    .all(|name| name.starts_with("layers.0.ffn.experts.0."))
+            );
+        }
     }
 }

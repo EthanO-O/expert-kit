@@ -61,7 +61,7 @@ async fn extract_attn(input: &str, output: &str) -> EKResult<()> {
         .write_all(new_map_json.to_string().as_bytes())
         .await?;
 
-    let serialized = safetensors::tensor::serialize(converted, &None)?;
+    let serialized = safetensors::tensor::serialize(converted, None)?;
     converted_st_fp.write_all(&serialized).await?;
 
     log::info!("converted safetensors saved to {}", output.display());

@@ -10,7 +10,11 @@ from expertkit_transport.batches import ACTIVATION_DTYPES
 
 @dataclass(frozen=True, slots=True)
 class TorchExpertWeights:
-    """Hold one gated FFN's final Torch tensors on its computation device.
+    """Hold one gated FFN's projection Torch tensors on its computation device.
+
+    Instances may represent zero-copy CPU cache views or final computation
+    weights. Readiness is established by TorchWeightAdapter completing placement
+    and WeightManager publishing the object into ReadyWeightTable.
 
     Attributes:
         gate_proj: Contiguous matrix shaped ``[intermediate_dim, hidden_dim]``.
@@ -49,6 +53,39 @@ class TorchExpertWeights:
         if self.down_proj.shape != (hidden_dim, intermediate_dim):
             raise ValueError("down projection shape must reverse gate and up dimensions")
 
+    def to(
+        self,
+        device: str | torch.device | int | None = None,
+        dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
+        copy: bool = False,
+        *,
+        memory_format: torch.memory_format | None = None,
+    ) -> TorchExpertWeights:
+        return TorchExpertWeights(
+            gate_proj=self.gate_proj.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+                copy=copy,
+                memory_format=memory_format,
+            ),
+            up_proj=self.up_proj.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+                copy=copy,
+                memory_format=memory_format,
+            ),
+            down_proj=self.down_proj.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking,
+                copy=copy,
+                memory_format=memory_format,
+            ),
+        )
+
     @property
     def hidden_dim(self) -> int:
         """Return the FFN input and output width."""
@@ -84,3 +121,48 @@ class TorchExpertWeights:
         """Return the projection tensors in gate, up, and down order."""
 
         return self.gate_proj, self.up_proj, self.down_proj
+
+
+@dataclass(frozen=True, slots=True)
+class TorchGPTQCpuWeight:
+    """Packed GPTQ tensors retained on CPU until a weight becomes ready."""
+
+    gate: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    up: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    down: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def dequantize_gptq(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    in_features: int,
+    out_features: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Decode one AutoGPTQ 4-bit weight matrix into ``[out, in]`` FP16.
+
+    GPTQ stores eight 4-bit values in each signed 32-bit word. This reference
+    decoder intentionally favors clear validation over speed; a packed CUDA
+    kernel can replace it without changing the Worker contract.
+    """
+
+    if group_size <= 0 or min(in_features, out_features) <= 0:
+        raise ValueError("GPTQ dimensions and group_size must be positive")
+    if in_features % 8 or out_features % 8 or in_features % group_size:
+        raise ValueError("GPTQ input width must be divisible by 8 and group_size")
+    if tuple(qweight.shape) != (in_features // 8, out_features):
+        raise ValueError("unexpected GPTQ qweight shape")
+    groups = in_features // group_size
+    if tuple(qzeros.shape) != (groups, out_features // 8):
+        raise ValueError("unexpected GPTQ qzeros shape")
+    if tuple(scales.shape) != (groups, out_features):
+        raise ValueError("unexpected GPTQ scales shape")
+    shifts = torch.arange(8, device=qweight.device, dtype=torch.int32) * 4
+    values = (qweight.to(torch.int32).unsqueeze(-1) >> shifts) & 0xF
+    values = values.permute(0, 2, 1).reshape(in_features, out_features)
+    zero_values = (qzeros.to(torch.int32).unsqueeze(-1) >> shifts) & 0xF
+    zero_values = zero_values.expand(-1, -1, 8).reshape(groups, out_features) + 1
+    group_ids = torch.arange(in_features, device=qweight.device) // group_size
+    return ((values - zero_values[group_ids]).to(scales.dtype) * scales[group_ids]).T.contiguous()

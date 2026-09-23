@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable
 
@@ -20,38 +21,44 @@ from expertkit_worker.backends.base import (
     ComputeBackend,
     InvalidBackendInput,
 )
+from expertkit_worker.backends.torch.fp4 import fp8_activation_reference
+from expertkit_worker.backends.torch.modelslim_w8a8 import (
+    TorchModelSlimW8A8Weights,
+    modelslim_w8a8_linear,
+)
+from expertkit_worker.backends.torch.w8a8 import TorchW8A8Weights, w8a8_linear
 from expertkit_worker.backends.torch.weights import TorchExpertWeights
+from expertkit_worker.device import CpuWorkerRuntime, CudaWorkerRuntime, WorkerDeviceRuntime
+from expertkit_worker.device.runtime import DeviceWork
 from expertkit_worker.weights import ReadyWeightLease, WeightsNotReady
+
+type TorchReadyWeights = TorchExpertWeights | TorchW8A8Weights | TorchModelSlimW8A8Weights
 
 type AcquireTorchWeights = Callable[
     [int, tuple[int, ...]],
-    ReadyWeightLease[TorchExpertWeights],
+    ReadyWeightLease[TorchReadyWeights],
 ]
 
 
 class _TorchCompletion(BackendCompletion):
-    """Retain ready weights and the submitting CUDA stream until result release."""
+    """Retain ready weights and the submitting device stream until result release."""
 
     def __init__(
         self,
-        lease: ReadyWeightLease[TorchExpertWeights],
-        stream: torch.cuda.Stream | None,
+        lease: ReadyWeightLease[TorchReadyWeights],
+        work: DeviceWork,
     ) -> None:
         self._lease = lease
-        self._stream = stream
+        self._work = work
         self._lock = threading.Lock()
-        self._waited = stream is None
+        self._waited = False
         self._failed = False
         self._closed = False
 
     def wait_host(self) -> None:
-        """Wait for submitted Torch CUDA work and surface asynchronous failures."""
-
-        stream = self._stream
-        if stream is None:
-            return
+        """Wait for submitted device work and surface asynchronous failures."""
         try:
-            stream.synchronize()
+            self._work.wait_host()
         except BaseException:
             with self._lock:
                 self._failed = True
@@ -61,22 +68,22 @@ class _TorchCompletion(BackendCompletion):
 
     def close(self) -> None:
         """Release ready weights after submitted Torch work is complete."""
-
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            stream = self._stream
             waited = self._waited
             failed = self._failed
 
         close_error: BaseException | None = None
-        if stream is not None and not waited and not failed:
+        if not waited and not failed:
             try:
-                stream.synchronize()
+                self._work.wait_host()
             except BaseException as error:
                 close_error = error
+
         self._lease.close()
+
         if close_error is not None:
             raise close_error
 
@@ -91,8 +98,12 @@ class TorchBackend(ComputeBackend):
         intermediate_dim: int,
         top_k: int,
         dtype: torch.dtype,
-        device: torch.device | str,
+        runtime: WorkerDeviceRuntime | None = None,
+        device: torch.device | str | None = None,
         acquire_many: AcquireTorchWeights,
+        expert_compute: str = "swiglu",
+        swiglu_limit: float = 0.0,
+        linear_compute: str = "float",
     ) -> None:
         for name, value in (
             ("hidden_dim", hidden_dim),
@@ -103,20 +114,56 @@ class TorchBackend(ComputeBackend):
                 raise ValueError(f"{name} must be a positive integer")
         if dtype not in ACTIVATION_DTYPES:
             raise ValueError("Torch Backend dtype must be FP16, BF16, or FP32")
-        resolved_device = torch.device(device)
-        if resolved_device.type not in {"cpu", "cuda"}:
-            raise ValueError("Torch Backend device must be CPU or CUDA")
-        if resolved_device.type == "cuda" and resolved_device.index is None:
-            raise ValueError("Torch Backend CUDA device must include an index")
         if not callable(acquire_many):
             raise TypeError("acquire_many must be callable")
+        if runtime is None:
+            if device is None:
+                raise TypeError("TorchBackend requires runtime or device")
+            parsed_device = torch.device(device)
+            if parsed_device.type == "cpu":
+                runtime = CpuWorkerRuntime(parsed_device)
+            elif parsed_device.type == "cuda":
+                runtime = CudaWorkerRuntime(parsed_device)
+            elif parsed_device.type == "npu":
+                from expertkit_worker.device.ascend import AscendWorkerRuntime
 
+                runtime = AscendWorkerRuntime(parsed_device)
+            else:
+                raise ValueError(f"unsupported Torch device: {parsed_device}")
+
+        if (
+            expert_compute not in {"swiglu", "deepseek_v4"}
+            or not math.isfinite(swiglu_limit)
+            or swiglu_limit < 0
+        ):
+            raise ValueError("unsupported expert computation policy")
+        linear_implementations = {
+            "float": self._float_linear,
+            "fp8_reference": self._fp8_linear,
+            "w8a8": self._w8a8_linear,
+            "modelslim_w8a8_dynamic": self._modelslim_w8a8_linear,
+        }
+        if linear_compute not in linear_implementations:
+            raise ValueError("unsupported linear computation recipe")
+        if linear_compute == "fp8_reference" and (hidden_dim % 128 or intermediate_dim % 128):
+            raise ValueError("V4 FP8 activation widths must be divisible by 128")
+        self._expert_compute = expert_compute
+        self._swiglu_limit = swiglu_limit
+        self._linear = linear_implementations[linear_compute]
+        self._weight_type = {
+            "w8a8": TorchW8A8Weights,
+            "modelslim_w8a8_dynamic": TorchModelSlimW8A8Weights,
+        }.get(linear_compute, TorchExpertWeights)
+        self._finish_expert = (
+            self._v4_output if expert_compute == "deepseek_v4" else self._swiglu_output
+        )
+        self._quantized_linear = linear_compute != "float"
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
         self._dtype = dtype
-        self._device = resolved_device
         self._acquire_many = acquire_many
+        self._runtime = runtime
         self._capabilities = BackendCapabilities(
             supports_dynamic_tokens=True,
             supports_concurrent_batches=True,
@@ -153,6 +200,12 @@ class TorchBackend(ComputeBackend):
                 + intermediate
                 + weighted_output
                 + accumulator
+                # Bound quantization, INT32 products, FP32 activation work, and row padding.
+                + (
+                    (max_batch_tokens + 32) * (self._hidden_dim + self._intermediate_dim) * 64
+                    if self._quantized_linear or self._expert_compute == "deepseek_v4"
+                    else 0
+                )
             )
         )
 
@@ -168,12 +221,12 @@ class TorchBackend(ComputeBackend):
 
         try:
             self._validate_weights(lease, batch)
+
             with torch.inference_mode():
                 self._compute(batch, prepared_output, lease)
-            stream = (
-                torch.cuda.current_stream(self._device) if self._device.type == "cuda" else None
-            )
-            return _TorchCompletion(lease, stream)
+
+            work = self._runtime.capture_current_work()
+            return _TorchCompletion(lease, work)
         except BaseException:
             self._finish_failed_submission(lease)
             raise
@@ -183,19 +236,20 @@ class TorchBackend(ComputeBackend):
         batch: BackendBatch,
         prepared_output: torch.Tensor,
     ) -> None:
+        device = self._runtime.device
         if batch.hidden_dim != self._hidden_dim:
             raise InvalidBackendInput("batch hidden dimension does not match the Torch Backend")
         if batch.top_k != self._top_k:
             raise InvalidBackendInput("batch top_k does not match the Torch Backend")
         if batch.hidden_states.dtype != self._dtype:
             raise InvalidBackendInput("batch dtype does not match the Torch Backend")
-        if batch.hidden_states.device != self._device:
+        if batch.hidden_states.device != device:
             raise InvalidBackendInput("batch device does not match the Torch Backend")
         if prepared_output.shape != batch.hidden_states.shape:
             raise InvalidBackendInput("prepared output shape does not match hidden states")
         if prepared_output.dtype != self._dtype:
             raise InvalidBackendInput("prepared output dtype does not match the Torch Backend")
-        if prepared_output.device != self._device:
+        if prepared_output.device != device:
             raise InvalidBackendInput("prepared output device does not match the Torch Backend")
         if not prepared_output.is_contiguous():
             raise InvalidBackendInput("prepared output must be contiguous")
@@ -203,7 +257,7 @@ class TorchBackend(ComputeBackend):
     def _acquire(
         self,
         batch: BackendBatch,
-    ) -> ReadyWeightLease[TorchExpertWeights]:
+    ) -> ReadyWeightLease[TorchReadyWeights]:
         try:
             return self._acquire_many(batch.layer_id, batch.distinct_expert_ids)
         except WeightsNotReady as error:
@@ -211,16 +265,21 @@ class TorchBackend(ComputeBackend):
 
     def _validate_weights(
         self,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
         batch: BackendBatch,
     ) -> None:
+        device = self._runtime.device
         if lease.expert_ids != batch.distinct_expert_ids:
             raise RuntimeError("ready weight lookup returned different expert IDs")
         if len(lease.objects) != len(batch.distinct_expert_ids):
             raise RuntimeError("ready weight lookup returned the wrong object count")
         for weight in lease.objects:
-            if not isinstance(weight, TorchExpertWeights):
+            if not isinstance(
+                weight, TorchExpertWeights | TorchW8A8Weights | TorchModelSlimW8A8Weights
+            ):
                 raise RuntimeError("ready weight lookup returned a non-Torch object")
+            if not isinstance(weight, self._weight_type):
+                raise RuntimeError("ready weight quantization differs from the Backend recipe")
             if (
                 weight.hidden_dim != self._hidden_dim
                 or weight.intermediate_dim != self._intermediate_dim
@@ -234,17 +293,52 @@ class TorchBackend(ComputeBackend):
                     BackendFatalReason.UNEXPECTED,
                     "ready expert weight dtype does not match the Torch Backend",
                 )
-            if weight.device != self._device:
+            if weight.device != device:
                 raise BackendFatalError(
                     BackendFatalReason.UNEXPECTED,
                     "ready expert weight device does not match the Torch Backend",
                 )
 
     @staticmethod
+    def _float_linear(x: torch.Tensor, weight: TorchExpertWeights, projection: int) -> torch.Tensor:
+        return functional.linear(x, weight.tensors[projection])
+
+    @staticmethod
+    def _fp8_linear(x: torch.Tensor, weight: TorchExpertWeights, projection: int) -> torch.Tensor:
+        return functional.linear(fp8_activation_reference(x), weight.tensors[projection])
+
+    @staticmethod
+    def _w8a8_linear(x: torch.Tensor, weight: TorchW8A8Weights, projection: int) -> torch.Tensor:
+        return w8a8_linear(x, weight.matrices[projection], weight.scales[projection])
+
+    @staticmethod
+    def _modelslim_w8a8_linear(
+        x: torch.Tensor, weight: TorchModelSlimW8A8Weights, projection: int
+    ) -> torch.Tensor:
+        return modelslim_w8a8_linear(x, weight, projection)
+
+    def _swiglu_output(
+        self, gate: torch.Tensor, up: torch.Tensor, routing: torch.Tensor, weight: TorchReadyWeights
+    ) -> torch.Tensor:
+        intermediate = functional.silu(gate) * up
+        return self._linear(intermediate, weight, 2).float() * routing
+
+    def _v4_output(
+        self, gate: torch.Tensor, up: torch.Tensor, routing: torch.Tensor, weight: TorchReadyWeights
+    ) -> torch.Tensor:
+        dtype = gate.dtype
+        gate, up = gate.float(), up.float()
+        if self._swiglu_limit > 0:
+            gate = gate.clamp(max=self._swiglu_limit)
+            up = up.clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
+        intermediate = (functional.silu(gate) * up * routing).to(dtype)
+        return self._linear(intermediate, weight, 2).float()
+
     def _compute(
+        self,
         batch: BackendBatch,
         prepared_output: torch.Tensor,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
     ) -> None:
         if not lease.objects:
             prepared_output.zero_()
@@ -260,27 +354,22 @@ class TorchBackend(ComputeBackend):
             token_indices = coordinates[:, 0]
             route_indices = coordinates[:, 1]
             expert_input = torch.index_select(batch.hidden_states, 0, token_indices)
-            gate = functional.linear(expert_input, weight.gate_proj)
-            up = functional.linear(expert_input, weight.up_proj)
-            expert_output = functional.linear(functional.silu(gate) * up, weight.down_proj)
-            routing = batch.routing_weights[token_indices, route_indices]
-            accumulator.index_add_(
-                0,
-                token_indices,
-                expert_output.to(torch.float32) * routing.unsqueeze(1),
-            )
+            gate = self._linear(expert_input, weight, 0)
+            up = self._linear(expert_input, weight, 1)
+            routing = batch.routing_weights[token_indices, route_indices].unsqueeze(1)
+            weighted = self._finish_expert(gate, up, routing, weight)
+            accumulator.index_add_(0, token_indices, weighted)
         prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
 
     def _finish_failed_submission(
         self,
-        lease: ReadyWeightLease[TorchExpertWeights],
+        lease: ReadyWeightLease[TorchReadyWeights],
     ) -> None:
         synchronization_error: BaseException | None = None
-        if self._device.type == "cuda":
-            try:
-                torch.cuda.current_stream(self._device).synchronize()
-            except BaseException as error:
-                synchronization_error = error
+        try:
+            self._runtime.capture_current_work().wait_host()
+        except BaseException as error:
+            synchronization_error = error
         lease.close()
         if synchronization_error is not None:
             raise BackendFatalError(

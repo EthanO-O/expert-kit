@@ -62,6 +62,15 @@ class WeightAdapter[CpuWeightT, ReadyWeightT](ABC):
     def conversion_temporary_bytes(self) -> int:
         """Return conservative temporary device bytes used during conversion."""
 
+    def host_conversion_temporary_bytes(self) -> int:
+        """Bound transient Host tensor bytes during one ready-weight conversion.
+
+        Excludes retained source bytes and resident CPU cache objects. Startup
+        reserves this capacity for each concurrent load before sizing the cache.
+        Implementations must include decoded matrices retained until placement.
+        """
+        return 0
+
     def initialize_ready_storage(self, max_experts: int) -> None:
         """Initialize optional fixed Backend storage for the derived capacity.
 
