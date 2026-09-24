@@ -70,7 +70,7 @@ Tensor to the vLLM layer.
 
 ## Inference tracing
 
-See [the tracing tutorial](../../doc/tutorial/inference-tracing.md) for opt-in
-Frontend-to-Worker traces, Jaeger configuration, and host/device timing limits.
-Use `EK_TRACE_ENDPOINT`, `EK_TRACE_SAMPLE_RATIO`, and `--enforce-eager` for a short
-diagnostic run; enable Worker tracing to retain the complete tree.
+See [the tracing tutorial](../../doc/tutorial/inference-tracing.md) for the
+Ascend generator setting and direct Jaeger inspection. Manual deployments use
+`EK_TRACE_ENDPOINT`, `EK_TRACE_SAMPLE_RATIO`, and `--enforce-eager` for the
+Frontend, plus Worker `observability.tracing` YAML for the complete trace.
