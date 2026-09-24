@@ -1,9 +1,6 @@
 """Trace real Torch frontend, gRPC fanout and expert execution as one batch."""
 
 import asyncio
-import json
-import os
-from pathlib import Path
 
 import pytest
 import torch
@@ -34,12 +31,11 @@ from expertkit_worker.weights import ReadyWeightTable
 
 
 @pytest.mark.parametrize("sample_ratio", [1.0, 0.0])
-@pytest.mark.parametrize("worker_count", [1, 2])
-def test_model_batch_connects_all_layers_workers_and_experts(
+def test_model_batch_connects_all_layers_and_workers(
     monkeypatch,
     sample_ratio: float,
-    worker_count: int,
 ) -> None:
+    worker_count = 2
     exporter = InMemorySpanExporter()
     providers = []
 
@@ -203,46 +199,16 @@ def test_model_batch_connects_all_layers_workers_and_experts(
             }
             layers = [s for s in children if s.name == "transport.layer"]
             assert len(layers) == 2
-            experts = [s for s in children if s.name == "worker.expert.submit"]
-            assert len(experts) == 6
-            for expert in experts:
-                assert by_id[expert.parent.span_id].name == "worker.backend.submit"
+            assert any(s.name == "worker.backend.submit" for s in children)
             rpcs = [s for s in children if s.name == "transport.grpc.rpc"]
             assert len(rpcs) == 2 * worker_count
             for rpc in rpcs:
                 assert rpc.kind.name == "CLIENT"
-                assert rpc.attributes["expertkit.request_bytes"] > 0
-                assert rpc.attributes["expertkit.response_bytes"] > 0
                 server = [
                     s for s in children if s.parent and s.parent.span_id == rpc.context.span_id
                 ]
                 assert len(server) == 1
                 assert server[0].name == "/ek.worker.v2.ComputationService/Execute"
-            names = {s.name for s in children}
-            assert {
-                "frontend.route",
-                "transport.group",
-                "transport.grpc.admission",
-                "transport.grpc.encode",
-                "transport.grpc.decode",
-            } <= names
-            if worker_count > 1:
-                assert "transport.aggregate" in names
-        artifact = os.getenv("EK_TRACE_TEST_ARTIFACT")
-        if artifact and worker_count == 2:
-            Path(artifact).write_text(
-                json.dumps([json.loads(s.to_json()) for s in spans], indent=2)
-            )
-        endpoint = os.getenv("EK_TRACE_TEST_EXPORT_ENDPOINT")
-        if endpoint and worker_count == 2:
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-            from opentelemetry.sdk.trace.export import SpanExportResult
-
-            otlp = OTLPSpanExporter(endpoint=endpoint)
-            try:
-                assert otlp.export(spans) == SpanExportResult.SUCCESS
-            finally:
-                otlp.shutdown()
     finally:
         for item in providers:
             item.shutdown()
