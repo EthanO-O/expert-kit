@@ -121,8 +121,9 @@ def group_worker_batches(
 
     Selection chooses one replica per expert for this grouping attempt. The
     Frontend-provided expert list avoids reading device routing values again.
-    Multi-Worker masks and row compaction stay on the input device. Oversized
-    batches copy one expert-count table for all physical chunks.
+    Multi-Worker masks and row compaction stay on the input device. Single-token
+    batches reuse the only row without discovering indices on the device.
+    Oversized batches copy one expert-count table for all physical chunks.
 
     Args:
         batch: Final model-router output.
@@ -230,20 +231,29 @@ def group_worker_batches(
     zero_weight = torch.zeros((), dtype=torch.float32, device=batch.routing_weights.device)
     for target_index, target in enumerate(targets):
         target_assignments = assignment_targets == target_index
-        token_indices = torch.nonzero(
-            torch.any(target_assignments, dim=1), as_tuple=False
-        ).flatten()
-        if token_indices.numel() == 0:
-            continue
-        selected_assignments = target_assignments[token_indices]
+        if batch.token_count == 1:
+            # The exact expert list guarantees every selected Worker owns this row.
+            token_indices = None
+            selected_assignments = target_assignments
+            expert_ids = batch.expert_ids
+            routing_weights = batch.routing_weights
+        else:
+            token_indices = torch.nonzero(
+                torch.any(target_assignments, dim=1), as_tuple=False
+            ).flatten()
+            if token_indices.numel() == 0:
+                continue
+            selected_assignments = target_assignments[token_indices]
+            expert_ids = batch.expert_ids[token_indices]
+            routing_weights = batch.routing_weights[token_indices]
         selected_ids = torch.where(
             selected_assignments,
-            batch.expert_ids[token_indices],
+            expert_ids,
             invalid_expert,
         )
         selected_weights = torch.where(
             selected_assignments,
-            batch.routing_weights[token_indices],
+            routing_weights,
             zero_weight,
         )
         logical = WorkerBatch(

@@ -203,7 +203,8 @@ def test_single_complete_worker_bypasses_fp32_dispatch(monkeypatch) -> None:
     run(scenario())
 
 
-def test_retry_keeps_successes_once_and_prefers_replacement() -> None:
+@pytest.mark.parametrize("token_count", [1, 2])
+def test_retry_keeps_successes_once_and_prefers_replacement(token_count) -> None:
     async def scenario() -> None:
         busy = TransportError(TransportErrorCode.BUSY, retryable=True)
         transport_a = ScriptedTransport([1.0])
@@ -227,7 +228,7 @@ def test_retry_keeps_successes_once_and_prefers_replacement() -> None:
         pools = pools_for((worker_a, worker_b, worker_c), clock=clock)
 
         result = await execute_routed_layer(
-            routed_batch(torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)),
+            routed_batch(torch.tensor([[0, 1]] * token_count, dtype=torch.int32)),
             topology,
             RoundRobinSelector(),
             pools,
@@ -237,9 +238,9 @@ def test_retry_keeps_successes_once_and_prefers_replacement() -> None:
         )
 
         assert result.dtype == torch.float16
-        torch.testing.assert_close(result, torch.full((2, 4), 3.0, dtype=torch.float16))
+        torch.testing.assert_close(result, torch.full((token_count, 4), 3.0, dtype=torch.float16))
         assert len(transport_a.calls) == len(transport_b.calls) == len(transport_c.calls) == 1
-        assert transport_c.calls[0].expert_ids.tolist() == [[-1, 1], [-1, 1]]
+        assert transport_c.calls[0].expert_ids.tolist() == [[-1, 1]] * token_count
         assert topology.refresh_calls == [(7, 11, 20.0)]
         assert clock.sleeps == []
         await close_pools(pools)

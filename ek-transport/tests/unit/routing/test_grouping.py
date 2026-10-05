@@ -122,6 +122,59 @@ def test_single_worker_reuses_complete_routing_tensors() -> None:
     assert physical.distinct_expert_ids == (0, 1, 2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("retry", [False, True])
+def test_single_token_grouping_reuses_row_without_nonzero(dtype, retry, monkeypatch) -> None:
+    worker_a = target("worker-a", max_batch_tokens=1)
+    worker_b = target("worker-b", max_batch_tokens=1)
+    source = RoutedLayerBatch(
+        instance_id=7,
+        layer_id=2,
+        hidden_states=torch.arange(8, dtype=dtype).reshape(1, 8),
+        expert_ids=torch.tensor([[2, 1, 2, -1]], dtype=torch.int32),
+        routing_weights=torch.tensor([[0.3, 0.4, 0.3, 0.0]], dtype=torch.float32),
+        distinct_expert_ids=(1, 2),
+    )
+
+    def unexpected_nonzero(*args, **kwargs):
+        raise AssertionError("single-token grouping must not discover rows on the device")
+
+    monkeypatch.setattr(torch, "nonzero", unexpected_nonzero)
+    grouped = plans_by_worker(
+        group_worker_batches(
+            source,
+            topology(worker_a, worker_b),
+            RoundRobinSelector(),
+            reuse_complete_tensors=not retry,
+        )
+    )
+
+    for physical in grouped.values():
+        assert physical.hidden_states is source.hidden_states
+        assert physical.token_indices is None
+        assert physical.token_count == 1
+        assert physical.expert_ids.shape == physical.routing_weights.shape == (1, 4)
+        assert physical.expert_ids.dtype is torch.int32
+        assert physical.routing_weights.dtype is torch.float32
+        assert (
+            physical.expert_ids.device
+            == physical.routing_weights.device
+            == source.hidden_states.device
+        )
+    assert grouped["worker-a"].expert_ids.tolist() == [[2, -1, 2, -1]]
+    assert grouped["worker-b"].expert_ids.tolist() == [[-1, 1, -1, -1]]
+    assert grouped["worker-a"].distinct_expert_ids == (2,)
+    assert grouped["worker-b"].distinct_expert_ids == (1,)
+    torch.testing.assert_close(
+        grouped["worker-a"].routing_weights,
+        torch.tensor([[0.3, 0.0, 0.3, 0.0]], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        grouped["worker-b"].routing_weights,
+        torch.tensor([[0.0, 0.4, 0.0, 0.0]], dtype=torch.float32),
+    )
+
+
 def test_grouping_splits_only_between_token_rows() -> None:
     worker_a = target("worker-a", max_batch_tokens=1)
     worker_b = target("worker-b", max_batch_tokens=2)
