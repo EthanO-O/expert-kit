@@ -34,12 +34,17 @@ def register() -> None:
         wrap_fused_moe_factory,
     )
 
-    if is_expertkit_fused_moe_factory(fused_moe_layer.FusedMoE):
-        return
+    if not is_expertkit_fused_moe_factory(fused_moe_layer.FusedMoE):
+        remote_factory = wrap_fused_moe_factory(fused_moe_layer.FusedMoE)
+        # These are deliberately mutable module exports: model modules import the
+        # package binding, while the platform wrapper owns the layer binding.
+        fused_moe_layer.__dict__["FusedMoE"] = remote_factory
+        fused_moe_package.__dict__["FusedMoE"] = remote_factory
+        logger.info(
+            f"enabled Expert Kit remote MoE for vLLM 0.25.1 on {current_platform.device_type}"
+        )
 
-    remote_factory = wrap_fused_moe_factory(fused_moe_layer.FusedMoE)
-    # These are deliberately mutable module exports: model modules import the
-    # package binding, while the platform wrapper owns the layer binding.
-    fused_moe_layer.__dict__["FusedMoE"] = remote_factory
-    fused_moe_package.__dict__["FusedMoE"] = remote_factory
-    logger.info(f"enabled Expert Kit remote MoE for vLLM 0.25.1 on {current_platform.device_type}")
+    from expertkit_vllm.dummy_batch import install_dummy_batch_guard
+
+    # Worker imports must see the remote factory exports above.
+    install_dummy_batch_guard(current_platform.device_type)

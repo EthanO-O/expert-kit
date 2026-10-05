@@ -39,6 +39,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 
+from expertkit_vllm.dummy_batch import is_dummy_forward
 from expertkit_vllm.experts.remote_routed_experts import RemoteRoutedExperts
 from expertkit_vllm.experts.selector import ExpertSelector, create_expert_selector
 from expertkit_vllm.utils.config import collect_ek_client_config
@@ -331,35 +332,39 @@ class RemoteMoERunner(MoERunnerInterface):
         trace_attributes(
             {"expertkit.layer_id": self.layer_id, "expertkit.token_count": hidden_states.shape[0]}
         )
-        with trace_span("frontend.route"):
-            if self.gate is not None:
-                if hasattr(self.gate, "weight_fp32"):
-                    # Ascend preserves FP32 gate weights for stable expert selection.
-                    router_logits = torch.nn.functional.linear(
-                        hidden_states.float(), self.gate.weight_fp32
-                    )
-                else:
-                    router_logits = _unwrap_tensor(self.gate(hidden_states))
-            # Expert selector (in vLLM or vLLM-Ascend) will select experts
-            # under different platform and runtime
-            routing_weights, expert_ids = self.expert_selector.select_experts(
-                hidden_states,
-                router_logits,
-                input_ids=input_ids,
+        if is_dummy_forward():
+            # Idle DP tokens need local output buffers, but no remote computation.
+            routed_output = torch.zeros_like(hidden_states)
+        else:
+            with trace_span("frontend.route"):
+                if self.gate is not None:
+                    if hasattr(self.gate, "weight_fp32"):
+                        # Ascend preserves FP32 gate weights for stable expert selection.
+                        router_logits = torch.nn.functional.linear(
+                            hidden_states.float(), self.gate.weight_fp32
+                        )
+                    else:
+                        router_logits = _unwrap_tensor(self.gate(hidden_states))
+                # Expert selector (in vLLM or vLLM-Ascend) will select experts
+                # under different platform and runtime
+                routing_weights, expert_ids = self.expert_selector.select_experts(
+                    hidden_states,
+                    router_logits,
+                    input_ids=input_ids,
+                )
+                expert_ids, routing_weights, distinct_expert_ids = validate_and_convert_routing(
+                    expert_ids,
+                    routing_weights,
+                    experts_per_layer=self.num_experts,
+                )
+            routed_output = _client_for(self, hidden_states).execute(
+                layer_id=self.layer_id,
+                hidden_states=hidden_states,
+                expert_ids=expert_ids,
+                routing_weights=routing_weights,
+                distinct_expert_ids=distinct_expert_ids,
+                timeout_seconds=self.client_config.timeout_seconds,
             )
-            expert_ids, routing_weights, distinct_expert_ids = validate_and_convert_routing(
-                expert_ids,
-                routing_weights,
-                experts_per_layer=self.num_experts,
-            )
-        routed_output = _client_for(self, hidden_states).execute(
-            layer_id=self.layer_id,
-            hidden_states=hidden_states,
-            expert_ids=expert_ids,
-            routing_weights=routing_weights,
-            distinct_expert_ids=distinct_expert_ids,
-            timeout_seconds=self.client_config.timeout_seconds,
-        )
 
         shared_output: torch.Tensor | None = None
         if self._shared_experts_module is not None:

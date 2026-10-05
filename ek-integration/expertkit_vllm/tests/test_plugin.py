@@ -23,6 +23,8 @@ def install_fake_vllm_modules(monkeypatch, *, device_type: str = "cuda"):
             "vllm.model_executor.layers",
             "vllm.model_executor.layers.fused_moe",
             "vllm.model_executor.layers.fused_moe.layer",
+            "vllm.v1.worker.gpu_worker",
+            "vllm_ascend.worker.worker",
         )
     }
     package = modules["vllm.model_executor.layers.fused_moe"]
@@ -33,6 +35,13 @@ def install_fake_vllm_modules(monkeypatch, *, device_type: str = "cuda"):
 
     package.__dict__["FusedMoE"] = platform_fused_moe
     layer.__dict__["FusedMoE"] = platform_fused_moe
+
+    class Worker:
+        def execute_dummy_batch(self):
+            return "dummy"
+
+    modules["vllm.v1.worker.gpu_worker"].__dict__["Worker"] = Worker
+    modules["vllm_ascend.worker.worker"].__dict__["NPUWorker"] = Worker
 
     class FakePlatform:
         def __init__(self) -> None:
