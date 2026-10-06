@@ -10,8 +10,13 @@ import grpc
 import pytest
 import torch
 
+import expertkit_transport.transports.grpc.receiver as receiver_module
 from expertkit_transport.batches import WorkerBatch
-from expertkit_transport.errors import TransportError, TransportErrorCode
+from expertkit_transport.errors import (
+    TransportError,
+    TransportErrorCode,
+    TransportProtocolError,
+)
 from expertkit_transport.tracing import TraceAttribute, TraceContext, Tracer, TraceSpan
 from expertkit_transport.transports import WorkerEndpointConfig
 from expertkit_transport.transports.base import BatchBufferConfig, ReceiverClosed
@@ -19,6 +24,7 @@ from expertkit_transport.transports.grpc import (
     GrpcWorkerBatchReceiver,
     GrpcWorkerTransport,
 )
+from expertkit_transport.transports.grpc.codec import decode_response, encode_request
 from expertkit_transport.transports.grpc.spec import calculate_message_limits
 
 
@@ -144,6 +150,205 @@ async def close_pair(server: GrpcWorkerBatchReceiver, client: GrpcWorkerTranspor
 
 def run(coroutine: Awaitable[None]) -> None:
     asyncio.run(coroutine)
+
+
+@pytest.mark.parametrize("codec", ["decode", "encode"])
+def test_small_cpu_codec_avoids_executor_handoff(
+    codec: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        spec = batch_spec()
+        server = GrpcWorkerBatchReceiver(
+            "127.0.0.1:0", spec, max_active_batches=1, max_pending_batches=1
+        )
+        submitted = []
+        original_submit = server._executor.submit
+
+        def observe_submit(function, *args, **kwargs):
+            submitted.append(function)
+            return original_submit(function, *args, **kwargs)
+
+        monkeypatch.setattr(server._executor, "submit", observe_submit)
+        try:
+            if codec == "decode":
+                decoded = await server._run_cpu(
+                    receiver_module.decode_request_with_size,
+                    encode_request(worker_batch(), spec),
+                    spec,
+                )
+                assert torch.equal(decoded.batch.expert_ids, worker_batch().expert_ids)
+            else:
+                output = torch.ones((2, 3), dtype=spec.dtype)
+                payload = await server._run_cpu(
+                    receiver_module.encode_success_response, output, spec
+                )
+                assert torch.equal(decode_response(payload, 2, spec), output)
+            assert submitted == []
+        finally:
+            await server.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("codec", "size", "experts", "offload"),
+    [
+        ("decode", 16 * 1024, 1024, False),
+        ("decode", 16 * 1024 + 1, 1024, True),
+        ("decode", 16 * 1024, 1025, True),
+        ("encode", 16 * 1024, 1024, False),
+        ("encode", 16 * 1024 + 2, 1024, True),
+        ("device", 12, 8, True),
+        ("error", 1, 8, True),
+        ("error", 64 * 1024, 8, True),
+        ("unknown", 0, 8, True),
+    ],
+)
+def test_cpu_codec_inline_bounds_and_fallback(
+    codec: str,
+    size: int,
+    experts: int,
+    offload: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        spec = replace(batch_spec(), experts_per_layer=experts, hidden_dim=8193)
+        server = GrpcWorkerBatchReceiver(
+            "127.0.0.1:0", spec, max_active_batches=1, max_pending_batches=1
+        )
+        submitted = []
+        original_submit = server._executor.submit
+
+        def observe_submit(function, *args, **kwargs):
+            submitted.append(function)
+            return original_submit(function, *args, **kwargs)
+
+        monkeypatch.setattr(server._executor, "submit", observe_submit)
+        try:
+            if codec == "decode":
+                with pytest.raises(TransportProtocolError):
+                    await server._run_cpu(
+                        receiver_module.decode_request_with_size, b"\x00" * size, spec
+                    )
+            elif codec in {"encode", "device"}:
+                spec = replace(spec, hidden_dim=size // 2)
+                output = torch.ones(
+                    (1, spec.hidden_dim),
+                    dtype=spec.dtype,
+                    device="meta" if codec == "device" else "cpu",
+                )
+                if codec == "device":
+                    with pytest.raises(ValueError, match="CPU"):
+                        await server._run_cpu(receiver_module.encode_success_response, output, spec)
+                else:
+                    payload = await server._run_cpu(
+                        receiver_module.encode_success_response, output, spec
+                    )
+                    assert torch.equal(decode_response(payload, 1, spec), output)
+            elif codec == "error":
+                error = TransportError(
+                    TransportErrorCode.BUSY, retryable=True, diagnostic="x" * size
+                )
+                payload = await server._run_cpu(receiver_module.encode_error_response, error, spec)
+                with pytest.raises(TransportError) as caught:
+                    decode_response(payload, 1, spec)
+                assert caught.value.code == TransportErrorCode.BUSY
+            else:
+                assert await server._run_cpu(lambda: 7) == 7
+            assert bool(submitted) is offload
+        finally:
+            await server.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("codec", "state"),
+    [
+        ("decode", "pending"),
+        ("encode", "pending"),
+        ("decode", "active"),
+        ("encode", "two_active"),
+    ],
+)
+def test_small_codec_offloads_when_receiver_has_other_work(
+    codec: str,
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        queued = asyncio.Event()
+        spec = batch_spec()
+        server = GrpcWorkerBatchReceiver(
+            "127.0.0.1:0",
+            spec,
+            max_active_batches=2,
+            max_pending_batches=2,
+            on_pending_changed=lambda count: queued.set() if count else None,
+        )
+        await server.start()
+        client = GrpcWorkerTransport(
+            f"127.0.0.1:{server.bound_port}", spec, max_in_flight=2, device="cpu"
+        )
+        await client.start()
+        output = prepare_output(client)
+        submission = asyncio.create_task(
+            client.execute(worker_batch(), output, monotonic_deadline=float("inf"))
+        )
+        received_batches = []
+        second_submission = None
+        try:
+            async with asyncio.timeout(2):
+                await queued.wait()
+            assert server.pending_count == 1
+            if state in {"active", "two_active"}:
+                received_batches.append(await server.receive())
+                assert server.active_count == 1
+                assert server.pending_count == 0
+            if state == "two_active":
+                second_submission = asyncio.create_task(
+                    client.execute(
+                        worker_batch(), torch.empty_like(output), monotonic_deadline=float("inf")
+                    )
+                )
+                async with asyncio.timeout(2):
+                    received_batches.append(await server.receive())
+                assert server.active_count == 2
+                assert server.pending_count == 0
+            submitted = []
+            original_submit = server._executor.submit
+
+            def observe_submit(function, *args, **kwargs):
+                submitted.append(function)
+                return original_submit(function, *args, **kwargs)
+
+            monkeypatch.setattr(server._executor, "submit", observe_submit)
+            if codec == "decode":
+                function = receiver_module.decode_request_with_size
+                decoded = await server._run_cpu(
+                    function, encode_request(worker_batch(), spec), spec
+                )
+                assert torch.equal(decoded.batch.expert_ids, worker_batch().expert_ids)
+            else:
+                function = receiver_module.encode_success_response
+                partial_output = torch.ones_like(output)
+                payload = await server._run_cpu(function, partial_output, spec)
+                assert torch.equal(decode_response(payload, 2, spec), partial_output)
+            assert submitted == [function]
+        finally:
+            submission.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await submission
+            if second_submission is not None:
+                second_submission.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await second_submission
+            for received in received_batches:
+                received.release_input()
+                await received.complete(output)
+            await close_pair(server, client)
+
+    run(scenario())
 
 
 def accelerator_module(device_type: str):

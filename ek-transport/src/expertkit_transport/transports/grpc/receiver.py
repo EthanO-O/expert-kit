@@ -39,6 +39,8 @@ from expertkit_transport.transports.queue import ReceiverQueue
 
 _EXECUTE_METHOD_NAME = "Execute"
 _SERVICE_NAME = "ek.worker.v2.ComputationService"
+_INLINE_CODEC_MAX_BYTES = 16 * 1024
+_INLINE_ROUTING_MAX_EXPERTS = 1024
 _NATIVE_ERROR_STATUS = {
     TransportErrorCode.DEADLINE_EXCEEDED: grpc.StatusCode.DEADLINE_EXCEEDED,
     TransportErrorCode.CANCELLED: grpc.StatusCode.CANCELLED,
@@ -522,6 +524,26 @@ class GrpcWorkerBatchReceiver(WorkerBatchReceiver):
         )
 
     async def _run_cpu(self, function: Callable[..., Any], *args: object) -> Any:
+        # Bound wire data and routing scans, and yield work when the receiver is busy.
+        # Error responses and other work retain the executor lifecycle below.
+        if (
+            function is decode_request_with_size
+            and isinstance(args[0], bytes)
+            and len(args[0]) <= _INLINE_CODEC_MAX_BYTES
+            and self._spec.experts_per_layer <= _INLINE_ROUTING_MAX_EXPERTS
+            and self.active_count == 0
+            and self.pending_count == 0
+        ):
+            return function(*args)
+        if function is encode_success_response and isinstance(args[0], torch.Tensor):
+            output = args[0]
+            if (
+                output.device.type == "cpu"
+                and output.numel() * output.element_size() <= _INLINE_CODEC_MAX_BYTES
+                and self.pending_count == 0
+                and self.active_count <= 1
+            ):
+                return function(*args)
         loop = asyncio.get_running_loop()
         work = loop.run_in_executor(self._executor, function, *args)
         try:
