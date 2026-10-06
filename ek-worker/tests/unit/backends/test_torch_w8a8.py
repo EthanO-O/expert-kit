@@ -122,8 +122,9 @@ def test_integer_gemm_matches_reference(rows: int) -> None:
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.cuda)])
 @pytest.mark.parametrize("expert_compute", ["deepseek_v4", "swiglu"])
+@pytest.mark.parametrize("token_count", [1, 3])
 def test_v4_w8a8_backend_weighting_clipping_and_completion(
-    device: str, expert_compute: str
+    device: str, expert_compute: str, token_count: int
 ) -> None:
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -145,12 +146,12 @@ def test_v4_w8a8_backend_weighting_clipping_and_completion(
         linear_compute="w8a8",
     )
     torch.manual_seed(5)
-    x = torch.randn(3, 32, device=device) * 4
-    routing = torch.tensor([[0.12], [0.77], [0.0]], device=device)
+    x = (torch.randn(3, 32, device=device) * 4)[:token_count]
+    routing = torch.tensor([[0.12], [0.77], [0.0]], device=device)[:token_count]
     batch = BackendBatch(
         layer_id=0,
         hidden_states=x,
-        expert_ids=torch.zeros(3, 1, dtype=torch.int32, device=device),
+        expert_ids=torch.zeros(token_count, 1, dtype=torch.int32, device=device),
         routing_weights=routing,
         distinct_expert_ids=(0,),
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import pytest
 import torch
@@ -129,6 +130,84 @@ def _device_runtime(device: torch.device):
 
         return AscendWorkerRuntime(device)
     return CpuWorkerRuntime(device) if device.type == "cpu" else CudaWorkerRuntime(device)
+
+
+def single_token_case(
+    dtype: torch.dtype,
+    routes: tuple[int, ...] = (2, 0, -1),
+) -> tuple[BackendBatch, dict[int, TorchExpertWeights]]:
+    """Build a decode batch with route order distinct from weight acquisition order."""
+    batch, weights = make_case(dtype, torch.device("cpu"))
+    return replace(
+        batch,
+        hidden_states=batch.hidden_states[:1],
+        expert_ids=torch.tensor([routes], dtype=torch.int32),
+        routing_weights=torch.tensor(
+            [
+                [
+                    value if expert >= 0 else 0.0
+                    for expert, value in zip(routes, (0.2, 0.0, 0.7), strict=True)
+                ]
+            ],
+            dtype=torch.float32,
+        ),
+        distinct_expert_ids=tuple(sorted({expert for expert in routes if expert >= 0})),
+    ), weights
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("routes", [(2, 0, -1), (2, 0, 1), (2, 0, 2)])
+def test_single_token_preserves_route_order_weighting_and_weight_lifetime(
+    dtype: torch.dtype, routes: tuple[int, ...]
+) -> None:
+    batch, weights = single_token_case(dtype, routes)
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight)
+    backend = make_backend(table, dtype, torch.device("cpu"))
+    output = torch.full_like(batch.hidden_states, torch.nan)
+    expected = reference_output(batch, weights)
+
+    completion = backend.submit(batch, output)
+    assert [table.usage_count(0, i) for i in range(3)] == [
+        int(i in batch.distinct_expert_ids) for i in range(3)
+    ]
+    completion.wait_host()
+    torch.testing.assert_close(output, expected)
+    completion.close()
+    completion.close()
+    assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
+
+
+def test_single_token_avoids_dynamic_indexing() -> None:
+    batch, weights = single_token_case(torch.bfloat16)
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight)
+    backend = make_backend(table, torch.bfloat16, torch.device("cpu"))
+    output = torch.empty_like(batch.hidden_states)
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        completion = backend.submit(batch, output)
+        completion.wait_host()
+        completion.close()
+
+    operators = {event.key for event in profile.key_averages()}
+    assert operators.isdisjoint({"aten::nonzero", "aten::index_select", "aten::index_add_"})
+    torch.testing.assert_close(output, reference_output(batch, weights))
+
+
+def test_single_token_rejects_absent_expert_and_releases_weights() -> None:
+    batch, weights = single_token_case(torch.float32)
+    batch = replace(batch, distinct_expert_ids=(0, 1, 2))
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight)
+    backend = make_backend(table, torch.float32, torch.device("cpu"))
+
+    with pytest.raises(InvalidBackendInput, match="distinct expert metadata"):
+        backend.submit(batch, torch.empty_like(batch.hidden_states))
+    assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
 
 
 @pytest.mark.parametrize(
@@ -271,14 +350,15 @@ def test_torch_backend_treats_invalid_ready_weight_as_fatal_and_releases_lease()
     assert [table.usage_count(0, expert_id) for expert_id in range(3)] == [0, 0, 0]
 
 
-def test_torch_backend_zeroes_output_when_worker_has_no_local_assignments() -> None:
+@pytest.mark.parametrize("token_count", [1, 2])
+def test_torch_backend_zeroes_output_when_worker_has_no_local_assignments(token_count: int) -> None:
     device = torch.device("cpu")
-    hidden = torch.ones(2, _HIDDEN_DIM)
+    hidden = torch.ones(token_count, _HIDDEN_DIM)
     batch = BackendBatch(
         layer_id=0,
         hidden_states=hidden,
-        expert_ids=torch.full((2, _TOP_K), -1, dtype=torch.int32),
-        routing_weights=torch.zeros(2, _TOP_K, dtype=torch.float32),
+        expert_ids=torch.full((token_count, _TOP_K), -1, dtype=torch.int32),
+        routing_weights=torch.zeros(token_count, _TOP_K, dtype=torch.float32),
         distinct_expert_ids=(),
     )
     table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)

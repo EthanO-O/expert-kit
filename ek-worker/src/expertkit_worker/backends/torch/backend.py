@@ -164,6 +164,7 @@ class TorchBackend(ComputeBackend):
             self._v4_output if expert_compute == "deepseek_v4" else self._swiglu_output
         )
         self._quantized_linear = linear_compute != "float"
+        self._reuse_single_token = linear_compute == "float" and expert_compute == "swiglu"
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
@@ -351,6 +352,11 @@ class TorchBackend(ComputeBackend):
             prepared_output.zero_()
             return
 
+        columns = (
+            self._single_token_columns(batch)
+            if self._reuse_single_token and batch.token_count == 1
+            else None
+        )
         accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
         for expert_id, weight in zip(lease.expert_ids, lease.objects, strict=True):
             with trace_span(
@@ -361,20 +367,50 @@ class TorchBackend(ComputeBackend):
                     "expertkit.timing": "host_submission",
                 },
             ):
-                coordinates = torch.nonzero(batch.expert_ids == expert_id, as_tuple=False)
-                if coordinates.shape[0] == 0:
-                    raise InvalidBackendInput(
-                        "distinct expert metadata does not match the routing tensor"
-                    )
-                token_indices = coordinates[:, 0]
-                route_indices = coordinates[:, 1]
-                expert_input = torch.index_select(batch.hidden_states, 0, token_indices)
+                if columns is None:
+                    coordinates = torch.nonzero(batch.expert_ids == expert_id, as_tuple=False)
+                    if coordinates.shape[0] == 0:
+                        raise InvalidBackendInput(
+                            "distinct expert metadata does not match the routing tensor"
+                        )
+                    token_indices = coordinates[:, 0]
+                    route_indices = coordinates[:, 1]
+                    expert_input = torch.index_select(batch.hidden_states, 0, token_indices)
+                else:
+                    column = columns.get(expert_id)
+                    if column is None:
+                        raise InvalidBackendInput(
+                            "distinct expert metadata does not match the routing tensor"
+                        )
+                    expert_input = batch.hidden_states
                 gate = self._linear(expert_input, weight, 0)
                 up = self._linear(expert_input, weight, 1)
-                routing = batch.routing_weights[token_indices, route_indices].unsqueeze(1)
+                if columns is None:
+                    routing = batch.routing_weights[token_indices, route_indices].unsqueeze(1)
+                else:
+                    routing = batch.routing_weights[:, column : column + 1]
                 weighted = self._finish_expert(gate, up, routing, weight)
-                accumulator.index_add_(0, token_indices, weighted)
+                if columns is None:
+                    accumulator.index_add_(0, token_indices, weighted)
+                else:
+                    accumulator.add_(weighted)
         prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
+
+    @staticmethod
+    def _single_token_columns(batch: BackendBatch) -> dict[int, int] | None:
+        """Read small routing IDs once instead of synchronizing for every expert.
+
+        Duplicate assignments retain the general path and its per-assignment
+        projection, weighting, and accumulation order.
+        """
+        columns: dict[int, int] = {}
+        for column, expert_id in enumerate(batch.expert_ids[0].cpu().tolist()):
+            if expert_id < 0:
+                continue
+            if expert_id in columns:
+                return None
+            columns[expert_id] = column
+        return columns
 
     def _finish_failed_submission(
         self,
