@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as functional
+from expertkit_transport.tracing import use_tracer
 
 from expertkit_worker.backends import (
     BackendBatch,
@@ -197,17 +202,200 @@ def test_single_token_avoids_dynamic_indexing() -> None:
     torch.testing.assert_close(output, reference_output(batch, weights))
 
 
-def test_single_token_rejects_absent_expert_and_releases_weights() -> None:
+@pytest.mark.parametrize(
+    ("device_name", "dtype", "linear", "expert", "available", "enabled"),
+    [
+        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", True, True),
+        ("Ascend910B2", torch.float16, "float", "swiglu", True, True),
+        ("Ascend310P3", torch.float16, "float", "swiglu", True, False),
+        ("unknown", torch.bfloat16, "float", "swiglu", True, False),
+        ("Ascend910_9362", torch.float32, "float", "swiglu", True, False),
+        ("Ascend910_9362", torch.bfloat16, "w8a8", "swiglu", True, False),
+        ("Ascend910_9362", torch.bfloat16, "float", "deepseek_v4", True, False),
+        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", False, False),
+    ],
+)
+def test_ascend_grouped_selection_and_per_batch_memory(
+    monkeypatch, device_name, dtype, linear, expert, available, enabled
+) -> None:
+    operator = object()
+    npu = SimpleNamespace(npu=SimpleNamespace(get_device_name=lambda _: device_name))
+    if available:
+        npu.npu_grouped_matmul = operator
+    monkeypatch.setitem(sys.modules, "torch_npu", npu)
+    options = dict(
+        hidden_dim=_HIDDEN_DIM,
+        intermediate_dim=_INTERMEDIATE_DIM,
+        top_k=_TOP_K,
+        dtype=dtype,
+        acquire_many=ReadyWeightTable(1, 3).acquire_many,
+        linear_compute=linear,
+        expert_compute=expert,
+    )
+    cpu = TorchBackend(**options, device="cpu")
+    backend = TorchBackend(**options, runtime=SimpleNamespace(device=SimpleNamespace(type="npu")))
+    assert backend._grouped_matmul is (operator if enabled else None)
+    for tokens in (1, 32):
+        extra = backend.estimate_resources(tokens).total_bytes(2) - cpu.estimate_resources(
+            tokens
+        ).total_bytes(2)
+        assert extra == (2 * 16 * 1024 * 1024 if enabled else 0)
+
+
+@pytest.mark.parametrize("routes", [(2, 0, -1), (2, 0, 1), (2, 0, 2), (2, -1, -1)])
+def test_grouped_single_token_preserves_routes_and_weight_views(routes) -> None:
+    batch, weights = single_token_case(torch.bfloat16, routes)
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight)
+    backend = make_backend(table, torch.bfloat16, torch.device("cpu"))
+    calls = []
+
+    def grouped(inputs, matrices, *, split_item, group_type):
+        assert (split_item, group_type) == (0, -1)
+        projection = len(calls)
+        for matrix, expert_id in zip(matrices, batch.distinct_expert_ids, strict=True):
+            original = weights[expert_id].tensors[projection]
+            assert matrix.data_ptr() == original.data_ptr()
+            assert matrix.stride() == original.t().stride()
+        if projection < 2:
+            assert all(value is batch.hidden_states for value in inputs)
+        calls.append(projection)
+        return [x @ matrix for x, matrix in zip(inputs, matrices, strict=True)]
+
+    backend._grouped_matmul = grouped
+    output = torch.full_like(batch.hidden_states, torch.nan)
+    attributes = {}
+    span = SimpleNamespace(is_recording=lambda: True, set_attribute=attributes.__setitem__)
+    tracer = SimpleNamespace(start_as_current_span=lambda *args, **kwargs: nullcontext(span))
+    with use_tracer(tracer):
+        completion = backend.submit(batch, output)
+    assert [table.usage_count(0, i) for i in batch.distinct_expert_ids] == [1] * len(
+        batch.distinct_expert_ids
+    )
+    completion.wait_host()
+    completion.close()
+    assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
+    assert calls == ([0, 1, 2] if routes in ((2, 0, -1), (2, 0, 1)) else [])
+    assert attributes == (
+        {"expertkit.expert_ids": ",".join(map(str, batch.distinct_expert_ids))} if calls else {}
+    )
+    torch.testing.assert_close(output, reference_output(batch, weights))
+
+
+def test_grouped_projection_failure_drains_work_before_releasing_weights() -> None:
+    batch, weights = single_token_case(torch.bfloat16)
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight)
+    events = []
+
+    class Work:
+        def wait_host(self):
+            assert [table.usage_count(0, i) for i in (0, 2)] == [1, 1]
+            events.append("waited")
+
+    class Runtime(CpuWorkerRuntime):
+        def capture_current_work(self):
+            return Work()
+
+    backend = TorchBackend(
+        hidden_dim=_HIDDEN_DIM,
+        intermediate_dim=_INTERMEDIATE_DIM,
+        top_k=_TOP_K,
+        dtype=torch.bfloat16,
+        runtime=Runtime(torch.device("cpu")),
+        acquire_many=table.acquire_many,
+    )
+
+    def grouped(inputs, matrices, **kwargs):
+        if events:
+            raise RuntimeError("grouped projection failed")
+        events.append("submitted")
+        return [x @ matrix for x, matrix in zip(inputs, matrices, strict=True)]
+
+    backend._grouped_matmul = grouped
+    with pytest.raises(RuntimeError, match="grouped projection failed"):
+        backend.submit(batch, torch.empty_like(batch.hidden_states))
+    assert events == ["submitted", "waited"]
+    assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_single_token_rejects_absent_expert_and_releases_weights(grouped: bool) -> None:
     batch, weights = single_token_case(torch.float32)
     batch = replace(batch, distinct_expert_ids=(0, 1, 2))
     table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
     for expert_id, weight in weights.items():
         table.publish(0, expert_id, weight)
     backend = make_backend(table, torch.float32, torch.device("cpu"))
+    if grouped:
+
+        def unexpected_projection(*args, **kwargs):
+            raise AssertionError("invalid metadata must fail before grouped projection")
+
+        backend._grouped_matmul = unexpected_projection
 
     with pytest.raises(InvalidBackendInput, match="distinct expert metadata"):
         backend.submit(batch, torch.empty_like(batch.hidden_states))
     assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
+
+
+@pytest.mark.skipif(os.getenv("EK_TEST_NPU") != "1", reason="requires an assigned Ascend NPU")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("routes", [(2, 0, -1), (2, 0, 1), (2, 0, 2), (-1, -1, -1)])
+def test_ascend_grouped_single_token_matches_independent_reference(dtype, routes) -> None:
+    pytest.importorskip("torch_npu")
+    torch.npu.set_device(0)
+    device = torch.device("npu:0")
+    generator = torch.Generator().manual_seed(82)
+    weights = {
+        i: TorchExpertWeights(
+            *(
+                torch.randn(shape, generator=generator).to(dtype) / 8
+                for shape in ((64, 32),) * 2 + ((32, 64),)
+            )
+        )
+        for i in range(3)
+    }
+    batch = BackendBatch(
+        layer_id=0,
+        hidden_states=torch.randn(1, 32, generator=generator).to(dtype),
+        expert_ids=torch.tensor([routes], dtype=torch.int32),
+        routing_weights=torch.tensor(
+            [[value if i >= 0 else 0.0 for i, value in zip(routes, (0.2, 0.0, 0.7), strict=True)]],
+            dtype=torch.float32,
+        ),
+        distinct_expert_ids=tuple(sorted({i for i in routes if i >= 0})),
+    )
+    expected = reference_output(batch, weights)
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight.to(device))
+    batch = replace(
+        batch,
+        hidden_states=batch.hidden_states.to(device),
+        expert_ids=batch.expert_ids.to(device),
+        routing_weights=batch.routing_weights.to(device),
+    )
+    backend = TorchBackend(
+        hidden_dim=32,
+        intermediate_dim=64,
+        top_k=3,
+        dtype=dtype,
+        device=device,
+        acquire_many=table.acquire_many,
+    )
+    assert backend._grouped_matmul is not None
+    output = torch.full_like(batch.hidden_states, torch.nan)
+    completion = backend.submit(batch, output)
+    assert all(table.usage_count(0, i) == 1 for i in batch.distinct_expert_ids)
+    try:
+        completion.wait_host()
+        torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-2)
+    finally:
+        completion.close()
+    assert all(table.usage_count(0, i) == 0 for i in range(3))
 
 
 @pytest.mark.parametrize(

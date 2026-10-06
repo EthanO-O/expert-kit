@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
+from importlib import import_module
 
 import torch
 import torch.nn.functional as functional
@@ -40,6 +41,9 @@ type AcquireTorchWeights = Callable[
     [int, tuple[int, ...]],
     ReadyWeightLease[TorchReadyWeights],
 ]
+
+# Reserve the measured NPU temporary peak in addition to explicit expert tensors.
+_ASCEND_GROUPED_TEMPORARY_BYTES = 16 * 1024 * 1024
 
 
 class _TorchCompletion(BackendCompletion):
@@ -165,6 +169,18 @@ class TorchBackend(ComputeBackend):
         )
         self._quantized_linear = linear_compute != "float"
         self._reuse_single_token = linear_compute == "float" and expert_compute == "swiglu"
+        self._grouped_matmul: Callable[..., list[torch.Tensor]] | None = None
+        if (
+            self._reuse_single_token
+            and runtime.device.type == "npu"
+            and dtype in (torch.float16, torch.bfloat16)
+            and max(hidden_dim, intermediate_dim) < 65536
+        ):
+            torch_npu = import_module("torch_npu")
+            device_name = torch_npu.npu.get_device_name(runtime.device)
+            # Other Ascend products may expose the API without supporting tensor lists.
+            if device_name.startswith("Ascend910B") or device_name == "Ascend910_9362":
+                self._grouped_matmul = getattr(torch_npu, "npu_grouped_matmul", None)
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
@@ -208,6 +224,11 @@ class TorchBackend(ComputeBackend):
                 + intermediate
                 + weighted_output
                 + accumulator
+                + (
+                    _ASCEND_GROUPED_TEMPORARY_BYTES
+                    if self._grouped_matmul is not None and self._top_k > 1
+                    else 0
+                )
                 # Bound quantization, INT32 products, FP32 activation work, and row padding.
                 + (
                     (max_batch_tokens + 32) * (self._hidden_dim + self._intermediate_dim) * 64
@@ -357,6 +378,13 @@ class TorchBackend(ComputeBackend):
             if self._reuse_single_token and batch.token_count == 1
             else None
         )
+        if (
+            columns is not None
+            and self._grouped_matmul is not None
+            and 1 < len(lease.objects) <= 128
+        ):
+            self._compute_grouped_single_token(batch, prepared_output, lease, columns)
+            return
         accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
         for expert_id, weight in zip(lease.expert_ids, lease.objects, strict=True):
             with trace_span(
@@ -395,6 +423,46 @@ class TorchBackend(ComputeBackend):
                 else:
                     accumulator.add_(weighted)
         prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
+
+    def _compute_grouped_single_token(
+        self,
+        batch: BackendBatch,
+        prepared_output: torch.Tensor,
+        lease: ReadyWeightLease[TorchReadyWeights],
+        columns: dict[int, int],
+    ) -> None:
+        """Group NPU projections without packing weights or changing reduction order."""
+        if any(expert_id not in columns for expert_id in lease.expert_ids):
+            raise InvalidBackendInput("distinct expert metadata does not match the routing tensor")
+        grouped_matmul = self._grouped_matmul
+        assert grouped_matmul is not None
+        with trace_span(
+            "worker.backend.grouped_experts",
+            attributes={
+                "expertkit.layer_id": batch.layer_id,
+                "expertkit.expert_count": len(lease.expert_ids),
+                "expertkit.backend": "torch",
+                "expertkit.timing": "host_submission",
+            },
+        ) as span:
+            if span is not None and span.is_recording():
+                span.set_attribute("expertkit.expert_ids", ",".join(map(str, lease.expert_ids)))
+            inputs = [batch.hidden_states] * len(lease.objects)
+            gates = grouped_matmul(
+                inputs, [w.gate_proj.t() for w in lease.objects], split_item=0, group_type=-1
+            )
+            ups = grouped_matmul(
+                inputs, [w.up_proj.t() for w in lease.objects], split_item=0, group_type=-1
+            )
+            intermediate = [functional.silu(gate) * up for gate, up in zip(gates, ups, strict=True)]
+            outputs = grouped_matmul(
+                intermediate, [w.down_proj.t() for w in lease.objects], split_item=0, group_type=-1
+            )
+            accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
+            for expert_id, output in zip(lease.expert_ids, outputs, strict=True):
+                column = columns[expert_id]
+                accumulator.add_(output.float() * batch.routing_weights[:, column : column + 1])
+            prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
 
     @staticmethod
     def _single_token_columns(batch: BackendBatch) -> dict[int, int] | None:
