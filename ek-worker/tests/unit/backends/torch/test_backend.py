@@ -118,9 +118,17 @@ def make_backend(
         intermediate_dim=_INTERMEDIATE_DIM,
         top_k=_TOP_K,
         dtype=dtype,
-        runtime=(CpuWorkerRuntime(device) if device.type == "cpu" else CudaWorkerRuntime(device)),
+        runtime=_device_runtime(device),
         acquire_many=table.acquire_many,
     )
+
+
+def _device_runtime(device: torch.device):
+    if device.type == "npu":
+        from expertkit_worker.device.ascend import AscendWorkerRuntime
+
+        return AscendWorkerRuntime(device)
+    return CpuWorkerRuntime(device) if device.type == "cpu" else CudaWorkerRuntime(device)
 
 
 @pytest.mark.parametrize(
@@ -322,9 +330,13 @@ def test_torch_backend_resource_estimate_scales_with_token_bound() -> None:
     assert eight == one * 8
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_torch_backend_completes_repeated_cuda_submissions() -> None:
-    device = torch.device("cuda:0")
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_torch_backend_completes_repeated_device_submissions(device_type: str) -> None:
+    if device_type == "npu":
+        pytest.importorskip("torch_npu")
+    if not torch.get_device_module(device_type).is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    device = torch.device(f"{device_type}:0")
     batch, weights = make_case(torch.float16, device)
     table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
     for expert_id, weight in weights.items():
@@ -338,3 +350,33 @@ def test_torch_backend_completes_repeated_cuda_submissions() -> None:
         completion.wait_host()
         completion.close()
         torch.testing.assert_close(output.cpu(), expected.cpu(), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("wait_first", [False, True])
+def test_failed_completion_keeps_weights_until_process_exit(wait_first: bool) -> None:
+    import gc
+    import weakref
+
+    from expertkit_worker.backends.torch.backend import _TorchCompletion
+
+    class FailedWork:
+        def wait_host(self) -> None:
+            raise RuntimeError("unprovable device completion")
+
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 1)
+    table.publish(0, 0, make_weight(0, torch.float32, torch.device("cpu")))
+    lease = table.acquire_many(0, (0,))
+    retained = weakref.ref(lease)
+    completion = _TorchCompletion(lease, FailedWork())  # type: ignore[arg-type]
+    if wait_first:
+        with pytest.raises(RuntimeError, match="unprovable"):
+            completion.wait_host()
+        completion.close()
+    else:
+        with pytest.raises(RuntimeError, match="unprovable"):
+            completion.close()
+    assert table.quarantined
+    assert table.usage_count(0, 0) == 1
+    del lease, completion
+    gc.collect()
+    assert retained() is not None

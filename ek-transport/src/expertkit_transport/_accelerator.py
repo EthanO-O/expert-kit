@@ -48,3 +48,8 @@ def accelerator_for(device: torch.device | str) -> TorchAccelerator | None:
     if resolved.type not in _SUPPORTED_ACCELERATORS:
         raise ValueError("transport device must be CPU, CUDA, or NPU")
     return TorchAccelerator(resolved)
+
+
+def accelerator_for_tensor(tensor: torch.Tensor) -> TorchAccelerator | None:
+    """Resolve stream operations for a Tensor's actual device."""
+    return accelerator_for(tensor.device)

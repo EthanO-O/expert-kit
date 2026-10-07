@@ -216,6 +216,55 @@ def _target(layer_id: int, expert_id: int, *peers: str) -> TargetExpert:
     return TargetExpert(layer_id, expert_id, "cuda:0", peers)
 
 
+@pytest.mark.parametrize("withdrawal", ["shutdown", "placement"])
+def test_failed_device_completion_unblocks_weight_shutdown_without_freeing_weights(
+    withdrawal: str,
+) -> None:
+    from expertkit_worker.backends.torch.backend import _TorchCompletion
+
+    class FailedWork:
+        def wait_host(self) -> None:
+            raise RuntimeError("unprovable device completion")
+
+    async def scenario() -> None:
+        adapter = _FakeAdapter()
+        manager, _ = _make_manager(_FakeLoader(), adapter=adapter)
+        manager.start()
+        await manager.apply_targets(1, [_target(0, 0)])
+        await manager.wait_for_idle()
+        lease = manager.acquire_many(0, (0,))
+        completion = _TorchCompletion(lease, FailedWork())  # type: ignore[arg-type]
+        if withdrawal == "placement":
+            await manager.apply_targets(2, [])
+            pending = asyncio.create_task(manager.remove_after_drain(2, (WeightKey(0, 0),)))
+        else:
+            pending = asyncio.create_task(manager.close())
+        try:
+            async with asyncio.timeout(2):
+                while manager._ready.is_ready(0, 0):
+                    await asyncio.sleep(0)
+            with pytest.raises(RuntimeError, match="unprovable"):
+                completion.wait_host()
+            completion.close()
+            async with asyncio.timeout(2):
+                if withdrawal == "placement":
+                    with pytest.raises(RuntimeError, match="quarantined"):
+                        await pending
+                else:
+                    await pending
+                await manager.close()
+            assert adapter.released == []
+            assert manager._ready.usage_count(0, 0) == 1
+            assert (await manager.stats()).loaded_device_bytes == 16
+        finally:
+            # This simulated device failure has no outstanding device work.
+            lease.close()
+            await asyncio.gather(pending, return_exceptions=True)
+            await manager.close()
+
+    run(scenario())
+
+
 def test_manager_bounds_whole_load_pipeline_and_publishes_direct_references() -> None:
     async def scenario() -> None:
         loader = _FakeLoader()

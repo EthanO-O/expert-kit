@@ -105,3 +105,48 @@ def test_finish_withdrawal_requires_begin_and_honors_timeout() -> None:
         table.finish_withdrawal(0, 0, timeout=0)
     lease.close()
     table.finish_withdrawal(0, 0, timeout=0)
+
+
+def test_quarantined_lease_wakes_withdrawal_without_releasing_weight() -> None:
+    import gc
+    import weakref
+
+    class Weight:
+        pass
+
+    table: ReadyWeightTable[Weight] = ReadyWeightTable(1, 1)
+    weight = Weight()
+    retained = weakref.ref(weight)
+    table.publish(0, 0, weight)
+    lease = table.acquire_many(0, (0,))
+    table.begin_withdrawal(0, 0)
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def withdraw(selected_table: ReadyWeightTable[Weight], failures: list[BaseException]) -> None:
+        started.set()
+        try:
+            selected_table.finish_withdrawal(0, 0)
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=withdraw, args=(table, errors))
+    thread.start()
+    assert started.wait(timeout=2)
+    try:
+        lease.quarantine()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert "quarantined" in str(errors[0])
+        assert table.usage_count(0, 0) == 1
+        with pytest.raises(WeightsNotReady):
+            table.acquire_many(0, (0,))
+    finally:
+        # No device work exists in this CPU test; unblock a pre-fix waiter.
+        if thread.is_alive():
+            lease.close()
+            thread.join(timeout=2)
+    del errors, lease, table, weight, thread
+    gc.collect()
+    assert retained() is not None

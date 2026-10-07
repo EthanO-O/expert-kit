@@ -73,8 +73,20 @@ async def _dispatch_plan(
                         dtype=torch.int64,
                         device=accumulator.device,
                     )
-                accumulator.index_add_(0, token_indices, partial.to(torch.float32))
-                lease.mark_consumed()
+                # Retain ownership before an operation can enqueue device work.
+                lease.mark_consumed(
+                    ownership_graph=(
+                        accumulator,
+                        partial,
+                        token_indices,
+                        plan,
+                        plan.batch,
+                        plan.target.transport,
+                    )
+                )
+                partial_fp32 = partial.to(torch.float32)
+                lease.retain_consumption_owners(partial_fp32)
+                accumulator.index_add_(0, token_indices, partial_fp32)
     except TransportError as error:
         return FailedWorkerBatch(plan=plan, error=error)
     return None

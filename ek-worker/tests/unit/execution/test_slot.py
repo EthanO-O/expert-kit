@@ -165,6 +165,8 @@ class DoublingBackend(ComputeBackend):
         self.streams.append(
             torch.cuda.current_stream(batch.hidden_states.device).cuda_stream
             if batch.hidden_states.device.type == "cuda"
+            else torch.get_device_module("npu").current_stream().npu_stream
+            if batch.hidden_states.device.type == "npu"
             else None
         )
         torch.mul(batch.hidden_states, 2, out=prepared_output)
@@ -208,11 +210,17 @@ def make_slot(
             buffers,
             runtime=CpuWorkerRuntime(spec.device),
         )
+    if spec.device.type == "npu":
+        from expertkit_worker.device.ascend import AscendWorkerRuntime
+
+        runtime = AscendWorkerRuntime(spec.device)
+    else:
+        runtime = CudaWorkerRuntime(spec.device)
     return AsyncExecutionSlot(
         spec,
         buffers,
         enable_device_timing=enable_device_timing,
-        runtime=CudaWorkerRuntime(spec.device),
+        runtime=runtime,
     )
 
 
@@ -306,9 +314,13 @@ def test_slot_maps_unclassified_backend_exception_to_fatal() -> None:
     slot.close()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_slot_uses_one_stream_and_reuses_pinned_output() -> None:
-    slot = make_slot("cuda:0", torch.float16, enable_device_timing=True)
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_device_slot_uses_one_stream_and_reuses_pinned_output(device_type: str) -> None:
+    if device_type == "npu":
+        pytest.importorskip("torch_npu")
+    if not torch.get_device_module(device_type).is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    slot = make_slot(f"{device_type}:0", torch.float16, enable_device_timing=True)
     backend = DoublingBackend()
     tracer = RecordingTracer()
     batch_span = RecordingSpan()

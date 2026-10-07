@@ -5,6 +5,12 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 
+from expertkit_transport.quarantine import retain_until_process_exit
+
+
+class ReadyWeightsQuarantined(RuntimeError):
+    """Stop weight withdrawal when failed device work may still use storage."""
+
 
 class WeightsNotReady(RuntimeError):
     """Report required experts that cannot accept a new computation."""
@@ -39,6 +45,11 @@ class ReadyWeightLease[T]:
         self._close_lock = threading.Lock()
         self._closed = False
 
+    def quarantine(self) -> None:
+        """Retain the table and wake withdrawal waiters without releasing this lease."""
+
+        self._table.quarantine()
+
     def close(self) -> None:
         """Decrement every retained usage count exactly once."""
 
@@ -65,6 +76,28 @@ class ReadyWeightTable[T]:
             [None] * experts_per_layer for _ in range(num_layers)
         ]
         self._condition = threading.Condition(threading.Lock())
+        self._quarantined = False
+
+    @property
+    def quarantined(self) -> bool:
+        """Return whether failed device work requires process-lifetime retention."""
+
+        with self._condition:
+            return self._quarantined
+
+    def quarantine(self) -> None:
+        """Keep all ready storage alive and abort current and future withdrawal."""
+
+        with self._condition:
+            if self._quarantined:
+                return
+            self._quarantined = True
+            retain_until_process_exit(self)
+            for layer in self._entries:
+                for entry in layer:
+                    if entry is not None:
+                        entry.accepting = False
+            self._condition.notify_all()
 
     def publish(self, layer_id: int, expert_id: int, value: T) -> None:
         """Make one fully prepared Backend object available to new computation."""
@@ -73,6 +106,8 @@ class ReadyWeightTable[T]:
         if value is None:
             raise ValueError("ready weight value must not be None")
         with self._condition:
+            if self._quarantined:
+                raise ReadyWeightsQuarantined("ready weights are quarantined until process exit")
             if self._entries[layer_id][expert_id] is not None:
                 raise RuntimeError("ready weight position is already occupied")
             self._entries[layer_id][expert_id] = _ReadyEntry(value)
@@ -139,6 +174,10 @@ class ReadyWeightTable[T]:
             This is a blocking lifecycle operation. Async Weight Manager code must
             call it in its bounded loading or control executor, never on an asyncio
             event-loop thread.
+
+        Raises:
+            ReadyWeightsQuarantined: Device completion is unproven. Storage stays
+                retained in the table, and pending withdrawal waiters are woken.
         """
 
         self._validate_position(layer_id, expert_id)
@@ -150,8 +189,13 @@ class ReadyWeightTable[T]:
                 raise WeightsNotReady((expert_id,))
             if entry.accepting:
                 raise RuntimeError("begin_withdrawal must run before finish_withdrawal")
-            if not self._condition.wait_for(lambda: entry.use_count == 0, timeout=timeout):
+            if not self._condition.wait_for(
+                lambda: entry.use_count == 0 or self._quarantined,
+                timeout=timeout,
+            ):
                 raise TimeoutError("timed out waiting for ready weight users")
+            if self._quarantined:
+                raise ReadyWeightsQuarantined("ready weights are quarantined until process exit")
             if self._entries[layer_id][expert_id] is not entry:
                 raise RuntimeError("ready weight position changed during withdrawal")
             self._entries[layer_id][expert_id] = None

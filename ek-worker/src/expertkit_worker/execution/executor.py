@@ -12,6 +12,7 @@ from functools import partial
 
 import structlog
 from expertkit_transport.errors import TransportError, TransportErrorCode
+from expertkit_transport.quarantine import retain_until_process_exit
 from expertkit_transport.tracing import Tracer, TraceSpan, use_tracer
 from expertkit_transport.transports.base import (
     BatchBufferConfig,
@@ -175,7 +176,8 @@ class WorkerExecutor:
             partial(self._executor.shutdown, wait=True, cancel_futures=True),
         )
         for slot in self._slots:
-            slot.close()
+            if not slot.quarantined:
+                slot.close()
 
     async def _serve_slot(self, slot: ExecutionSlot) -> None:
         while True:
@@ -262,14 +264,16 @@ class WorkerExecutor:
             await received.reject(rejection)
             return None
         except BackendFatalError as error:
+            slot.quarantine()
+            if self._fatal_error is None:
+                retain_until_process_exit(self)
             with suppress(Exception):
-                await received.reject(
-                    TransportError(
-                        TransportErrorCode.UNAVAILABLE,
-                        retryable=True,
-                        diagnostic="Worker Backend cannot continue serving",
-                    )
+                rejection = TransportError(
+                    TransportErrorCode.UNAVAILABLE,
+                    retryable=False,
+                    diagnostic="Worker Backend cannot continue serving",
                 )
+                await received.reject_unsafe(rejection)
             return error
 
         try:
@@ -310,11 +314,19 @@ class WorkerExecutor:
             work = loop.run_in_executor(self._executor, context.run, execute)
         try:
             return await asyncio.shield(work)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
+            # The execution thread owns fixed device resources until it reaches a
+            # terminal result.  Repeated task cancellation must not interrupt
+            # that wait, and an eventual fatal must take precedence so the
+            # caller can quarantine the ownership graph.
+            while not work.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(work)
             try:
-                result = await work
-            except BaseException:
-                pass
-            else:
-                result.release()
-            raise
+                result = work.result()
+            except BackendFatalError:
+                raise
+            except BaseException as terminal_error:
+                raise cancelled from terminal_error
+            result.release()
+            raise cancelled

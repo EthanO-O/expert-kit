@@ -138,6 +138,18 @@ class WorkerBatchBuffers(ABC):
     def close(self) -> None:
         """Release this slot's Transport-specific fixed resources."""
 
+    def execution_views(
+        self,
+        batch: WorkerBatch,
+        destination: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Borrow storage retained by the receiver until response completion.
+
+        ``release_input()`` must not end the underlying arena lease. Transports
+        without leased device buffers keep using the execution slot allocations.
+        """
+        return None
+
 
 class ReceivedBatch(ABC):
     """Represent one admitted batch until computation and response finish."""
@@ -179,9 +191,26 @@ class ReceivedBatch(ABC):
     async def reject(self, error: TransportError) -> None:
         """Finish the request with a structured computation rejection."""
 
+    async def reject_unsafe(self, error: TransportError) -> None:
+        """Reject work whose device access cannot be proven terminal.
+
+        Most Transports do not expose registered device storage, so their safe
+        fallback is the ordinary rejection path.  A Transport that can retain
+        remotely accessible storage must override this method and quarantine
+        that storage before acknowledging the failure.
+        """
+
+        await self.reject(error)
+
 
 class WorkerBatchReceiver(ABC):
     """Supply admitted batches and result communication to Worker execution."""
+
+    @property
+    def fixed_device_bytes(self) -> int:
+        """Return device memory retained outside the execution-slot buffers."""
+
+        return 0
 
     @abstractmethod
     async def start(self) -> None:

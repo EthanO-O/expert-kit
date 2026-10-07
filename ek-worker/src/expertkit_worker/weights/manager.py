@@ -11,6 +11,7 @@ from enum import StrEnum
 from functools import partial
 
 import structlog
+from expertkit_transport.quarantine import retain_until_process_exit
 
 from expertkit_worker.weights.adapter import (
     WeightAdapter,
@@ -26,7 +27,11 @@ from expertkit_worker.weights.loader import (
     WeightLoadStage,
     WeightSource,
 )
-from expertkit_worker.weights.ready import ReadyWeightLease, ReadyWeightTable
+from expertkit_worker.weights.ready import (
+    ReadyWeightLease,
+    ReadyWeightsQuarantined,
+    ReadyWeightTable,
+)
 from expertkit_worker.weights.writeback import DiskWriteback
 
 logger = structlog.get_logger(__name__)
@@ -429,7 +434,11 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
         return error
 
     async def close(self) -> None:
-        """Cancel loading, drain writeback, and release every ready object."""
+        """Cancel loading, drain writeback, and release safe ready storage.
+
+        Note:
+            Failed device work retains quarantined storage until process exit.
+        """
 
         if self._close_task is None:
             self._close_task = asyncio.create_task(
@@ -456,16 +465,30 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
             ready_keys = tuple(sorted(self._ready_keys))
         loop = asyncio.get_running_loop()
         for key in ready_keys:
+            if self._ready.quarantined:
+                break
             self._ready.begin_withdrawal(key.layer_id, key.expert_id)
-            await loop.run_in_executor(
-                self._conversion_executor,
-                partial(
-                    self._finish_withdrawal_and_release,
-                    key.layer_id,
-                    key.expert_id,
-                ),
-            )
+            try:
+                await loop.run_in_executor(
+                    self._conversion_executor,
+                    partial(
+                        self._finish_withdrawal_and_release,
+                        key.layer_id,
+                        key.expert_id,
+                    ),
+                )
+            except ReadyWeightsQuarantined:
+                break
+            async with self._lock:
+                self._ready_keys.remove(key)
+                self._loaded_device_bytes -= self._ready_weight_bytes
         self._conversion_executor.shutdown(wait=True, cancel_futures=True)
+        if self._ready.quarantined:
+            # Failed device work still owns these allocations. The table woke
+            # blocked withdrawal threads without handing storage to the adapter.
+            retain_until_process_exit(self)
+            self._emit_device_bytes(self._loaded_device_bytes)
+            return
         async with self._lock:
             self._ready_keys.clear()
             self._loaded_device_bytes = 0

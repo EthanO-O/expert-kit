@@ -9,6 +9,7 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as functional
 from expertkit_transport.batches import ACTIVATION_DTYPES
+from expertkit_transport.quarantine import retain_until_process_exit
 from expertkit_transport.tracing import trace_span
 
 from expertkit_worker.backends.base import (
@@ -72,21 +73,25 @@ class _TorchCompletion(BackendCompletion):
         with self._lock:
             if self._closed:
                 return
+            if self._failed:
+                self._closed = True
+                self._lease.quarantine()
+                retain_until_process_exit(self)
+                return
             self._closed = True
             waited = self._waited
-            failed = self._failed
 
         close_error: BaseException | None = None
-        if not waited and not failed:
+        if not waited:
             try:
                 self._work.wait_host()
             except BaseException as error:
                 close_error = error
-
-        self._lease.close()
-
         if close_error is not None:
+            self._lease.quarantine()
+            retain_until_process_exit(self)
             raise close_error
+        self._lease.close()
 
 
 class TorchBackend(ComputeBackend):
@@ -165,6 +170,7 @@ class TorchBackend(ComputeBackend):
         self._dtype = dtype
         self._acquire_many = acquire_many
         self._runtime = runtime
+        self._unsafe_leases: list[ReadyWeightLease[TorchReadyWeights]] = []
         self._capabilities = BackendCapabilities(
             supports_dynamic_tokens=True,
             supports_concurrent_batches=True,
@@ -379,9 +385,12 @@ class TorchBackend(ComputeBackend):
             self._runtime.capture_current_work().wait_host()
         except BaseException as error:
             synchronization_error = error
-        lease.close()
         if synchronization_error is not None:
+            lease.quarantine()
+            self._unsafe_leases.append(lease)
+            retain_until_process_exit(lease)
             raise BackendFatalError(
                 BackendFatalReason.ASYNC_EXECUTION,
                 str(synchronization_error),
             ) from synchronization_error
+        lease.close()
