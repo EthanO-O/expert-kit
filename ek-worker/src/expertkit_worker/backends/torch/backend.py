@@ -431,7 +431,10 @@ class TorchBackend(ComputeBackend):
         lease: ReadyWeightLease[TorchReadyWeights],
         columns: dict[int, int],
     ) -> None:
-        """Group NPU projections without packing weights or changing reduction order."""
+        """Group projections and postprocessing without changing reduction order.
+
+        Only fresh activation and FP32 weighting tensors are modified in place.
+        """
         if any(expert_id not in columns for expert_id in lease.expert_ids):
             raise InvalidBackendInput("distinct expert metadata does not match the routing tensor")
         grouped_matmul = self._grouped_matmul
@@ -449,19 +452,34 @@ class TorchBackend(ComputeBackend):
                 span.set_attribute("expertkit.expert_ids", ",".join(map(str, lease.expert_ids)))
             inputs = [batch.hidden_states] * len(lease.objects)
             gates = grouped_matmul(
-                inputs, [w.gate_proj.t() for w in lease.objects], split_item=0, group_type=-1
-            )
+                inputs,
+                [w.gate_proj.t() for w in lease.objects],
+                split_item=2,
+                group_type=0,
+                group_list_type=0,
+            )[0]
             ups = grouped_matmul(
-                inputs, [w.up_proj.t() for w in lease.objects], split_item=0, group_type=-1
-            )
-            intermediate = [functional.silu(gate) * up for gate, up in zip(gates, ups, strict=True)]
+                inputs,
+                [w.up_proj.t() for w in lease.objects],
+                split_item=2,
+                group_type=0,
+                group_list_type=0,
+            )[0]
+            intermediate = functional.silu(gates)
+            intermediate.mul_(ups)
             outputs = grouped_matmul(
-                intermediate, [w.down_proj.t() for w in lease.objects], split_item=0, group_type=-1
-            )
+                [intermediate[row : row + 1] for row in range(len(lease.objects))],
+                [w.down_proj.t() for w in lease.objects],
+                split_item=2,
+                group_type=0,
+                group_list_type=0,
+            )[0]
+            routing = batch.routing_weights[:, [columns[i] for i in lease.expert_ids]].t()
+            weighted = outputs.float()
+            weighted.mul_(routing)
             accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
-            for expert_id, output in zip(lease.expert_ids, outputs, strict=True):
-                column = columns[expert_id]
-                accumulator.add_(output.float() * batch.routing_weights[:, column : column + 1])
+            for row in range(len(lease.objects)):
+                accumulator.add_(weighted[row : row + 1])
             prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
 
     @staticmethod

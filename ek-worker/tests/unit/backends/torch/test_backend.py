@@ -242,17 +242,19 @@ def test_ascend_grouped_selection_and_per_batch_memory(
         assert extra == (2 * 16 * 1024 * 1024 if enabled else 0)
 
 
-@pytest.mark.parametrize("routes", [(2, 0, -1), (2, 0, 1), (2, 0, 2), (2, -1, -1)])
-def test_grouped_single_token_preserves_routes_and_weight_views(routes) -> None:
-    batch, weights = single_token_case(torch.bfloat16, routes)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("routes", [(2, 0, -1), (2, 0, 1), (2, 0, 2), (2, -1, -1), (-1, -1, -1)])
+def test_grouped_single_token_preserves_routes_and_weight_views(dtype, routes) -> None:
+    batch, weights = single_token_case(dtype, routes)
     table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
     for expert_id, weight in weights.items():
         table.publish(0, expert_id, weight)
-    backend = make_backend(table, torch.bfloat16, torch.device("cpu"))
+    backend = make_backend(table, dtype, torch.device("cpu"))
     calls = []
+    leaf_outputs = []
 
-    def grouped(inputs, matrices, *, split_item, group_type):
-        assert (split_item, group_type) == (0, -1)
+    def grouped(inputs, matrices, *, split_item, group_type, group_list_type=None):
+        assert (split_item, group_type, group_list_type) == (2, 0, 0)
         projection = len(calls)
         for matrix, expert_id in zip(matrices, batch.distinct_expert_ids, strict=True):
             original = weights[expert_id].tensors[projection]
@@ -260,11 +262,20 @@ def test_grouped_single_token_preserves_routes_and_weight_views(routes) -> None:
             assert matrix.stride() == original.t().stride()
         if projection < 2:
             assert all(value is batch.hidden_states for value in inputs)
+        else:
+            for row, value in enumerate(inputs):
+                expected = functional.silu(leaf_outputs[0][row]) * leaf_outputs[1][row]
+                torch.testing.assert_close(value, expected, rtol=0, atol=0)
+                assert value.shape == (1, _INTERMEDIATE_DIM)
+                assert value.storage_offset() == row * _INTERMEDIATE_DIM
+                assert value.untyped_storage().data_ptr() == inputs[0].untyped_storage().data_ptr()
         calls.append(projection)
-        return [x @ matrix for x, matrix in zip(inputs, matrices, strict=True)]
+        leaf_outputs.append([x @ matrix for x, matrix in zip(inputs, matrices, strict=True)])
+        return [torch.cat(leaf_outputs[-1])]
 
     backend._grouped_matmul = grouped
     output = torch.full_like(batch.hidden_states, torch.nan)
+    output_pointer = output.data_ptr()
     attributes = {}
     span = SimpleNamespace(is_recording=lambda: True, set_attribute=attributes.__setitem__)
     tracer = SimpleNamespace(start_as_current_span=lambda *args, **kwargs: nullcontext(span))
@@ -280,10 +291,18 @@ def test_grouped_single_token_preserves_routes_and_weight_views(routes) -> None:
     assert attributes == (
         {"expertkit.expert_ids": ",".join(map(str, batch.distinct_expert_ids))} if calls else {}
     )
+    assert output.data_ptr() == output_pointer
+    if calls:
+        expected = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
+        for expert_id, leaf in zip(batch.distinct_expert_ids, leaf_outputs[2], strict=True):
+            column = routes.index(expert_id)
+            expected.add_(leaf.float() * batch.routing_weights[:, column : column + 1])
+        torch.testing.assert_close(output, expected.to(dtype), rtol=0, atol=0)
     torch.testing.assert_close(output, reference_output(batch, weights))
 
 
-def test_grouped_projection_failure_drains_work_before_releasing_weights() -> None:
+@pytest.mark.parametrize("failed_projection", [1, 2])
+def test_grouped_projection_failure_drains_work_before_releasing_weights(failed_projection) -> None:
     batch, weights = single_token_case(torch.bfloat16)
     table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
     for expert_id, weight in weights.items():
@@ -309,15 +328,16 @@ def test_grouped_projection_failure_drains_work_before_releasing_weights() -> No
     )
 
     def grouped(inputs, matrices, **kwargs):
-        if events:
+        assert kwargs == {"split_item": 2, "group_type": 0, "group_list_type": 0}
+        if len(events) == failed_projection:
             raise RuntimeError("grouped projection failed")
         events.append("submitted")
-        return [x @ matrix for x, matrix in zip(inputs, matrices, strict=True)]
+        return [torch.cat([x @ matrix for x, matrix in zip(inputs, matrices, strict=True)])]
 
     backend._grouped_matmul = grouped
     with pytest.raises(RuntimeError, match="grouped projection failed"):
         backend.submit(batch, torch.empty_like(batch.hidden_states))
-    assert events == ["submitted", "waited"]
+    assert events == ["submitted"] * failed_projection + ["waited"]
     assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
 
 
