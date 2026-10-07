@@ -5,6 +5,25 @@ from __future__ import annotations
 import torch
 
 
+def _validate_single_token_routing(
+    expert_ids: torch.Tensor,
+    routing_weights: torch.Tensor,
+    experts_per_layer: int,
+) -> tuple[int, ...]:
+    """Check the original small row before narrowing IDs or routing weights."""
+    host_ids = expert_ids.detach().cpu().tolist()[0]
+    if any(expert_id < -1 or expert_id >= experts_per_layer for expert_id in host_ids):
+        raise ValueError("expert_ids must be within the configured expert range [-1, count)")
+    if -1 in host_ids:
+        host_weights = routing_weights.detach().cpu().tolist()[0]
+        if any(
+            expert_id == -1 and weight != 0
+            for expert_id, weight in zip(host_ids, host_weights, strict=True)
+        ):
+            raise ValueError("an expert ID of -1 must have zero routing weight")
+    return tuple(sorted({expert_id for expert_id in host_ids if expert_id >= 0}))
+
+
 def validate_and_convert_routing(
     expert_ids: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -13,10 +32,10 @@ def validate_and_convert_routing(
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     """Return validated routing Tensors and their sorted distinct expert IDs.
 
-    The fixed-size validation summary is copied to the Host once. This may
-    synchronize an accelerator. Call the function once on final router output,
-    before an integer narrowing conversion could change an invalid expert ID
-    into a valid one.
+    A single Token's routing values are checked on the Host; larger batches
+    copy a fixed-size validation summary instead. Both paths may synchronize
+    an accelerator. Call once on final router output, before integer narrowing
+    could change an invalid expert ID into a valid one.
     """
 
     if (
@@ -35,6 +54,16 @@ def validate_and_convert_routing(
         integer_info = torch.iinfo(expert_ids.dtype)
     except TypeError as error:
         raise ValueError("expert_ids must use an integer dtype") from error
+
+    if expert_ids.shape[0] == 1:
+        distinct_expert_ids = _validate_single_token_routing(
+            expert_ids, routing_weights, experts_per_layer
+        )
+        return (
+            expert_ids.to(dtype=torch.int32),
+            routing_weights.to(dtype=torch.float32),
+            distinct_expert_ids,
+        )
 
     checked_ids = expert_ids
     if integer_info.min >= 0:
