@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,121 @@ def test_generation_splits_control_and_attention_bundles(tmp_path: Path) -> None
     assert attention["name"] == "expert-kit-ascend-attention"
     assert set(attention["services"]) == {"attention", "benchmark"}
     assert attention["services"]["attention"]["environment"]["EK_ADDR"] == ("192.0.2.10:15002")
+    frontend = attention["services"]["attention"]
+    assert frontend["networks"] == ["expert-kit-network"]
+    assert "EK_TRANSPORT_CONFIG" not in frontend["environment"]
+    assert not (output / "a-transport.toml").exists()
+    benchmark = yaml.safe_load((output / "vllm-bench.yaml").read_text())
+    assert benchmark["base-url"] == "http://attention:8000"
+    worker = yaml.safe_load((output / "worker-pool1/workers/worker-00.yaml").read_text())
+    assert worker["transport"] == {
+        "type": "grpc",
+        "max_pending_batches_per_device": 8,
+        "listen": "0.0.0.0:51234",
+        "advertise": "192.0.2.11:53234",
+    }
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {
+            "max_workers": 3,
+            "client_max_in_flight": 2,
+            "max_registered_bytes": 1048576,
+            "ascend_receive_fence": "device",
+        },
+    ],
+)
+def test_ascend_transport_generation_connects_frontend_and_worker_config(
+    tmp_path: Path, settings: dict[str, object]
+) -> None:
+    cluster, experiment = _inputs(tmp_path)
+    data = yaml.safe_load(cluster.read_text())
+    data["transport"] = {"type": "transfer_engine", **settings}
+    data["attention"]["vllm_port"] = 18765
+    cluster.write_text(yaml.safe_dump(data))
+    output = tmp_path / "generated"
+
+    _generate(cluster, experiment, output)
+
+    limits = {
+        "max_workers": settings.get("max_workers", 2),
+        "ascend_receive_fence": settings.get("ascend_receive_fence", "stream"),
+    }
+    if "max_registered_bytes" in settings:
+        limits["max_registered_bytes"] = settings["max_registered_bytes"]
+    frontend_config = tomllib.loads((output / "a-transport.toml").read_text())
+    assert frontend_config == {
+        "transfer_engine": {
+            "segment_name": "192.0.2.10:0",
+            "client_max_in_flight": settings.get("client_max_in_flight", 1),
+            **limits,
+        }
+    }
+    attention = yaml.safe_load((output / "compose.attention.yaml").read_text())
+    frontend = attention["services"]["attention"]
+    assert frontend["network_mode"] == "host"
+    assert "networks" not in frontend
+    assert "./a-transport.toml:/configs/a-transport.toml:ro" in frontend["volumes"]
+    assert "/etc/hccn.conf:/etc/hccn.conf:ro" in frontend["volumes"]
+    assert frontend["environment"]["EK_TRANSPORT_CONFIG"] == "/configs/a-transport.toml"
+    assert "EK_TRANSPORT_CONFIG" not in attention["services"]["benchmark"]["environment"]
+    assert attention["services"]["benchmark"]["networks"] == ["expert-kit-network"]
+    benchmark = yaml.safe_load((output / "vllm-bench.yaml").read_text())
+    assert benchmark["base-url"] == "http://192.0.2.10:18765"
+    assert "18765/health" in frontend["healthcheck"]["test"][-1]
+    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
+    assert serve["port"] == 18765
+    attention_overlay = yaml.safe_load((output / "compose.attention.dev.yaml").read_text())
+    assert attention_overlay["services"]["attention"] == {"network_mode": "host"}
+    for pool, address in (("worker-pool1", "192.0.2.11"), ("worker-pool2", "192.0.2.12")):
+        compose = yaml.safe_load((output / pool / "compose.expert.yaml").read_text())
+        overlay = yaml.safe_load((output / pool / "compose.expert.dev.yaml").read_text())
+        for index, (name, service) in enumerate(compose["services"].items()):
+            worker = yaml.safe_load((output / pool / "workers" / f"{name}.yaml").read_text())
+            assert worker["transport"] == {
+                "type": "transfer_engine",
+                "max_pending_batches_per_device": 8,
+                "control_listen": f"0.0.0.0:{53234 + index}",
+                "control_advertise": f"{address}:{53234 + index}",
+                "segment_advertise": f"{address}:0",
+                **limits,
+            }
+            assert worker["worker"]["max_active_batches_per_device"] == 8
+            assert worker["weight_manager"]["peer"]["listen"] == f"0.0.0.0:{54234 + index}"
+            assert service["network_mode"] == "host"
+            assert "networks" not in service
+            assert "/etc/hccn.conf:/etc/hccn.conf:ro" in service["volumes"]
+            assert overlay["services"][name] == {"network_mode": "host"}
+
+
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    [
+        ({"type": "rdma"}, "type"),
+        ({"max_workers": 0}, "max_workers"),
+        ({"client_max_in_flight": 0}, "client_max_in_flight"),
+        ({"max_registered_bytes": 0}, "max_registered_bytes"),
+        ({"ascend_receive_fence": "none"}, "ascend_receive_fence"),
+        ({"protocol": "ascend_direct"}, "Extra inputs are not permitted"),
+    ],
+)
+def test_transport_generation_rejects_unsupported_settings(
+    tmp_path: Path, settings: dict[str, object], error: str
+) -> None:
+    cluster, experiment = _inputs(tmp_path)
+    data = yaml.safe_load(cluster.read_text())
+    data["transport"] = {"type": "transfer_engine", **settings}
+    cluster.write_text(yaml.safe_dump(data))
+    output = tmp_path / "generated"
+
+    result = _generate(cluster, experiment, output, expect_success=False)
+
+    assert result.returncode != 0
+    assert error in result.stderr
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(

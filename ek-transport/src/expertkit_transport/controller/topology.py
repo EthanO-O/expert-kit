@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import grpc
 import torch
@@ -29,6 +30,9 @@ from expertkit_transport.routing import (
     WorkerIdentity,
 )
 from expertkit_transport.transports.factory import create_worker_transport
+
+if TYPE_CHECKING:
+    from expertkit_transport.transports.transfer_engine import TransferEngineRuntime
 
 _CONTROL_MESSAGE_BYTES = 1024 * 1024
 
@@ -81,6 +85,7 @@ class ControllerTopologyWatcher(TopologyProvider):
         reconnect_delay_seconds: float = 0.1,
         clock: Callable[[], float] = time.monotonic,
         resource_factory: WorkerConnectionFactory | None = None,
+        transport_runtime: TransferEngineRuntime | None = None,
     ) -> None:
         if not controller_endpoint:
             raise ValueError("controller_endpoint must not be empty")
@@ -100,6 +105,7 @@ class ControllerTopologyWatcher(TopologyProvider):
         if not math.isfinite(reconnect_delay_seconds) or reconnect_delay_seconds <= 0:
             raise ValueError("reconnect_delay_seconds must be finite and positive")
 
+        self._transport_runtime = transport_runtime
         self._controller_endpoint = controller_endpoint
         self._instance_id = instance_id
         self._num_layers = num_layers
@@ -246,10 +252,13 @@ class ControllerTopologyWatcher(TopologyProvider):
         self._resources.clear()
         self._pools.clear()
         if resources:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(self._close_worker_resources(resource) for resource in resources),
-                return_exceptions=False,
+                return_exceptions=True,
             )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
 
     async def _watch(self) -> None:
         assert self._channel is not None
@@ -373,6 +382,8 @@ class ControllerTopologyWatcher(TopologyProvider):
             dtype=self._dtype,
             device=self._device,
             max_in_flight=route.max_in_flight,
+            worker_start_id=route.identity.start_id,
+            transport_runtime=self._transport_runtime,
         )
         try:
             pool = OutputPool(
@@ -408,9 +419,14 @@ class ControllerTopologyWatcher(TopologyProvider):
         ):
             self._pools.pop(resource.route.identity, None)
 
-    @staticmethod
-    async def _close_worker_resources(resource: _WorkerConnectionResources) -> None:
+    async def _close_worker_resources(self, resource: _WorkerConnectionResources) -> None:
         try:
             await resource.target.transport.close()
+        except BaseException:
+            if self._transport_runtime is not None:
+                self._transport_runtime.quarantine(
+                    "Worker connection close failed before peer drain"
+                )
+            raise
         finally:
             await resource.pool.close()

@@ -286,3 +286,96 @@ def test_invalid_input_device_does_not_leave_blocking_client_active(monkeypatch)
         assert not client._active
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("mode", ["resolve", "close", "retry"])
+def test_startup_shutdown_keeps_runtime_owned_until_pending_peer_cleanup_finishes(
+    monkeypatch, mode: str
+) -> None:
+    async def scenario() -> None:
+        during_resolution = mode == "resolve"
+        topologies = []
+        started = asyncio.Event()
+        allow_resolution = asyncio.Event()
+        closing = asyncio.Event()
+        drained = asyncio.Event()
+        runtime_closed = False
+
+        async def resolve(*args, **kwargs):
+            if during_resolution:
+                started.set()
+                await allow_resolution.wait()
+            return ResolvedDefaultInstance(7, "model", "default")
+
+        class Runtime:
+            async def close(self):
+                nonlocal runtime_closed
+                assert during_resolution or drained.is_set()
+                runtime_closed = True
+
+            def quarantine(self, diagnostic):
+                pytest.fail(diagnostic)
+
+        class Topology:
+            def __init__(self, *args, **kwargs):
+                self.close_task = None
+                topologies.append(self)
+
+            async def start(self, **kwargs):
+                started.set()
+                if len(topologies) == 1:
+                    await asyncio.Event().wait()
+
+            async def close(self):
+                async def cleanup():
+                    closing.set()
+                    await drained.wait()
+
+                if self.close_task is None:
+                    self.close_task = asyncio.create_task(cleanup())
+                await asyncio.shield(self.close_task)
+
+        monkeypatch.setattr(client_module, "resolve_default_instance", resolve)
+        monkeypatch.setattr(client_module, "ControllerTopologyWatcher", Topology)
+        client = RoutedMoEClient(
+            "controller:5002",
+            num_layers=2,
+            experts_per_layer=4,
+            hidden_dim=3,
+            top_k=2,
+            dtype=torch.float32,
+            device="cpu",
+            transport_runtime=Runtime(),
+        )
+        startup = asyncio.create_task(client.start(monotonic_deadline=time.monotonic() + 5))
+        await started.wait()
+        if during_resolution:
+            await client.close()
+            allow_resolution.set()
+            with pytest.raises(RuntimeError, match="closed"):
+                await startup
+            assert client._topology is None
+        else:
+            startup.cancel()
+            await closing.wait()
+            startup.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+            if mode == "retry":
+                retry = asyncio.create_task(client.start(monotonic_deadline=time.monotonic() + 5))
+                await asyncio.sleep(0)
+                assert len(topologies) == 1
+                assert not runtime_closed
+                drained.set()
+                await asyncio.wait_for(retry, 2)
+                assert len(topologies) == 2
+                await client.close()
+            else:
+                shutdown = asyncio.create_task(client.close())
+                await asyncio.sleep(0)
+                assert not runtime_closed
+                drained.set()
+                await asyncio.wait_for(shutdown, 2)
+        assert runtime_closed
+
+    asyncio.run(scenario())

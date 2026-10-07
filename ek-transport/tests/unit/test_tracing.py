@@ -31,7 +31,8 @@ def test_concurrent_batches_keep_their_parent_across_loop_threads() -> None:
     async def layer() -> None:
         await asyncio.sleep(0)
         with trace_span("rpc"):
-            assert dict(grpc_trace_metadata())["traceparent"].endswith("-01")
+            flags = int(dict(grpc_trace_metadata())["traceparent"].rsplit("-", 1)[1], 16)
+            assert flags & 1 == 1
 
     def caller(loop: asyncio.AbstractEventLoop) -> None:
         with use_tracer(tracer), trace_span("batch"):
@@ -100,7 +101,8 @@ def test_unsampled_parent_is_propagated_and_context_restored_after_error() -> No
     tracer = OpenTelemetryTracer(provider.get_tracer("test"))
     try:
         with pytest.raises(ValueError, match="failure"), use_tracer(tracer), trace_span("batch"):
-            assert dict(grpc_trace_metadata())["traceparent"].endswith("-00")
+            flags = int(dict(grpc_trace_metadata())["traceparent"].rsplit("-", 1)[1], 16)
+            assert flags & 1 == 0
             raise ValueError("failure")
         assert grpc_trace_metadata() == ()
     finally:

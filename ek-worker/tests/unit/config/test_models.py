@@ -128,7 +128,9 @@ def test_npu_worker_rejects_shm_transport(tmp_path: Path) -> None:
         "shared_memory_dir": "/dev/shm",
     }
 
-    with pytest.raises(ValidationError, match="NPU workers currently require the gRPC transport"):
+    with pytest.raises(
+        ValidationError, match="shared-memory transport is unavailable for NPU workers"
+    ):
         WorkerConfig.model_validate(raw)
 
 
@@ -211,3 +213,31 @@ def test_tracing_requires_plaintext_endpoint_and_bounded_sampling(tmp_path: Path
     }
     with pytest.raises(ValidationError, match="greater than 0"):
         WorkerConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "device, pending, valid",
+    [
+        ("npu:0", 4095, True),
+        ("npu:0", 4096, False),
+        ("cpu", 1, False),
+    ],
+)
+def test_ascend_transport_requires_npu_and_bounded_registered_capacity(
+    tmp_path: Path, device: str, pending: int, valid: bool
+) -> None:
+    raw = _config(tmp_path, backend="torch", device=device)
+    raw["transport"] = dict(
+        type="transfer_engine",
+        control_listen="0.0.0.0:50051",
+        control_advertise="worker:50051",
+        segment_advertise="worker:0",
+        max_pending_batches_per_device=pending,
+    )
+    if valid:
+        config = WorkerConfig.model_validate(raw)
+        assert config.transport.segment_advertise == "worker:0"
+        assert config.transport.ascend_receive_fence == "stream"
+    else:
+        with pytest.raises(ValidationError, match=r"capacity|indexed NPU"):
+            WorkerConfig.model_validate(raw)

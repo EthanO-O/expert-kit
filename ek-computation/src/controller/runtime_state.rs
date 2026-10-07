@@ -1077,6 +1077,15 @@ fn validate_registration(registration: &RegisterWorkerRequest) -> Result<(), Con
             "worker Transport type is invalid",
         ));
     }
+    if registration.transport_type == WorkerTransportType::WorkerTransportTransferEngine as i32
+        && u64::from(registration.max_active_batches_per_device)
+            + u64::from(registration.max_pending_batches_per_device)
+            > 4096
+    {
+        return Err(ControllerStateError::InvalidRegistration(
+            "Transfer Engine capacity cannot exceed 4096",
+        ));
+    }
     let Some(device) = registration.device.as_ref() else {
         return Err(ControllerStateError::InvalidRegistration(
             "one device is required",
@@ -1581,6 +1590,23 @@ mod tests {
                 "worker Transport type is invalid"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn ascend_registration_enforces_registered_arena_capacity() {
+        let state = ControllerRuntimeState::new(8);
+        let mut request = registration("worker-0", "start-0");
+        request.transport_type = WorkerTransportType::WorkerTransportTransferEngine as i32;
+        request.max_active_batches_per_device = 2048;
+        request.max_pending_batches_per_device = 2049;
+        assert!(matches!(
+            state.register(request.clone()).await,
+            Err(ControllerStateError::InvalidRegistration(
+                "Transfer Engine capacity cannot exceed 4096"
+            ))
+        ));
+        request.max_pending_batches_per_device = 2048;
+        assert!(state.register(request).await.is_ok());
     }
 
     #[tokio::test]

@@ -63,3 +63,10 @@ def test_rejects_an_unknown_published_type() -> None:
         assert "unsupported Worker transport type" in str(error)
     else:
         raise AssertionError("an unknown Transport type must be rejected")
+
+
+def test_ascend_selection_requires_an_explicit_runtime() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="EK_TRANSPORT_CONFIG"):
+        create(lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE)

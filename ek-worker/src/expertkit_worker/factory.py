@@ -30,6 +30,7 @@ from expertkit_worker.backends.factory import (
 from expertkit_worker.config import (
     GrpcTransportConfig,
     ShmTransportConfig,
+    TransferEngineTransportConfig,
     WorkerConfig,
     plan_device_resources,
     validate_available_device_memory,
@@ -38,6 +39,7 @@ from expertkit_worker.control import (
     ExpertStateReporter,
 )
 from expertkit_worker.control.factory import create_controller_supervisor
+from expertkit_worker.control.lifecycle import new_start_id
 from expertkit_worker.device import (
     AsyncWorkerDeviceRuntime,
     CpuWorkerRuntime,
@@ -177,6 +179,8 @@ async def build_worker_application(
     execution: WorkerExecutor | None = None
     disk_cache: DirectIOWeightDiskCache | None = None
     weight_services: WeightServices | None = None
+    transport_runtime = None
+    worker_start_id = new_start_id()
     try:
         disk_cache = await create_weight_disk_cache(config)
         adapter = create_weight_adapter(
@@ -210,6 +214,32 @@ async def build_worker_application(
             )
             computation_endpoint = config.transport.advertise
             transport_type = "grpc"
+        elif isinstance(config.transport, TransferEngineTransportConfig):
+            from expertkit_transport.transports.transfer_engine import (
+                TransferEngineRuntime,
+                TransferEngineRuntimeConfig,
+                TransferEngineWorkerBatchReceiver,
+            )
+
+            transport_runtime = TransferEngineRuntime(
+                TransferEngineRuntimeConfig(
+                    segment_name=config.transport.segment_advertise,
+                    device=device,
+                    max_workers=config.transport.max_workers,
+                    max_registered_bytes=config.transport.max_registered_bytes,
+                    ascend_receive_fence=config.transport.ascend_receive_fence,
+                )
+            )
+            receiver = TransferEngineWorkerBatchReceiver(
+                config.transport.control_listen,
+                endpoint_config,
+                runtime=transport_runtime,
+                worker_start_id=worker_start_id,
+                session_close_grace_secs=config.worker.shutdown_grace_secs,
+                **receiver_options,
+            )
+            computation_endpoint = config.transport.control_advertise
+            transport_type = "transfer_engine"
         elif isinstance(config.transport, ShmTransportConfig):
             receiver = ShmWorkerBatchReceiver(
                 config.transport.rpc_listen,
@@ -255,7 +285,7 @@ async def build_worker_application(
         )
         resource_plan = plan_device_resources(
             device_memory_limit_bytes=int(config.worker.device_memory_limit),
-            fixed_slot_bytes=execution.fixed_device_bytes,
+            fixed_slot_bytes=execution.fixed_device_bytes + receiver.fixed_device_bytes,
             backend_estimate=backend.estimate_resources(config.worker.max_batch_tokens),
             active_batches=config.worker.max_active_batches_per_device,
             conversion_temporary_bytes=adapter.conversion_temporary_bytes(),
@@ -306,6 +336,7 @@ async def build_worker_application(
             reporter=reporter,
             computation_endpoint=computation_endpoint,
             transport_type=transport_type,
+            start_id=worker_start_id,
         )
         logger.info(
             "worker_resource_plan",
@@ -330,13 +361,19 @@ async def build_worker_application(
             observability=observability,
         )
     except BaseException:
-        if execution is not None:
-            await execution.close()
-        elif receiver is not None:
-            await receiver.close()
-        if weight_services is not None:
-            await weight_services.close()
-        elif disk_cache is not None:
-            disk_cache.close()
-        await observability.close()
+        try:
+            if execution is not None:
+                await execution.close()
+            elif receiver is not None:
+                await receiver.close()
+            elif transport_runtime is not None:
+                await transport_runtime.close()
+        finally:
+            try:
+                if weight_services is not None:
+                    await weight_services.close()
+                elif disk_cache is not None:
+                    disk_cache.close()
+            finally:
+                await observability.close()
         raise

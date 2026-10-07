@@ -310,3 +310,23 @@ def test_watcher_reconnects_from_the_last_complete_version() -> None:
             await server.stop(None)
 
     run(scenario())
+
+
+@pytest.mark.parametrize("pending", [4095, 4096])
+def test_ascend_route_capacity_is_validated_before_allocating_resources(pending: int) -> None:
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    advertised = worker(
+        "worker-a",
+        start_id="start-a",
+        endpoint="worker-a:5001",
+        transport_type=lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE,
+    )
+    advertised.max_pending_batches = pending
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    payload = snapshot(1, [route(0, 0, advertised)])
+    if pending == 4096:
+        with pytest.raises(TopologyProtocolError, match="capacity"):
+            messages.consume(payload, installed_version=0, installed_routes={})
+    else:
+        assert messages.consume(payload, installed_version=0, installed_routes={}) is not None

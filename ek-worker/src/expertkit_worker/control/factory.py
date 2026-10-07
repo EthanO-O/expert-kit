@@ -28,10 +28,11 @@ def create_controller_supervisor(
     reporter: ExpertStateReporter,
     computation_endpoint: str,
     transport_type: str,
+    start_id: str | None = None,
 ) -> ControllerSupervisor:
     """Create the complete Controller-facing control path for one Worker."""
 
-    start_id = new_start_id()
+    start_id = new_start_id() if start_id is None else start_id
     connection = ControllerConnection(config.controller.endpoint)
     heartbeat = HeartbeatSender(
         worker_id=config.worker.id,

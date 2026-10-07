@@ -237,8 +237,27 @@ class ShmTransportConfig(_StrictModel):
     shared_memory_dir: Literal["/dev/shm"] = "/dev/shm"
 
 
+def _validate_segment_address(value: str) -> str:
+    # Mooncake P2P binds an available port and exchanges its actual endpoint.
+    _validate_network_address(value[:-1] + "1" if value.endswith(":0") else value)
+    return value
+
+
+class TransferEngineTransportConfig(_StrictModel):
+    """Ascend registered-memory receiver and its gRPC control endpoint."""
+
+    type: Literal["transfer_engine"]
+    control_listen: NetworkAddress
+    control_advertise: NetworkAddress
+    segment_advertise: Annotated[str, AfterValidator(_validate_segment_address)]
+    max_pending_batches_per_device: int = Field(gt=0)
+    max_workers: int = Field(default=2, gt=0)
+    max_registered_bytes: int | None = Field(default=None, gt=0)
+    ascend_receive_fence: Literal["stream", "device"] = "stream"
+
+
 TransportConfig = Annotated[
-    GrpcTransportConfig | ShmTransportConfig,
+    GrpcTransportConfig | ShmTransportConfig | TransferEngineTransportConfig,
     Field(discriminator="type"),
 ]
 
@@ -379,7 +398,16 @@ class WorkerConfig(_StrictModel):
         """Reject unused or incomplete Backend-specific configuration."""
         # Shared-memory transport remains disabled for NPU workers.
         if self.worker.device.startswith("npu:") and isinstance(self.transport, ShmTransportConfig):
-            raise ValueError("NPU workers currently require the gRPC transport")
+            raise ValueError("shared-memory transport is unavailable for NPU workers")
+        if isinstance(self.transport, TransferEngineTransportConfig):
+            if not self.worker.device.startswith("npu:"):
+                raise ValueError("Ascend Direct requires an indexed NPU device")
+            if (
+                self.worker.max_active_batches_per_device
+                + self.transport.max_pending_batches_per_device
+                > 4096
+            ):
+                raise ValueError("Transfer Engine capacity cannot exceed 4096")
 
         if (
             self.model.quantization is not None

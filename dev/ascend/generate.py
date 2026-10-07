@@ -1,14 +1,13 @@
 """Generate role-specific Ascend Compose and runtime configuration files."""
 
 from __future__ import annotations
-from dataclasses import dataclass
 
+from dataclasses import dataclass
 from pathlib import Path
 
-
 from renderer import Renderer
-from schemas.cluster import WorkerConfig, PoolConfig
-from schemas.context import TemplateContext, NodeBindingContext
+from schemas.cluster import PoolConfig, WorkerConfig
+from schemas.context import NodeBindingContext, TemplateContext
 from schemas.experiment import DatasetType
 from utils import long_banner
 
@@ -32,6 +31,7 @@ class ConfigFileNames:
     TORCH_BENCH = "torch-bench.yaml"
     CONTROLLER = "controller.yaml"
     WORKER = "worker.yaml"
+    A_TRANSPORT = "a-transport.toml"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +54,10 @@ def generate_root_config(
             spec.template,
             **template_context,
         )
+
+    if context.transport.type == "transfer_engine":
+        spec = create_render_spec(output, ConfigFileNames.A_TRANSPORT)
+        renderer.render_to_file(spec.output, spec.template, **template_context)
 
     if context.dataset.config.type is DatasetType.SHAREGPT:
         spec = create_render_spec(output, ConfigFileNames.TORCH_BENCH)

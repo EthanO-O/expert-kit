@@ -8,6 +8,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -17,12 +18,16 @@ from expertkit_transport._accelerator import (
     accelerator_for_tensor,
 )
 from expertkit_transport.batches import RoutedLayerBatch
+from expertkit_transport.config import runtime_from_environment
 from expertkit_transport.controller.instance import resolve_default_instance
 from expertkit_transport.controller.topology import ControllerTopologyWatcher
 from expertkit_transport.errors import TransportError, TransportErrorCode
 from expertkit_transport.quarantine import retain_until_process_exit
 from expertkit_transport.routing import RoundRobinSelector, execute_routed_layer
 from expertkit_transport.tracing import trace_attributes, traced
+
+if TYPE_CHECKING:
+    from expertkit_transport.transports.transfer_engine import TransferEngineRuntime
 
 _RESULT_GRACE_SECONDS = 0.1
 
@@ -49,7 +54,13 @@ def _validate_timeout(timeout_seconds: float) -> None:
 
 
 class RoutedMoEClient:
-    """Execute complete routed layers over a watched direct-Worker topology."""
+    """Execute complete routed layers over a watched direct-Worker topology.
+
+    Note:
+        An injected transport runtime transfers ownership to this client. Worker
+        connections within the client share it; independent clients must not.
+        Closing the client drains every connection before closing the runtime.
+    """
 
     def __init__(
         self,
@@ -63,6 +74,7 @@ class RoutedMoEClient:
         dtype: torch.dtype,
         device: torch.device | str,
         same_worker_retry_delay_seconds: float = 0.001,
+        transport_runtime: TransferEngineRuntime | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not controller_endpoint:
@@ -97,20 +109,30 @@ class RoutedMoEClient:
         self._top_k = top_k
         self._dtype = dtype
         self._device = torch.device(device)
+        self._transport_runtime = transport_runtime
         self._same_worker_retry_delay_seconds = same_worker_retry_delay_seconds
         self._clock = clock
         self._topology: ControllerTopologyWatcher | None = None
         self._selector = RoundRobinSelector()
         self._started = False
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._start_lock = asyncio.Lock()
 
     async def start(self, *, monotonic_deadline: float) -> None:
         """Connect to the Controller and install its first complete topology."""
+        async with self._start_lock:
+            await self._start(monotonic_deadline=monotonic_deadline)
 
+    async def _start(self, *, monotonic_deadline: float) -> None:
         if self._closed:
             raise RuntimeError("Routed-MoE client is closed")
         if self._started:
             return
+        if self._topology is not None:
+            # A cancelled startup can leave its shielded cleanup in progress.
+            # Drain that owner before a retry replaces the topology reference.
+            await self._topology.close()
         remaining = monotonic_deadline - self._clock()
         if remaining <= 0:
             raise TransportError(
@@ -123,6 +145,10 @@ class RoutedMoEClient:
             requested_instance_id=self._requested_instance_id,
             timeout_seconds=remaining,
         )
+        if self._closed:
+            raise RuntimeError("Routed-MoE client is closed")
+        if self._transport_runtime is None:
+            self._transport_runtime = runtime_from_environment(self._device)
         topology = ControllerTopologyWatcher(
             self._controller_endpoint,
             instance_id=resolved.instance_id,
@@ -133,14 +159,18 @@ class RoutedMoEClient:
             dtype=self._dtype,
             device=self._device,
             clock=self._clock,
+            transport_runtime=self._transport_runtime,
         )
+        self._topology = topology
         try:
             await topology.start(monotonic_deadline=monotonic_deadline)
         except BaseException:
             await topology.close()
             raise
+        if self._closed:
+            await topology.close()
+            raise RuntimeError("Routed-MoE client closed during startup")
         self._instance_id = resolved.instance_id
-        self._topology = topology
         self._started = True
 
     @traced("transport.layer")
@@ -209,16 +239,30 @@ class RoutedMoEClient:
     async def close(self) -> None:
         """Stop topology watching and all direct Worker connections."""
 
-        if self._closed:
-            return
-        self._closed = True
-        if self._topology is not None:
-            await self._topology.close()
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
+        try:
+            if self._topology is not None:
+                await self._topology.close()
+        except BaseException:
+            if self._transport_runtime is not None:
+                self._transport_runtime.quarantine(
+                    "topology shutdown could not prove every peer drained"
+                )
+            raise
+        finally:
+            if self._transport_runtime is not None:
+                await self._transport_runtime.close()
 
 
 class BlockingRoutedMoEClient:
     """Run the asynchronous Transport client on one private event-loop thread.
 
+    An injected transport runtime is owned and closed by the underlying client.
     Framework model hooks are commonly synchronous. This wrapper preserves one
     process-lifetime asyncio loop and channel set rather than creating an event
     loop for every layer. Several calling threads may submit work concurrently.
@@ -238,6 +282,7 @@ class BlockingRoutedMoEClient:
         dtype: torch.dtype,
         device: torch.device | str,
         same_worker_retry_delay_seconds: float = 0.001,
+        transport_runtime: TransferEngineRuntime | None = None,
     ) -> None:
         self._client_args = (controller_endpoint,)
         self._client_kwargs = {
@@ -249,6 +294,7 @@ class BlockingRoutedMoEClient:
             "dtype": dtype,
             "device": device,
             "same_worker_retry_delay_seconds": same_worker_retry_delay_seconds,
+            "transport_runtime": transport_runtime,
         }
         accelerator_for(device)
         self._loop: asyncio.AbstractEventLoop | None = None

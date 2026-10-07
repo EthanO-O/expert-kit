@@ -225,3 +225,11 @@ def test_registration_and_identity_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="transport_type"):
         replace(_registration(), transport_type="rdma")
     assert new_start_id() != new_start_id()
+
+
+def test_registration_advertises_ascend_transport_without_changing_start_identity() -> None:
+    request = replace(
+        _registration(), transport_type="transfer_engine", device="npu:0"
+    ).to_protobuf()
+    assert request.transport_type == lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE
+    assert request.start_id == "start-1"

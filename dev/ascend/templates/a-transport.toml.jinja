@@ -1,0 +1,8 @@
+[transfer_engine]
+segment_name = "{{ attention.address }}:0"
+max_workers = {{ transport.max_workers }}
+client_max_in_flight = {{ transport.client_max_in_flight }}
+ascend_receive_fence = "{{ transport.ascend_receive_fence }}"
+{% if transport.max_registered_bytes is not none %}
+max_registered_bytes = {{ transport.max_registered_bytes }}
+{% endif %}

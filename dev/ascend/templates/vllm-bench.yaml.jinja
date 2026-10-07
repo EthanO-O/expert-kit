@@ -2,7 +2,11 @@ backend: vllm
 model: {{ model.name }}
 tokenizer: /model/{{ model.name }}
 endpoint: /v1/completions
+{% if transport.type == "transfer_engine" %}
+base-url: http://{{ attention.address }}:{{ attention.vllm_port }}
+{% else %}
 base-url: http://attention:8000
+{% endif %}
 num-prompts: {{ run.num_prompts }}
 {% if dataset.type == "random" %}
 dataset-name: random

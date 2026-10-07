@@ -10,6 +10,7 @@ from expertkit_worker.config.models import (
     QuantizationConfig,
     QuantizationType,
     ShmTransportConfig,
+    TransferEngineTransportConfig,
     WorkerConfig,
 )
 from expertkit_worker.config.resources import (
@@ -29,6 +30,7 @@ __all__ = [
     "QuantizationConfig",
     "QuantizationType",
     "ShmTransportConfig",
+    "TransferEngineTransportConfig",
     "WorkerConfig",
     "load_config",
     "plan_device_resources",

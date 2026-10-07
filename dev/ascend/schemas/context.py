@@ -1,19 +1,23 @@
 """Resolved template context built from cluster and experiment inputs."""
 
 from __future__ import annotations
+
+from pathlib import Path
 from typing import Any, Self
+
 from pydantic import BaseModel, computed_field, model_serializer, model_validator
+
 from .cluster import (
-    ClusterConfig,
+    AscendTransportConfig,
     AttentionConfig,
+    ClusterConfig,
     ControlConfig,
+    ExpertRuntimeConfig,
     ImageConfig,
     Inference,
-    ExpertRuntimeConfig,
-    PoolConfig,
     NodeConfig,
+    PoolConfig,
 )
-from pathlib import Path
 from .experiment import (
     DatasetConfig,
     ExperimentConfig,
@@ -38,6 +42,7 @@ class TemplateContext(BaseModel):
     project_name: str
     inference: Inference
     images: ImageConfig
+    transport: AscendTransportConfig
     attention: NodeBindingContext[AttentionConfig]
     control: NodeBindingContext[ControlConfig]
     expert: ExpertContext
@@ -83,6 +88,7 @@ class TemplateContext(BaseModel):
             project_name=cluster.project_name,
             inference=cluster.inference,
             images=cluster.images,
+            transport=cluster.transport,
             attention=attention,
             control=control,
             expert=expert,

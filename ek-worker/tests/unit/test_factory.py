@@ -435,3 +435,45 @@ def test_host_budget_reserves_conversion_capacity(
         _dram_cache_limit(config, adapter)
         == entry * config.model.num_layers * config.model.experts_per_layer
     )
+
+
+def test_failed_receiver_cleanup_still_closes_disk_cache_and_observability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from expertkit_transport.transports.grpc import GrpcWorkerBatchReceiver
+
+    import expertkit_worker.factory as factory
+    from expertkit_worker.observability import create_observability
+
+    raw = _config(tmp_path).model_dump()
+    raw["worker"]["device"] = "cpu"
+    config = WorkerConfig.model_validate(raw)
+    observability = create_observability(config.observability, worker_id=config.worker.id)
+    closed = []
+    original_cache_close = DirectIOWeightDiskCache.close
+
+    def cache_close(cache):
+        closed.append("disk")
+        original_cache_close(cache)
+
+    async def initialize(cache):
+        pass
+
+    async def receiver_close(receiver):
+        raise RuntimeError("native close failed")
+
+    async def observability_close():
+        closed.append("observability")
+
+    def backend(*args, **kwargs):
+        raise RuntimeError("backend startup failed")
+
+    monkeypatch.setattr(DirectIOWeightDiskCache, "initialize", initialize)
+    monkeypatch.setattr(DirectIOWeightDiskCache, "close", cache_close)
+    monkeypatch.setattr(GrpcWorkerBatchReceiver, "close", receiver_close)
+    monkeypatch.setattr(observability, "close", observability_close)
+    monkeypatch.setattr(factory, "create_observability", lambda *args, **kwargs: observability)
+    monkeypatch.setattr(factory, "create_compute_backend", backend)
+    with pytest.raises(RuntimeError, match="native close failed"):
+        asyncio.run(build_worker_application(config, instance_resolver=_resolve_instance))
+    assert closed == ["disk", "observability"]
