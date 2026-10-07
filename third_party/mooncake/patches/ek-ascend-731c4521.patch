@@ -1,0 +1,450 @@
+diff --git a/mooncake-common/src/CMakeLists.txt b/mooncake-common/src/CMakeLists.txt
+index 1f23177..e60a7cc 100644
+--- a/mooncake-common/src/CMakeLists.txt
++++ b/mooncake-common/src/CMakeLists.txt
+@@ -62,6 +62,7 @@ target_include_directories(mooncake_common PUBLIC
+ target_link_libraries(mooncake_common PUBLIC
+     yaml-cpp
+     jsoncpp
++    yalantinglibs::yalantinglibs
+ )
+ 
+ if (BUILD_SHARED_LIBS)
+diff --git a/mooncake-integration/transfer_engine/transfer_engine_py.cpp b/mooncake-integration/transfer_engine/transfer_engine_py.cpp
+index 58eebe3..5ec6b83 100644
+--- a/mooncake-integration/transfer_engine/transfer_engine_py.cpp
++++ b/mooncake-integration/transfer_engine/transfer_engine_py.cpp
+@@ -17,6 +17,11 @@
+ #include <cassert>
+ #include <numeric>
+ #include <fstream>
++#include <stdexcept>
++#ifdef USE_ASCEND_DIRECT
++#include "acl/acl.h"
++#include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
++#endif
+ 
+ #include <pybind11/stl.h>
+ #include "transport/rpc_communicator/rpc_interface.h"
+@@ -187,8 +192,20 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+         return -1;
+     }
+ 
++    configured_backend_.clear();
+     std::string proto = protocol ? std::string(protocol) : "";
+     std::string conn_string = buildConnString(metadata_type, metadata_server);
++    const bool use_forced_ascend = (proto == "ascend_direct");
++#ifndef USE_ASCEND_DIRECT
++    if (use_forced_ascend) {
++        LOG(ERROR) << "ascend_direct requires USE_ASCEND_DIRECT";
++        return -1;
++    }
++#endif
++    if (use_forced_ascend && (getenv("MC_FORCE_TCP") || conn_string != P2PHANDSHAKE)) {
++        LOG(ERROR) << "ascend_direct requires P2PHANDSHAKE and forbids MC_FORCE_TCP";
++        return -1;
++    }
+ 
+     auto device_name_safe = device_name ? std::string(device_name) : "";
+     auto device_filter = buildDeviceFilter(device_name_safe);
+@@ -218,7 +235,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+                   << " devices.";
+     }
+ #else
+-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
++    engine_ = std::make_unique<TransferEngine>(!use_forced_ascend, device_filter);
+ #endif
+ 
+     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+@@ -244,7 +261,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+             return -1;
+         }
+         LOG(INFO) << "EFA transport installed successfully";
+-    } else {
++    } else if (!use_forced_ascend) {
+         // For non-EFA protocols (e.g. TCP), manually install TCP transport
+         // since auto_discover is disabled to prevent RDMA installation
+         // (RDMA QP creation fails on EFA devices).
+@@ -267,7 +284,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+             return -1;
+         }
+         LOG(INFO) << "CXI transport installed successfully";
+-    } else {
++    } else if (!use_forced_ascend) {
+         // For non-EFA protocols (e.g. TCP), manually install TCP transport
+         // since auto_discover is disabled to prevent RDMA installation
+         // (RDMA QP creation fails on EFA devices).
+@@ -282,6 +299,16 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+     }
+ #endif
+ 
++#ifdef USE_ASCEND_DIRECT
++    if (use_forced_ascend) {
++        // Check the entire payload transport set; metadata TCP is independent.
++        if (!engine_->isTransportOnly("ascend")) {
++            LOG(ERROR) << "ascend_direct did not install exactly {ascend}";
++            return -1;
++        }
++        configured_backend_ = "ascend_direct";
++    }
++#endif
+     free_list_.resize(kSlabSizeKBTabLen);
+     return 0;
+ }
+@@ -576,6 +603,9 @@ int TransferEnginePy::batchTransferSync(
+                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                 : engine_->submitTransfer(batch_id, entries);
+         if (!s.ok()) {
++            if (configured_backend_ == "ascend_direct") {
++                throw std::runtime_error("Ascend submit failed; retain batch and registered owners");
++            }
+             engine_->freeBatchID(batch_id);
+             Status segment_status = engine_->CheckSegmentStatus(handle);
+             if (!segment_status.ok()) {
+@@ -595,10 +625,19 @@ int TransferEnginePy::batchTransferSync(
+         bool already_freed = false;
+         while (!completed) {
+             Status s = engine_->getBatchTransferStatus(batch_id, status);
++            if (!s.ok() && configured_backend_ == "ascend_direct") {
++                throw std::runtime_error("Ascend status query failed; DMA termination is unknown");
++            }
+             LOG_ASSERT(s.ok());
++            if (configured_backend_ == "ascend_direct" &&
++                (status.s == TransferStatusEnum::FAILED || status.s == TransferStatusEnum::TIMEOUT)) {
++                // Failure is not a drain proof. Never free or retry this batch.
++                throw std::runtime_error("Ascend transfer failed; DMA termination is unknown");
++            }
+             if (status.s == TransferStatusEnum::COMPLETED) {
+-                engine_->freeBatchID(batch_id);
+-                return 0;
++                Status free_status = engine_->freeBatchID(batch_id);
++                if (free_status.ok()) return 0;
++                if (configured_backend_ == "ascend_direct") continue;
+             } else if (status.s == TransferStatusEnum::FAILED) {
+                 engine_->freeBatchID(batch_id);
+                 already_freed = true;
+@@ -611,6 +650,10 @@ int TransferEnginePy::batchTransferSync(
+             const int64_t timeout =
+                 transfer_timeout_nsec_ + total_length;  // 1GiB per second
+             if (current_ts - start_ts > timeout) {
++                if (configured_backend_ == "ascend_direct") {
++                    // A logical deadline cannot release live native work.
++                    continue;
++                }
+                 LOG(INFO) << "Sync batch data transfer timeout after "
+                           << current_ts - start_ts << "ns";
+                 // TODO: as @doujiang24 mentioned, early free(while there are
+@@ -1064,6 +1107,39 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
+     return segment_desc->buffers[0].addr;
+ }
+ 
++#ifdef USE_ASCEND_DIRECT
++void TransferEnginePy::acquireAscendWrites() {
++    pybind11::gil_scoped_release release;
++    // Only successful local READ or peer WRITE completion permits this acquire.
++    if (aclrtSynchronizeDevice() != ACL_ERROR_NONE) {
++        throw std::runtime_error("Ascend device acquire failed");
++    }
++}
++
++int TransferEnginePy::disconnectDrainedAscendSegment(const std::string& segment_name) {
++    pybind11::gil_scoped_release release;
++    if (configured_backend_ != "ascend_direct") return -1;
++    {
++        std::lock_guard<std::mutex> guard(mutex_);
++        // Without a transfer handle this engine never initiated a peer link.
++        if (!handle_map_.count(segment_name)) return 0;
++    }
++    auto transport = dynamic_cast<AscendDirectTransport*>(engine_->getTransport("ascend"));
++    return transport ? transport->disconnectDrainedSegment(segment_name) : -1;
++}
++
++int TransferEnginePy::invalidateDrainedAscendSegment(const std::string& segment_name) {
++    pybind11::gil_scoped_release release;
++    if (configured_backend_ != "ascend_direct") return -1;
++    {
++        std::lock_guard<std::mutex> guard(mutex_);
++        handle_map_.erase(segment_name);
++    }
++    // The caller drains sessions first; ADXL links cannot cross process epochs.
++    return engine_->removeLocalSegment(segment_name);
++}
++#endif
++
+ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
+     pybind11::gil_scoped_release release;
+     auto device_name_safe = device_name ? std::string(device_name) : "";
+@@ -1116,6 +1192,13 @@ void bind_coro_rpc_interface(py::module_& m) {
+ }
+ 
+ PYBIND11_MODULE(engine, m) {
++#ifdef USE_ASCEND_DIRECT
++    m.attr("EK_ASCEND_SYNC_SUCCESS_COMPLETION") = true;
++    m.attr("EK_HAS_ASCEND_ACQUIRE") = true;
++    m.attr("EK_FORCE_CONFIGURED_ASCEND_DIRECT_TRANSPORT") = true;
++    m.attr("EK_DRAINED_ASCEND_REMOTE_DESCRIPTOR_INVALIDATION") = true;
++    m.attr("EK_DRAINED_ASCEND_PEER_DISCONNECT") = true;
++#endif
+ #ifdef USE_EFA
+     m.attr("SUPPORT_EFA") = true;
+ #else
+@@ -1165,6 +1248,12 @@ PYBIND11_MODULE(engine, m) {
+             .def("initialize", &TransferEnginePy::initialize)
+             .def("initialize_ext", &TransferEnginePy::initializeExt)
+             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
++            .def("get_configured_backend", &TransferEnginePy::getConfiguredBackend)
++#ifdef USE_ASCEND_DIRECT
++            .def("acquire_ascend_writes", &TransferEnginePy::acquireAscendWrites)
++            .def("disconnect_drained_ascend_segment", &TransferEnginePy::disconnectDrainedAscendSegment)
++            .def("invalidate_drained_ascend_segment", &TransferEnginePy::invalidateDrainedAscendSegment)
++#endif
+             .def("allocate_managed_buffer",
+                  &TransferEnginePy::allocateManagedBuffer)
+             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
+diff --git a/mooncake-integration/transfer_engine/transfer_engine_py.h b/mooncake-integration/transfer_engine/transfer_engine_py.h
+index d4af71a..1e933ae 100644
+--- a/mooncake-integration/transfer_engine/transfer_engine_py.h
++++ b/mooncake-integration/transfer_engine/transfer_engine_py.h
+@@ -194,6 +194,12 @@ class TransferEnginePy {
+ 
+     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
+ 
++    std::string getConfiguredBackend() const { return configured_backend_; }
++#ifdef USE_ASCEND_DIRECT
++    void acquireAscendWrites();
++    int disconnectDrainedAscendSegment(const std::string &segment_name);
++    int invalidateDrainedAscendSegment(const std::string &segment_name);
++#endif
+     std::string getLocalTopology(const char *device_name);
+ 
+     std::vector<TransferNotify> getNotifies();
+@@ -214,6 +220,7 @@ class TransferEnginePy {
+    private:
+     std::shared_ptr<TransferEngine> engine_;
+     Transport *xport_;
++    std::string configured_backend_;
+ 
+     std::mutex mutex_;
+     std::vector<std::stack<char *>> free_list_;
+diff --git a/mooncake-transfer-engine/include/multi_transport.h b/mooncake-transfer-engine/include/multi_transport.h
+index 541a739..7998961 100644
+--- a/mooncake-transfer-engine/include/multi_transport.h
++++ b/mooncake-transfer-engine/include/multi_transport.h
+@@ -67,6 +67,9 @@ class MultiTransport {
+      */
+     bool isTcpOnly() const;
+ 
++    /** Return true only for an exact singleton payload transport set. */
++    bool isTransportOnly(const std::string &proto) const;
++
+     std::vector<Transport *> listTransports();
+ 
+     void *getBaseAddr();
+diff --git a/mooncake-transfer-engine/include/transfer_engine.h b/mooncake-transfer-engine/include/transfer_engine.h
+index ca83bce..907ff9d 100644
+--- a/mooncake-transfer-engine/include/transfer_engine.h
++++ b/mooncake-transfer-engine/include/transfer_engine.h
+@@ -180,6 +180,11 @@ class TransferEngine {
+         const std::vector<std::string>& device_filter = {});
+ #endif
+ 
++    /**
++     * @brief Check whether `proto` is the exact installed transport set.
++     */
++    bool isTransportOnly(const std::string& proto) const;
++
+     /**
+      * @brief Check if TCP is the only installed transport.
+      *
+diff --git a/mooncake-transfer-engine/include/transfer_engine_impl.h b/mooncake-transfer-engine/include/transfer_engine_impl.h
+index a404851..98414f0 100644
+--- a/mooncake-transfer-engine/include/transfer_engine_impl.h
++++ b/mooncake-transfer-engine/include/transfer_engine_impl.h
+@@ -358,7 +358,11 @@ class TransferEngineImpl {
+         const std::vector<std::string>& device_filter = {});
+ #endif
+ 
+-    bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
++    bool isTransportOnly(const std::string& proto) const {
++        return multi_transports_ && multi_transports_->isTransportOnly(proto);
++    }
++
++    bool isTcpOnly() const { return isTransportOnly("tcp"); }
+ 
+     int syncSegmentCache(const std::string& segment_name = "") {
+         return metadata_->syncSegmentCache(segment_name);
+diff --git a/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h b/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
+index b697081..79215a0 100644
+--- a/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
++++ b/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
+@@ -69,6 +69,9 @@ class AscendDirectTransport : public Transport {
+     int unregisterLocalMemoryBatch(
+         const std::vector<void *> &addr_list) override;
+ 
++    // Disconnect only a drained peer before its registered memory is retired.
++    int disconnectDrainedSegment(const std::string &segment_name);
++
+    private:
+     int allocateLocalSegmentID();
+ 
+diff --git a/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h b/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h
+index e07e971..631f312 100644
+--- a/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h
++++ b/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h
+@@ -81,6 +81,10 @@ class TransferExecutorBase {
+                     bool use_buffer_pool, bool roce_mode, bool agent_mode);
+     int deregisterMem(void* addr);
+ 
++    // The caller must gate new work and drain this peer's submitted transfers.
++    int disconnectDrainedSegment(
++        const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc);
++
+     const size_t getNumEngines() const { return adxl_engines_.size(); }
+     const std::vector<aclrtContext>& getLocalEngineContexts() const {
+         return local_engine_contexts_;
+diff --git a/mooncake-transfer-engine/src/multi_transport.cpp b/mooncake-transfer-engine/src/multi_transport.cpp
+index 81cb017..951e9cf 100644
+--- a/mooncake-transfer-engine/src/multi_transport.cpp
++++ b/mooncake-transfer-engine/src/multi_transport.cpp
+@@ -608,10 +608,12 @@ Transport* MultiTransport::getTransport(const std::string& proto) {
+     return transport_map_[proto].get();
+ }
+ 
+-bool MultiTransport::isTcpOnly() const {
+-    return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
++bool MultiTransport::isTransportOnly(const std::string& proto) const {
++    return transport_map_.size() == 1 && transport_map_.count(proto) == 1;
+ }
+ 
++bool MultiTransport::isTcpOnly() const { return isTransportOnly("tcp"); }
++
+ std::vector<Transport*> MultiTransport::listTransports() {
+     std::vector<Transport*> transport_list;
+     for (auto& entry : transport_map_)
+diff --git a/mooncake-transfer-engine/src/transfer_engine.cpp b/mooncake-transfer-engine/src/transfer_engine.cpp
+index b966147..f7be6ce 100644
+--- a/mooncake-transfer-engine/src/transfer_engine.cpp
++++ b/mooncake-transfer-engine/src/transfer_engine.cpp
+@@ -268,7 +268,11 @@ device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+ }
+ #endif
+ 
+-bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
++bool TransferEngine::isTransportOnly(const std::string& proto) const {
++    return impl_ && impl_->isTransportOnly(proto);
++}
++
++bool TransferEngine::isTcpOnly() const { return isTransportOnly("tcp"); }
+ 
+ int TransferEngine::syncSegmentCache(const std::string& segment_name) {
+     return impl_->syncSegmentCache(segment_name);
+@@ -791,13 +795,18 @@ device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+ }
+ #endif
+ 
++bool TransferEngine::isTransportOnly(const std::string& proto) const {
++    if (use_tent_) return false;
++    return impl_ && impl_->isTransportOnly(proto);
++}
++
+ bool TransferEngine::isTcpOnly() const {
+     if (use_tent_)
+         // TENT already rejects TCP loopback transfers when MC_STORE_MEMCPY
+         // is disabled, so auto-enabling memcpy is unnecessary in TENT mode.
+         return false;
+     else
+-        return impl_->isTcpOnly();
++        return isTransportOnly("tcp");
+ }
+ 
+ int TransferEngine::syncSegmentCache(const std::string& segment_name) {
+diff --git a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp
+index 365505c..3c5eae8 100644
+--- a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp
+@@ -374,6 +374,12 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
+     return register_ret;
+ }
+ 
++int AscendDirectTransport::disconnectDrainedSegment(const std::string &segment_name) {
++    if (!transfer_executor_) return -1;
++    return transfer_executor_->disconnectDrainedSegment(
++        metadata_->getSegmentDescByName(segment_name));
++}
++
+ int AscendDirectTransport::unregisterLocalMemory(void *addr,
+                                                  bool update_metadata) {
+     aclrtContext saved_ctx = nullptr;
+diff --git a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.cpp b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.cpp
+index 434235a..3a24697 100644
+--- a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.cpp
++++ b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.cpp
+@@ -76,11 +76,9 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
+                              op_descs, params_.transfer_timeout);
+ 
+     if (status != adxl::SUCCESS) {
+-        if (!params_.auto_connect) {
+-            disconnect(local_engine_idx, target_adxl_engine_name,
+-                       kDefaultDisconnectTime);
+-        }
+-        return {.ret = -1, .status = status, .retryable = true};
++        // TransferSync failure does not establish DMA termination. Do not
++        // disconnect/retry or claim that the buffers may be recycled.
++        return {.ret = -1, .status = status, .retryable = false};
+     }
+ 
+     recordConnectedSegment(local_engine_idx, target_adxl_engine_name);
+diff --git a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.cpp b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.cpp
+index 6f08a32..ff648ff 100644
+--- a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.cpp
++++ b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/transfer_executor_base.cpp
+@@ -93,7 +93,7 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
+     }
+     char* use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
+     if (use_async) {
+-        params.use_async_transfer = true;
++        params.use_async_transfer = std::strcmp(use_async, "0") != 0;
+     }
+     char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
+     if (auto_connect) {
+@@ -335,16 +335,38 @@ int TransferExecutorBase::disconnect(size_t engine_idx,
+     }
+     auto status = adxl_engines_[engine_idx]->Disconnect(
+         target_adxl_engine_name.c_str(), timeout_in_millis);
+-    engine_connections.erase(it);
+-    if (status != adxl::SUCCESS) {
++    if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
+         LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+                    << ", status: " << status
+                    << ", errmsg: " << aclGetRecentErrMsg();
+         return -1;
+     }
++    engine_connections.erase(it);
+     return 0;
+ }
+ 
++int TransferExecutorBase::disconnectDrainedSegment(
++    const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc) {
++    if (!segment_desc) return -1;
++    aclrtContext saved_ctx = nullptr;
++    if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) return -1;
++    MAKE_GUARD(ctx_restore,
++               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
++    int first_error = 0;
++    for (size_t idx = 0; idx < getNumEngines(); ++idx) {
++        if (idx >= local_engine_contexts_.size() ||
++            aclrtSetCurrentContext(local_engine_contexts_[idx]) != ACL_ERROR_NONE) {
++            first_error = -1;
++            continue;
++        }
++        const auto target = resolveTargetAdxlEngineName(segment_desc, idx);
++        if (target.empty() || disconnect(idx, target, params_.connect_timeout) != 0) {
++            first_error = -1;
++        }
++    }
++    return first_error;
++}
++
+ void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
+     if (engine_idx >= adxl_engines_.size() ||
+         engine_idx >= local_engine_contexts_.size() ||
