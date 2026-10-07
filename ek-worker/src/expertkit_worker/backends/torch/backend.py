@@ -44,6 +44,8 @@ type AcquireTorchWeights = Callable[
 
 # Reserve the measured NPU temporary peak in addition to explicit expert tensors.
 _ASCEND_GROUPED_TEMPORARY_BYTES = 16 * 1024 * 1024
+_ASCEND_ROUTING_MAX_EXPERTS = 10240
+_ASCEND_GROUPED_MAX_EXPERTS = 128
 
 
 class _TorchCompletion(BackendCompletion):
@@ -170,6 +172,7 @@ class TorchBackend(ComputeBackend):
         self._quantized_linear = linear_compute != "float"
         self._reuse_single_token = linear_compute == "float" and expert_compute == "swiglu"
         self._grouped_matmul: Callable[..., list[torch.Tensor]] | None = None
+        self._moe_init_routing: Callable[..., tuple[torch.Tensor, ...]] | None = None
         if (
             self._reuse_single_token
             and runtime.device.type == "npu"
@@ -181,6 +184,8 @@ class TorchBackend(ComputeBackend):
             # Other Ascend products may expose the API without supporting tensor lists.
             if device_name.startswith("Ascend910B") or device_name == "Ascend910_9362":
                 self._grouped_matmul = getattr(torch_npu, "npu_grouped_matmul", None)
+                if self._grouped_matmul is not None:
+                    self._moe_init_routing = getattr(torch_npu, "npu_moe_init_routing_v2", None)
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
@@ -216,6 +221,17 @@ class TorchBackend(ComputeBackend):
         intermediate = assignments * self._intermediate_dim * element_bytes * 3
         weighted_output = assignments * self._hidden_dim * 4
         accumulator = max_batch_tokens * self._hidden_dim * 4
+        native_routing = 0
+        if self._moe_init_routing is not None and max_batch_tokens > 1:
+            # Add the fixed packed allocation and native indices/routes to the eager-loop bound.
+            # Non-quantized initialization also retains an FP32 scale per assignment.
+            native_routing = (
+                assignments * self._hidden_dim * element_bytes
+                + assignments * (4 + 4 + 8 + 8 + 4)
+                + _ASCEND_ROUTING_MAX_EXPERTS * 8
+                + 4 * _ASCEND_GROUPED_MAX_EXPERTS * 8
+                + 3 * 8
+            )
         return BackendResourceEstimate(
             temporary_bytes_per_active_batch=(
                 index_bytes
@@ -224,11 +240,8 @@ class TorchBackend(ComputeBackend):
                 + intermediate
                 + weighted_output
                 + accumulator
-                + (
-                    _ASCEND_GROUPED_TEMPORARY_BYTES
-                    if self._grouped_matmul is not None and self._top_k > 1
-                    else 0
-                )
+                + native_routing
+                + (_ASCEND_GROUPED_TEMPORARY_BYTES if self._grouped_matmul is not None else 0)
                 # Bound quantization, INT32 products, FP32 activation work, and row padding.
                 + (
                     (max_batch_tokens + 32) * (self._hidden_dim + self._intermediate_dim) * 64
@@ -385,6 +398,12 @@ class TorchBackend(ComputeBackend):
         ):
             self._compute_grouped_single_token(batch, prepared_output, lease, columns)
             return
+        if (
+            batch.token_count > 1
+            and self._moe_init_routing is not None
+            and self._compute_packed_prefill(batch, prepared_output, lease)
+        ):
+            return
         accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
         for expert_id, weight in zip(lease.expert_ids, lease.objects, strict=True):
             with trace_span(
@@ -423,6 +442,80 @@ class TorchBackend(ComputeBackend):
                 else:
                     accumulator.add_(weighted)
         prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
+
+    def _compute_packed_prefill(
+        self,
+        batch: BackendBatch,
+        prepared_output: torch.Tensor,
+        lease: ReadyWeightLease[TorchReadyWeights],
+    ) -> bool:
+        """Pack initialized rows and retain ordinary projections and accumulation.
+
+        Native type-1 row indices must preserve token-major order within each expert
+        exactly as the baseline nonzero/gather path. One Host transfer obtains the
+        selected counts and original valid-assignment total. A failed coverage check
+        returns before reading packed data or the potentially uninitialized tail.
+        The caller retains the lease and drains submitted work on failure.
+
+        Returns:
+            Whether computation wrote prepared output. False retains the general path
+            before any potentially uninitialized packed input or index is read.
+        """
+        if batch.token_count <= 1 or not 1 < len(lease.objects) <= _ASCEND_GROUPED_MAX_EXPERTS:
+            return False
+        expert_num = lease.expert_ids[-1] + 1
+        if expert_num > _ASCEND_ROUTING_MAX_EXPERTS:
+            return False
+        init_routing = self._moe_init_routing
+        if init_routing is None:
+            return False
+
+        packed, original_rows, counts, _ = init_routing(
+            batch.hidden_states,
+            batch.expert_ids,
+            active_num=batch.token_count * batch.top_k,
+            expert_num=expert_num,
+            drop_pad_mode=0,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, expert_num],
+            quant_mode=-1,
+            row_idx_type=1,
+        )
+        indices = torch.tensor(lease.expert_ids, dtype=torch.int64, device=batch.expert_ids.device)
+        selected_counts = counts.index_select(0, indices)
+        original_valid_count = (batch.expert_ids >= 0).sum().reshape(1)
+        summary = torch.cat((selected_counts, original_valid_count)).cpu().tolist()
+        expert_counts, valid_count = summary[:-1], summary[-1]
+        if any(count <= 0 for count in expert_counts) or sum(expert_counts) != valid_count:
+            return False
+
+        # Only the initialized prefix contains defined type-1 row indices and inputs.
+        original_rows = original_rows[:valid_count].long()
+        token_indices = original_rows.div(batch.top_k, rounding_mode="floor")
+        routing = batch.routing_weights.flatten().index_select(0, original_rows).unsqueeze(1)
+        accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
+        start = 0
+        for expert_id, weight, count in zip(
+            lease.expert_ids, lease.objects, expert_counts, strict=True
+        ):
+            with trace_span(
+                "worker.expert.submit",
+                attributes={
+                    "expertkit.layer_id": batch.layer_id,
+                    "expertkit.expert_id": expert_id,
+                    "expertkit.timing": "host_submission",
+                },
+            ):
+                stop = start + count
+                expert_input = packed[start:stop]
+                gate = self._linear(expert_input, weight, 0)
+                up = self._linear(expert_input, weight, 1)
+                weighted = self._finish_expert(gate, up, routing[start:stop], weight)
+                accumulator.index_add_(0, token_indices[start:stop], weighted)
+                start = stop
+        prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
+        return True
 
     def _compute_grouped_single_token(
         self,

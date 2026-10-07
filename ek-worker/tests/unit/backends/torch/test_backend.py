@@ -203,25 +203,29 @@ def test_single_token_avoids_dynamic_indexing() -> None:
 
 
 @pytest.mark.parametrize(
-    ("device_name", "dtype", "linear", "expert", "available", "enabled"),
+    ("device_name", "dtype", "linear", "expert", "available", "native_available", "enabled"),
     [
-        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", True, True),
-        ("Ascend910B2", torch.float16, "float", "swiglu", True, True),
-        ("Ascend310P3", torch.float16, "float", "swiglu", True, False),
-        ("unknown", torch.bfloat16, "float", "swiglu", True, False),
-        ("Ascend910_9362", torch.float32, "float", "swiglu", True, False),
-        ("Ascend910_9362", torch.bfloat16, "w8a8", "swiglu", True, False),
-        ("Ascend910_9362", torch.bfloat16, "float", "deepseek_v4", True, False),
-        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", False, False),
+        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", True, True, True),
+        ("Ascend910B2", torch.float16, "float", "swiglu", True, True, True),
+        ("Ascend310P3", torch.float16, "float", "swiglu", True, True, False),
+        ("unknown", torch.bfloat16, "float", "swiglu", True, True, False),
+        ("Ascend910_9362", torch.float32, "float", "swiglu", True, True, False),
+        ("Ascend910_9362", torch.bfloat16, "w8a8", "swiglu", True, True, False),
+        ("Ascend910_9362", torch.bfloat16, "float", "deepseek_v4", True, True, False),
+        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", False, True, False),
+        ("Ascend910_9362", torch.bfloat16, "float", "swiglu", True, False, True),
     ],
 )
 def test_ascend_grouped_selection_and_per_batch_memory(
-    monkeypatch, device_name, dtype, linear, expert, available, enabled
+    monkeypatch, device_name, dtype, linear, expert, available, native_available, enabled
 ) -> None:
     operator = object()
     npu = SimpleNamespace(npu=SimpleNamespace(get_device_name=lambda _: device_name))
     if available:
         npu.npu_grouped_matmul = operator
+    route_operator = object()
+    if native_available:
+        npu.npu_moe_init_routing_v2 = route_operator
     monkeypatch.setitem(sys.modules, "torch_npu", npu)
     options = dict(
         hidden_dim=_HIDDEN_DIM,
@@ -232,14 +236,28 @@ def test_ascend_grouped_selection_and_per_batch_memory(
         linear_compute=linear,
         expert_compute=expert,
     )
-    cpu = TorchBackend(**options, device="cpu")
-    backend = TorchBackend(**options, runtime=SimpleNamespace(device=SimpleNamespace(type="npu")))
-    assert backend._grouped_matmul is (operator if enabled else None)
-    for tokens in (1, 32):
-        extra = backend.estimate_resources(tokens).total_bytes(2) - cpu.estimate_resources(
-            tokens
-        ).total_bytes(2)
-        assert extra == (2 * 16 * 1024 * 1024 if enabled else 0)
+    native = enabled and native_available
+    for top_k in (1, 2, 8):
+        options["top_k"] = top_k
+        cpu = TorchBackend(**options, device="cpu")
+        backend = TorchBackend(
+            **options, runtime=SimpleNamespace(device=SimpleNamespace(type="npu"))
+        )
+        assert backend._grouped_matmul is (operator if enabled else None)
+        assert backend._moe_init_routing is (route_operator if native else None)
+        assert cpu._moe_init_routing is None
+        for tokens in (1, 32):
+            extra = backend.estimate_resources(tokens).total_bytes(2) - cpu.estimate_resources(
+                tokens
+            ).total_bytes(2)
+            scratch = 16 * 1024 * 1024 if enabled else 0
+            route_extra = 0
+            if native and tokens > 1:
+                counts = 8 * 10240 + 4 * 128 * 8 + 3 * 8
+                indices_and_routes = 28 * tokens * top_k
+                packed = tokens * top_k * _HIDDEN_DIM * 2
+                route_extra = counts + indices_and_routes + packed
+            assert extra == 2 * (scratch + route_extra)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -341,6 +359,196 @@ def test_grouped_projection_failure_drains_work_before_releasing_weights(failed_
     assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
 
 
+class _PrefillPacking:
+    """Model native initialization, including a poisoned unused packed tail."""
+
+    def __init__(self, batch, *, zero_counts=False):
+        self.batch = batch
+        self.zero_counts = zero_counts
+        self.pack_calls = 0
+        self.packed = None
+
+    def __call__(self, hidden, expert_ids, **kwargs):
+        assert hidden is self.batch.hidden_states
+        assert expert_ids is self.batch.expert_ids
+        expert_num = self.batch.distinct_expert_ids[-1] + 1
+        assignments = self.batch.token_count * self.batch.top_k
+        assert kwargs == dict(
+            active_num=assignments,
+            expert_num=expert_num,
+            drop_pad_mode=0,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, expert_num],
+            quant_mode=-1,
+            row_idx_type=1,
+        )
+        self.pack_calls += 1
+        flat = expert_ids.flatten()
+        order = flat.argsort(stable=True)
+        order = order[(flat[order] >= 0) & (flat[order] < expert_num)]
+        self.packed = torch.full((assignments, hidden.shape[1]), torch.nan, dtype=hidden.dtype)
+        rows = torch.full((assignments,), -999, dtype=torch.int32)
+        counts = torch.zeros(expert_num, dtype=torch.int64)
+        if not self.zero_counts:
+            self.packed[: len(order)] = hidden[order // self.batch.top_k]
+            rows[: len(order)] = order.int()
+            counts = torch.bincount(flat[order].long(), minlength=expert_num)
+        return self.packed, rows, counts, torch.zeros(assignments, dtype=torch.float32)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_prefill_packing_preserves_linear_inputs_routes_output_and_fallback(monkeypatch, dtype):
+    linear = functional.linear
+    for kind in (
+        "normal",
+        "sparse",
+        "duplicate",
+        "invalid_nan",
+        "zero_counts",
+        "missing",
+        "unleased",
+        "outside_range",
+    ):
+        batch, weights = make_case(dtype, torch.device("cpu"))
+        batch.expert_ids[0, 2] = 1
+        batch.expert_ids[1, 2] = 2
+        if kind == "sparse":
+            ids = batch.expert_ids.clone()
+            ids[ids == 1] = 10239
+            weights = {0: weights[0], 2: weights[2], 10239: weights[1]}
+            batch = replace(batch, expert_ids=ids, distinct_expert_ids=(0, 2, 10239))
+        elif kind == "duplicate":
+            batch.expert_ids[0] = torch.tensor([2, 2, 0], dtype=torch.int32)
+        elif kind in {"invalid_nan", "zero_counts"}:
+            batch.hidden_states[2].fill_(torch.nan)
+            batch.expert_ids[2].fill_(-1)
+            batch.routing_weights[2].zero_()
+        elif kind == "missing":
+            batch.expert_ids[batch.expert_ids == 1] = -1
+        elif kind == "unleased":
+            batch = replace(batch, distinct_expert_ids=(0, 2))
+        elif kind == "outside_range":
+            batch.expert_ids[0, 2] = 77
+        batch.routing_weights[0, 0] = 0
+        table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, max(weights) + 1)
+        for expert_id, weight in weights.items():
+            table.publish(0, expert_id, weight)
+        backend = make_backend(table, dtype, torch.device("cpu"))
+        packing = _PrefillPacking(batch, zero_counts=kind == "zero_counts")
+        backend._moe_init_routing = packing
+        output = torch.full_like(batch.hidden_states, torch.nan)
+        pointer = output.data_ptr()
+        routes = batch.expert_ids.clone()
+        calls = []
+        handled = kind in {"normal", "sparse", "duplicate", "invalid_nan"}
+
+        def checked_linear(
+            inputs,
+            matrix,
+            bias=None,
+            *,
+            batch=batch,
+            weights=weights,
+            handled=handled,
+            packing=packing,
+            calls=calls,
+        ):
+            expert_id, projection = next(
+                (i, p)
+                for i, weight in weights.items()
+                for p, value in enumerate(weight.tensors)
+                if matrix is value
+            )
+            coordinates = torch.nonzero(batch.expert_ids == expert_id)
+            if projection < 2:
+                expected = batch.hidden_states.index_select(0, coordinates[:, 0])
+                torch.testing.assert_close(inputs, expected, rtol=0, atol=0, equal_nan=True)
+                if handled:
+                    start = sum(
+                        int((batch.expert_ids == i).sum())
+                        for i in batch.distinct_expert_ids
+                        if i < expert_id
+                    )
+                    assert (
+                        inputs.data_ptr()
+                        == packing.packed.data_ptr()
+                        + start * batch.hidden_dim * inputs.element_size()
+                    )
+                    assert inputs.is_contiguous()
+            calls.append((expert_id, projection))
+            return linear(inputs, matrix, bias)
+
+        with monkeypatch.context() as context:
+            context.setattr(functional, "linear", checked_linear)
+            if kind == "missing":
+                with pytest.raises(InvalidBackendInput, match="distinct expert metadata"):
+                    backend.submit(batch, output)
+            else:
+                completion = backend.submit(batch, output)
+                assert all(table.usage_count(0, i) == 1 for i in batch.distinct_expert_ids)
+                completion.wait_host()
+                completion.close()
+        assert packing.pack_calls == 1
+        if kind != "missing":
+            reference_batch = replace(batch, expert_ids=batch.expert_ids.clone())
+            for i in set(batch.expert_ids.flatten().tolist()) - set(batch.distinct_expert_ids):
+                reference_batch.expert_ids[reference_batch.expert_ids == i] = -1
+            torch.testing.assert_close(output, reference_output(reference_batch, weights))
+            assert calls == [(i, p) for i in batch.distinct_expert_ids for p in range(3)]
+        if kind in {"invalid_nan", "zero_counts"}:
+            assert torch.equal(output[2], torch.zeros_like(output[2]))
+        assert output.data_ptr() == pointer
+        assert torch.equal(batch.expert_ids, routes)
+        assert all(table.usage_count(0, i) == 0 for i in batch.distinct_expert_ids)
+
+
+@pytest.mark.parametrize("failed_projection", [1, 2])
+def test_prefill_linear_failure_drains_native_work_before_releasing_weights(
+    monkeypatch, failed_projection
+):
+    batch, weights = make_case(torch.bfloat16, torch.device("cpu"))
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, 3)
+    for expert_id, weight in weights.items():
+        table.publish(0, expert_id, weight)
+    events = []
+
+    class Work:
+        def wait_host(self):
+            assert [table.usage_count(0, i) for i in range(3)] == [1, 1, 1]
+            events.append("drained")
+
+    class Runtime(CpuWorkerRuntime):
+        def capture_current_work(self):
+            return Work()
+
+    backend = TorchBackend(
+        hidden_dim=_HIDDEN_DIM,
+        intermediate_dim=_INTERMEDIATE_DIM,
+        top_k=_TOP_K,
+        dtype=torch.bfloat16,
+        runtime=Runtime(torch.device("cpu")),
+        acquire_many=table.acquire_many,
+    )
+    packing = _PrefillPacking(batch)
+    backend._moe_init_routing = packing
+    linear = functional.linear
+
+    def fail_projection(*args, **kwargs):
+        if len(events) == failed_projection:
+            raise RuntimeError("prefill projection failed")
+        result = linear(*args, **kwargs)
+        events.append("submitted")
+        return result
+
+    monkeypatch.setattr(functional, "linear", fail_projection)
+    with pytest.raises(RuntimeError, match="prefill projection failed"):
+        backend.submit(batch, torch.empty_like(batch.hidden_states))
+    assert packing.pack_calls == 1
+    assert events == ["submitted"] * failed_projection + ["drained"]
+    assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 def test_single_token_rejects_absent_expert_and_releases_weights(grouped: bool) -> None:
     batch, weights = single_token_case(torch.float32)
@@ -416,6 +624,153 @@ def test_ascend_grouped_single_token_matches_independent_reference(dtype, routes
     finally:
         completion.close()
     assert all(table.usage_count(0, i) == 0 for i in range(3))
+
+
+@pytest.mark.skipif(os.getenv("EK_TEST_NPU") != "1", reason="requires an assigned Ascend NPU")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+def test_ascend_packed_prefill_preserves_linear_views_fallback_and_completion(
+    monkeypatch, dtype, top_k
+):
+    torch_npu = pytest.importorskip("torch_npu")
+    torch.npu.set_device(0)
+    device = torch.device("npu:0")
+    generator = torch.Generator().manual_seed(40)
+    routes = (
+        [[1], [0], [1]]
+        if top_k == 1
+        else [[2, 0], [1, 0], [2, 1]]
+        if top_k == 2
+        else [[7, 0, 4, 2, 6, 1, 5, 3], list(range(8)), list(range(8))]
+    )
+    ids = torch.tensor(routes, dtype=torch.int32)
+    distinct = tuple(sorted({i for row in routes for i in row}))
+    hidden = torch.randn(3, 32, generator=generator).to(dtype) / 8
+    routing = torch.full(ids.shape, 1 / top_k)
+    routing[0, 0] = 0
+    cpu_batch = BackendBatch(
+        layer_id=0,
+        hidden_states=hidden,
+        expert_ids=ids,
+        routing_weights=routing,
+        distinct_expert_ids=distinct,
+    )
+    weights = {
+        i: TorchExpertWeights(
+            *(
+                torch.randn(shape, generator=generator).to(dtype) / 8
+                for shape in ((64, 32), (64, 32), (32, 64))
+            )
+        )
+        for i in distinct
+    }
+    device_weights = {i: weight.to(device) for i, weight in weights.items()}
+    table: ReadyWeightTable[TorchExpertWeights] = ReadyWeightTable(1, max(distinct) + 1)
+    for i, weight in device_weights.items():
+        table.publish(0, i, weight)
+    backend = TorchBackend(
+        hidden_dim=32,
+        intermediate_dim=64,
+        top_k=top_k,
+        dtype=dtype,
+        device=device,
+        acquire_many=table.acquire_many,
+    )
+    assert backend._moe_init_routing is not None
+    packed_buffers = []
+
+    def pack(*args, **kwargs):
+        assert kwargs["row_idx_type"] == 1
+        result = torch_npu.npu_moe_init_routing_v2(*args, **kwargs)
+        packed_buffers.append(result[0])
+        return result
+
+    backend._moe_init_routing = pack
+    linear = functional.linear
+    calls = []
+    check_views = False
+    active_cpu = cpu_batch
+
+    def checked_linear(inputs, matrix, bias=None):
+        expert_id, projection = next(
+            (i, p)
+            for i, weight in device_weights.items()
+            for p, value in enumerate(weight.tensors)
+            if matrix is value
+        )
+        if check_views and projection < 2:
+            start = sum(int((active_cpu.expert_ids == i).sum()) for i in distinct if i < expert_id)
+            assert (
+                inputs.data_ptr()
+                == packed_buffers[-1].data_ptr() + start * 32 * inputs.element_size()
+            )
+            assert inputs.is_contiguous()
+        calls.append((expert_id, projection))
+        return linear(inputs, matrix, bias)
+
+    monkeypatch.setattr(functional, "linear", checked_linear)
+    stream = torch.npu.Stream(device=device)
+    stream.wait_stream(torch.npu.current_stream(device))
+
+    def run(cpu_case, *, packed_views=False):
+        nonlocal check_views, active_cpu
+        check_views, active_cpu = packed_views, cpu_case
+        calls.clear()
+        before = len(packed_buffers)
+        with torch.npu.stream(stream):
+            batch = replace(
+                cpu_case,
+                hidden_states=cpu_case.hidden_states.to(device),
+                expert_ids=cpu_case.expert_ids.to(device),
+                routing_weights=cpu_case.routing_weights.to(device),
+            )
+            output = torch.full_like(batch.hidden_states, torch.nan)
+            pointer = output.data_ptr()
+            completion = backend.submit(batch, output)
+        assert len(packed_buffers) == before + 1
+        assert all(table.usage_count(0, i) == 1 for i in distinct)
+        completion.wait_host()
+        completion.close()
+        actual = output.cpu()
+        assert calls == [(i, p) for i in distinct for p in range(3)]
+        assert output.data_ptr() == pointer
+        assert all(table.usage_count(0, i) == 0 for i in distinct)
+        check_views = False
+        torch.testing.assert_close(
+            actual, reference_output(cpu_case, weights), atol=2e-3, rtol=2e-2
+        )
+        return batch, output
+
+    batch, output = run(cpu_batch, packed_views=True)
+    masked_hidden, masked_ids, masked_routing = hidden.clone(), ids.clone(), routing.clone()
+    masked_hidden[2].fill_(torch.nan)
+    masked_ids[2].fill_(-1)
+    masked_routing[2].zero_()
+    masked = replace(
+        cpu_batch,
+        hidden_states=masked_hidden,
+        expert_ids=masked_ids,
+        routing_weights=masked_routing,
+    )
+    _, masked_output = run(masked)
+    assert masked_output[2].cpu().eq(0).all()
+    if top_k > 1:
+        duplicate_ids = ids.clone()
+        duplicate_ids[0, 1] = duplicate_ids[0, 0]
+        run(replace(cpu_batch, expert_ids=duplicate_ids), packed_views=True)
+    calls.clear()
+
+    def fail_projection(*args, **kwargs):
+        if calls:
+            assert all(table.usage_count(0, i) == 1 for i in distinct)
+            raise RuntimeError("prefill projection failed")
+        return checked_linear(*args, **kwargs)
+
+    monkeypatch.setattr(functional, "linear", fail_projection)
+    with torch.npu.stream(stream), pytest.raises(RuntimeError, match="prefill projection failed"):
+        backend.submit(batch, output)
+    assert len(calls) == 1
+    assert all(table.usage_count(0, i) == 0 for i in distinct)
 
 
 @pytest.mark.parametrize(
