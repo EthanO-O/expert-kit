@@ -514,7 +514,7 @@ class TorchBackend(ComputeBackend):
                 weighted = self._finish_expert(gate, up, routing[start:stop], weight)
                 accumulator.index_add_(0, token_indices[start:stop], weighted)
                 start = stop
-        prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
+        prepared_output.copy_(accumulator)
         return True
 
     def _compute_grouped_single_token(
@@ -573,7 +573,7 @@ class TorchBackend(ComputeBackend):
             accumulator = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
             for row in range(len(lease.objects)):
                 accumulator.add_(weighted[row : row + 1])
-            prepared_output.copy_(accumulator.to(batch.hidden_states.dtype))
+            prepared_output.copy_(accumulator)
 
     @staticmethod
     def _single_token_columns(batch: BackendBatch) -> dict[int, int] | None:

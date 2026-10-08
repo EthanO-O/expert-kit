@@ -292,31 +292,46 @@ def test_grouped_single_token_preserves_routes_and_weight_views(dtype, routes) -
         return [torch.cat(leaf_outputs[-1])]
 
     backend._grouped_matmul = grouped
-    output = torch.full_like(batch.hidden_states, torch.nan)
+    parent = torch.full((3, _HIDDEN_DIM), 7, dtype=dtype)
+    output = parent[1:2]
+    storage_pointer = parent.untyped_storage().data_ptr()
     output_pointer = output.data_ptr()
     attributes = {}
     span = SimpleNamespace(is_recording=lambda: True, set_attribute=attributes.__setitem__)
     tracer = SimpleNamespace(start_as_current_span=lambda *args, **kwargs: nullcontext(span))
-    with use_tracer(tracer):
-        completion = backend.submit(batch, output)
-    assert [table.usage_count(0, i) for i in batch.distinct_expert_ids] == [1] * len(
-        batch.distinct_expert_ids
-    )
-    completion.wait_host()
-    completion.close()
-    assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
-    assert calls == ([0, 1, 2] if routes in ((2, 0, -1), (2, 0, 1)) else [])
-    assert attributes == (
-        {"expertkit.expert_ids": ",".join(map(str, batch.distinct_expert_ids))} if calls else {}
-    )
-    assert output.data_ptr() == output_pointer
-    if calls:
-        expected = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
-        for expert_id, leaf in zip(batch.distinct_expert_ids, leaf_outputs[2], strict=True):
-            column = routes.index(expert_id)
-            expected.add_(leaf.float() * batch.routing_weights[:, column : column + 1])
-        torch.testing.assert_close(output, expected.to(dtype), rtol=0, atol=0)
-    torch.testing.assert_close(output, reference_output(batch, weights))
+    previous = None
+    for scale in (1.0, 0.5):
+        batch = replace(batch, routing_weights=batch.routing_weights * scale)
+        calls.clear()
+        leaf_outputs.clear()
+        attributes.clear()
+        with use_tracer(tracer):
+            completion = backend.submit(batch, output)
+        assert [table.usage_count(0, i) for i in batch.distinct_expert_ids] == [1] * len(
+            batch.distinct_expert_ids
+        )
+        completion.wait_host()
+        completion.close()
+        assert [table.usage_count(0, i) for i in range(3)] == [0, 0, 0]
+        assert calls == ([0, 1, 2] if routes in ((2, 0, -1), (2, 0, 1)) else [])
+        assert attributes == (
+            {"expertkit.expert_ids": ",".join(map(str, batch.distinct_expert_ids))} if calls else {}
+        )
+        assert output.data_ptr() == output_pointer
+        if calls:
+            expected = torch.zeros_like(batch.hidden_states, dtype=torch.float32)
+            for expert_id, leaf in zip(batch.distinct_expert_ids, leaf_outputs[2], strict=True):
+                column = routes.index(expert_id)
+                expected.add_(leaf.float() * batch.routing_weights[:, column : column + 1])
+            torch.testing.assert_close(output, expected.to(dtype), rtol=0, atol=0)
+        torch.testing.assert_close(output, reference_output(batch, weights))
+
+        if previous is not None and batch.distinct_expert_ids:
+            assert not torch.equal(output, previous)
+        previous = output.clone()
+        assert output.storage_offset() == _HIDDEN_DIM
+        assert output.untyped_storage().data_ptr() == storage_pointer
+        assert torch.equal(parent[[0, 2]], torch.full((2, _HIDDEN_DIM), 7, dtype=dtype))
 
 
 @pytest.mark.parametrize("failed_projection", [1, 2])
@@ -437,7 +452,9 @@ def test_prefill_packing_preserves_linear_inputs_routes_output_and_fallback(monk
         backend = make_backend(table, dtype, torch.device("cpu"))
         packing = _PrefillPacking(batch, zero_counts=kind == "zero_counts")
         backend._moe_init_routing = packing
-        output = torch.full_like(batch.hidden_states, torch.nan)
+        parent = torch.full((batch.token_count + 2, batch.hidden_dim), 7, dtype=dtype)
+        output = parent[1:-1]
+        storage_pointer = parent.untyped_storage().data_ptr()
         pointer = output.data_ptr()
         routes = batch.expert_ids.clone()
         calls = []
@@ -501,6 +518,21 @@ def test_prefill_packing_preserves_linear_inputs_routes_output_and_fallback(monk
         assert output.data_ptr() == pointer
         assert torch.equal(batch.expert_ids, routes)
         assert all(table.usage_count(0, i) == 0 for i in batch.distinct_expert_ids)
+
+        if kind == "normal":
+            previous = output.clone()
+            batch = replace(batch, routing_weights=batch.routing_weights * 0.5)
+            completion = backend.submit(batch, output)
+            completion.wait_host()
+            completion.close()
+            torch.testing.assert_close(output, reference_output(batch, weights))
+            assert not torch.equal(output, previous)
+            assert packing.pack_calls == 2
+            assert all(table.usage_count(0, i) == 0 for i in batch.distinct_expert_ids)
+        assert output.data_ptr() == pointer
+        assert output.storage_offset() == batch.hidden_dim
+        assert output.untyped_storage().data_ptr() == storage_pointer
+        assert torch.equal(parent[[0, -1]], torch.full((2, batch.hidden_dim), 7, dtype=dtype))
 
 
 @pytest.mark.parametrize("failed_projection", [1, 2])
@@ -615,15 +647,32 @@ def test_ascend_grouped_single_token_matches_independent_reference(dtype, routes
         acquire_many=table.acquire_many,
     )
     assert backend._grouped_matmul is not None
-    output = torch.full_like(batch.hidden_states, torch.nan)
-    completion = backend.submit(batch, output)
-    assert all(table.usage_count(0, i) == 1 for i in batch.distinct_expert_ids)
-    try:
-        completion.wait_host()
-        torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-2)
-    finally:
-        completion.close()
-    assert all(table.usage_count(0, i) == 0 for i in range(3))
+    parent = torch.full((3, 32), 7, dtype=dtype, device=device)
+    output = parent[1:2]
+    pointer = output.data_ptr()
+    storage_pointer = parent.untyped_storage().data_ptr()
+    stream = torch.npu.Stream(device=device)
+    stream.wait_stream(torch.npu.current_stream(device))
+    previous = None
+    for scale in (1.0, 0.5):
+        with torch.npu.stream(stream):
+            batch = replace(batch, routing_weights=batch.routing_weights * scale)
+            completion = backend.submit(batch, output)
+        assert all(table.usage_count(0, i) == 1 for i in batch.distinct_expert_ids)
+        try:
+            completion.wait_host()
+            actual = output.cpu()
+            torch.testing.assert_close(actual, expected * scale, atol=2e-3, rtol=2e-2)
+            if previous is not None and batch.distinct_expert_ids:
+                assert not torch.equal(actual, previous)
+            previous = actual
+        finally:
+            completion.close()
+        assert all(table.usage_count(0, i) == 0 for i in range(3))
+        assert output.data_ptr() == pointer
+        assert output.storage_offset() == 32
+        assert output.untyped_storage().data_ptr() == storage_pointer
+        assert parent[[0, 2]].cpu().eq(7).all()
 
 
 @pytest.mark.skipif(os.getenv("EK_TEST_NPU") != "1", reason="requires an assigned Ascend NPU")
@@ -712,6 +761,12 @@ def test_ascend_packed_prefill_preserves_linear_views_fallback_and_completion(
     stream = torch.npu.Stream(device=device)
     stream.wait_stream(torch.npu.current_stream(device))
 
+    with torch.npu.stream(stream):
+        parent = torch.full((5, 32), 7, dtype=dtype, device=device)
+    output = parent[1:4]
+    pointer = output.data_ptr()
+    storage_pointer = parent.untyped_storage().data_ptr()
+
     def run(cpu_case, *, packed_views=False):
         nonlocal check_views, active_cpu
         check_views, active_cpu = packed_views, cpu_case
@@ -724,8 +779,6 @@ def test_ascend_packed_prefill_preserves_linear_views_fallback_and_completion(
                 expert_ids=cpu_case.expert_ids.to(device),
                 routing_weights=cpu_case.routing_weights.to(device),
             )
-            output = torch.full_like(batch.hidden_states, torch.nan)
-            pointer = output.data_ptr()
             completion = backend.submit(batch, output)
         assert len(packed_buffers) == before + 1
         assert all(table.usage_count(0, i) == 1 for i in distinct)
@@ -734,6 +787,9 @@ def test_ascend_packed_prefill_preserves_linear_views_fallback_and_completion(
         actual = output.cpu()
         assert calls == [(i, p) for i in distinct for p in range(3)]
         assert output.data_ptr() == pointer
+        assert output.storage_offset() == 32
+        assert output.untyped_storage().data_ptr() == storage_pointer
+        assert parent[[0, 4]].cpu().eq(7).all()
         assert all(table.usage_count(0, i) == 0 for i in distinct)
         check_views = False
         torch.testing.assert_close(
@@ -742,6 +798,9 @@ def test_ascend_packed_prefill_preserves_linear_views_fallback_and_completion(
         return batch, output
 
     batch, output = run(cpu_batch, packed_views=True)
+    previous = output.cpu()
+    run(replace(cpu_batch, routing_weights=routing * 0.5), packed_views=True)
+    assert not torch.equal(output.cpu(), previous)
     masked_hidden, masked_ids, masked_routing = hidden.clone(), ids.clone(), routing.clone()
     masked_hidden[2].fill_(torch.nan)
     masked_ids[2].fill_(-1)
