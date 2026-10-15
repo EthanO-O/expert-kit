@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
 
 def register() -> None:
-    """Wrap the active vLLM 0.25.1 FusedMoE factory when explicitly enabled."""
+    """Wrap the factory of an explicitly supported vLLM runtime when enabled."""
 
     if os.getenv("EK_ENABLE") != "1":
         return
@@ -34,15 +35,35 @@ def register() -> None:
         wrap_fused_moe_factory,
     )
 
-    if not is_expertkit_fused_moe_factory(fused_moe_layer.FusedMoE):
-        remote_factory = wrap_fused_moe_factory(fused_moe_layer.FusedMoE)
+    factory_name = "FusedMoEFactory" if hasattr(fused_moe_layer, "FusedMoEFactory") else "FusedMoE"
+    platform_factory = getattr(fused_moe_layer, factory_name)
+    if not is_expertkit_fused_moe_factory(platform_factory):
+        remote_factory = wrap_fused_moe_factory(platform_factory)
         # These are deliberately mutable module exports: model modules import the
         # package binding, while the platform wrapper owns the layer binding.
-        fused_moe_layer.__dict__["FusedMoE"] = remote_factory
-        fused_moe_package.__dict__["FusedMoE"] = remote_factory
+        fused_moe_layer.__dict__[factory_name] = remote_factory
+        fused_moe_package.__dict__[factory_name] = remote_factory
+        for name, module in tuple(sys.modules.items()):
+            if (
+                name.startswith(("vllm.model_executor.models.", "vllm.models."))
+                and module is not None
+                and module.__dict__.get(factory_name) is platform_factory
+            ):
+                module.__dict__[factory_name] = remote_factory
         logger.info(
-            f"enabled Expert Kit remote MoE for vLLM 0.25.1 on {current_platform.device_type}"
+            f"enabled Expert Kit remote MoE using {factory_name} on {current_platform.device_type}"
         )
+
+    from expertkit_vllm.decode_graph import (
+        graph_config_from_environment,
+        install_decode_graph_wrapper,
+    )
+
+    graph_config = graph_config_from_environment()
+    if graph_config is not None:
+        if current_platform.device_type != "npu":
+            raise ValueError("EK_ASCEND_DECODE_GRAPH_CONFIG requires the Ascend platform")
+        install_decode_graph_wrapper(graph_config)
 
     from expertkit_vllm.dummy_batch import install_dummy_batch_guard
 

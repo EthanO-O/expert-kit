@@ -44,8 +44,13 @@ class RemoteRoutedExperts(nn.Module):
         swiglu_beta: float | None = None,
         e_score_correction_bias: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
+        is_fused_checkpoint_transposed: bool = False,
+        n_shared_experts: int | None = None,
+        tid2eid: torch.Tensor | None = None,
     ) -> None:
-        super().__init__()
+        # Ascend adapts this placeholder with a native RoutedExperts mixin. Its
+        # constructor allocates local weights, so initialize only module state.
+        nn.Module.__init__(self)
         self.layer_name = layer_name
         self.params_dtype = params_dtype
         self.moe_config = moe_config
@@ -74,6 +79,8 @@ class RemoteRoutedExperts(nn.Module):
         )
 
         unsupported = {
+            "transposed_fused_checkpoint": is_fused_checkpoint_transposed,
+            "hash_routing": tid2eid is not None,
             "quantization": quant_config is not None and not modelslim_quantization,
             "prefill_context_parallel": moe_config.pcp_size != 1,
             "sequence_parallel": moe_config.is_sequence_parallel,
@@ -95,6 +102,9 @@ class RemoteRoutedExperts(nn.Module):
         enabled = sorted(name for name, value in unsupported.items() if value)
         if enabled:
             raise ValueError(f"Expert Kit remote MoE does not support: {', '.join(enabled)}")
+
+        if n_shared_experts is not None and n_shared_experts < 0:
+            raise ValueError("n_shared_experts must be nonnegative")
 
         self._load_weight_sink(modelslim_quantization=modelslim_quantization)
 

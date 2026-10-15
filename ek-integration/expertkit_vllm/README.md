@@ -2,9 +2,11 @@
 
 This package replaces vLLM's routed MoE factory with an implementation that
 keeps vLLM's router and shared experts local while sending one complete routed
-layer to Expert Kit Transport. It targets vLLM `0.25.1` exactly.
+layer to Expert Kit Transport. The ordinary engine extra targets vLLM `0.25.1`.
+The optional Ascend Decode graph lane uses a separate exact vLLM `0.30.0`
+source-built runtime described below.
 
-The version-pinned integration is runtime-qualified with the official
+The ordinary vLLM 0.25.1 lane is runtime-qualified with the official
 DeepSeek-V2-Lite-Chat BF16 checkpoint. Ordinary CI keeps the full model run
 disabled because it requires a Controller, Weight Server, CUDA Frontend, and a
 Worker with enough memory for every routed expert.
@@ -19,6 +21,16 @@ uv sync --locked --extra vllm
 
 This installs `expertkit-vllm`, its workspace Transport dependency, and vLLM
 0.25.1 in the root `.venv`. Ordinary workspace development omits this extra.
+
+For a standalone wheel installation, request `expertkit-vllm[engine]` to install
+vLLM `0.25.1`; the base package leaves the engine choice to the deployment.
+
+The optional Ascend lane requires the pinned source-built EMPTY/NPU engine runtime, Torch
+`2.10.0`, and Torch-NPU `2.10.0.post4` in an isolated environment. Its
+`ascend-graph` extra supplies graph configuration dependencies and does not
+install a PyPI vLLM engine. Follow the [complete Ascend graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
+for exact source commits, resolver constraints, shared configuration, and startup
+order. The ordinary root workspace environment remains separate.
 
 Lightweight checks do not need to install vLLM:
 
@@ -58,8 +70,13 @@ variable. Shared memory requires vLLM and the Worker to use the same Host,
 - Routed experts must use the unquantized SiLU FFN path.
 - Tensor, expert, sequence, prefill-context parallelism and EPLB are rejected.
 - Pipeline and ordinary data-parallel model processes are allowed.
-- Full CUDA Graph capture is changed to piecewise capture because remote MoE
-  calls perform network I/O between graph segments.
+- On the ordinary path, full graph capture is changed to piecewise capture
+  because remote MoE calls perform network I/O between graph segments.
+- The optional fixed 1A1F Ascend path preserves native `FULL_DECODE_ONLY`, keeps
+  all routed experts resident, and coordinates one control exchange around each
+  complete Decode step. Prefill and mixed batches use the ordinary path. It
+  requires the exact DeepSeek-V2-Lite BF16 shape, a single rank per role, and
+  fixed placement; see the recipe for configuration and qualification status.
 - The integration depends on vLLM internal interfaces and therefore stays
   pinned until a later version is reviewed and adapted.
 

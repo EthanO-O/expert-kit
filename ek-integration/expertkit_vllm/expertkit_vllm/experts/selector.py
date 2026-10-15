@@ -169,6 +169,9 @@ def create_expert_selector(
     *,
     tid2eid: torch.Tensor | None = None,
 ) -> ExpertSelector:
-    if current_platform.device_type == "npu":
+    native_ascend_router = router.__class__.__module__.startswith(
+        "vllm_ascend.ops.fused_moe.router"
+    )
+    if current_platform.device_type == "npu" and not native_ascend_router:
         return AscendExpertSelector(options, tid2eid=tid2eid)
     return VllmExpertSelector(router)

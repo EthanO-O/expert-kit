@@ -142,7 +142,9 @@ def test_pyproject_pins_vllm_and_registers_the_plugin() -> None:
     with path.open("rb") as source:
         pyproject = tomllib.load(source)
 
-    assert "vllm==0.25.1" in pyproject["project"]["dependencies"]
+    extras = pyproject["project"]["optional-dependencies"]
+    assert extras["engine"] == ["vllm==0.25.1"]
+    assert all(not dependency.startswith("vllm") for dependency in extras["ascend-graph"])
     entry_points = pyproject["project"]["entry-points"]["vllm.general_plugins"]
     assert entry_points == {"register_expertkit": "expertkit_vllm.plugin:register"}
     assert pyproject["build-system"]["build-backend"] == "hatchling.build"

@@ -39,6 +39,12 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 
+from expertkit_vllm.decode_graph import (
+    active_graph_session,
+    graph_config_from_environment,
+    is_graph_profile,
+    validate_graph_model,
+)
 from expertkit_vllm.dummy_batch import is_dummy_forward
 from expertkit_vllm.experts.remote_routed_experts import RemoteRoutedExperts
 from expertkit_vllm.experts.selector import ExpertSelector, create_expert_selector
@@ -213,20 +219,24 @@ class RemoteMoERunner(MoERunnerInterface):
             tid2eid=tid2eid,
         )
         self.client_config = collect_ek_client_config()
+        self.graph_config = graph_config_from_environment()
+        if self.graph_config is not None:
+            validate_graph_model(vllm_config, self.graph_config)
 
         compilation = vllm_config.compilation_config
         if layer_name in compilation.static_forward_context:
             raise ValueError(f"duplicate Expert Kit MoE layer prefix {layer_name!r}")
         compilation.static_forward_context[layer_name] = self
         compilation.static_all_moe_layers.append(layer_name)
-        if compilation.splitting_ops is None:
-            compilation.splitting_ops = []
-        op_name = "vllm::expertkit_remote_moe"
-        if op_name not in compilation.splitting_ops:
-            compilation.splitting_ops.append(op_name)
-        if compilation.cudagraph_mode.has_full_cudagraphs():
-            compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
-            logger.info("disabled full graph capture around remote MoE execution")
+        if self.graph_config is None:
+            if compilation.splitting_ops is None:
+                compilation.splitting_ops = []
+            op_name = "vllm::expertkit_remote_moe"
+            if op_name not in compilation.splitting_ops:
+                compilation.splitting_ops.append(op_name)
+            if compilation.cudagraph_mode.has_full_cudagraphs():
+                compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                logger.info("disabled full graph capture around remote MoE execution")
 
     @property
     def is_internal_router(self) -> bool:
@@ -312,8 +322,12 @@ class RemoteMoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run this layer as an eager split between compiled vLLM segments."""
+
+        if shared_experts_input is not None:
+            raise ValueError("Expert Kit does not support separate shared-expert inputs")
 
         return torch.ops.vllm.expertkit_remote_moe(
             hidden_states,
@@ -332,13 +346,14 @@ class RemoteMoERunner(MoERunnerInterface):
         trace_attributes(
             {"expertkit.layer_id": self.layer_id, "expertkit.token_count": hidden_states.shape[0]}
         )
-        if is_dummy_forward():
+        graph_session = active_graph_session()
+        if (is_dummy_forward() or is_graph_profile()) and graph_session is None:
             # Idle DP tokens need local output buffers, but no remote computation.
             routed_output = torch.zeros_like(hidden_states)
         else:
             with trace_span("frontend.route"):
                 if self.gate is not None:
-                    if hasattr(self.gate, "weight_fp32"):
+                    if self.graph_config is None and hasattr(self.gate, "weight_fp32"):
                         # Ascend preserves FP32 gate weights for stable expert selection.
                         router_logits = torch.nn.functional.linear(
                             hidden_states.float(), self.gate.weight_fp32
@@ -352,19 +367,23 @@ class RemoteMoERunner(MoERunnerInterface):
                     router_logits,
                     input_ids=input_ids,
                 )
-                expert_ids, routing_weights, distinct_expert_ids = validate_and_convert_routing(
-                    expert_ids,
-                    routing_weights,
-                    experts_per_layer=self.num_experts,
+                if graph_session is None:
+                    expert_ids, routing_weights, distinct_expert_ids = validate_and_convert_routing(
+                        expert_ids, routing_weights, experts_per_layer=self.num_experts
+                    )
+            if graph_session is not None:
+                routed_output = graph_session.exchange(
+                    self.layer_id, hidden_states, expert_ids, routing_weights
                 )
-            routed_output = _client_for(self, hidden_states).execute(
-                layer_id=self.layer_id,
-                hidden_states=hidden_states,
-                expert_ids=expert_ids,
-                routing_weights=routing_weights,
-                distinct_expert_ids=distinct_expert_ids,
-                timeout_seconds=self.client_config.timeout_seconds,
-            )
+            else:
+                routed_output = _client_for(self, hidden_states).execute(
+                    layer_id=self.layer_id,
+                    hidden_states=hidden_states,
+                    expert_ids=expert_ids,
+                    routing_weights=routing_weights,
+                    distinct_expert_ids=distinct_expert_ids,
+                    timeout_seconds=self.client_config.timeout_seconds,
+                )
 
         shared_output: torch.Tensor | None = None
         if self._shared_experts_module is not None:

@@ -178,6 +178,35 @@ def test_vllm_factory_constructs_the_remote_runner_without_local_weights(
     }
 
 
+def test_platform_adapted_experts_skip_native_weight_constructor(monkeypatch) -> None:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    config = _vllm_factory_config()
+    _patch_vllm_config(monkeypatch, config)
+
+    class AscendRoutedExperts(RoutedExperts):
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("native local-weight constructor must not run")
+
+    adapted = type("AdaptedRemoteRoutedExperts", (RemoteRoutedExperts, AscendRoutedExperts), {})
+
+    def platform_factory(**kwargs):
+        kwargs["routed_experts_cls"] = adapted
+        return fused_moe_layer.FusedMoE(**kwargs)
+
+    wrapped = wrap_fused_moe_factory(platform_factory)
+    runner = cast(Callable[..., MoERunnerInterface], wrapped)(**_remote_factory_kwargs())
+
+    assert isinstance(runner.routed_experts, RemoteRoutedExperts)
+    assert isinstance(runner.routed_experts, RoutedExperts)
+    assert isinstance(runner.routed_experts, torch.nn.Module)
+    assert all(parameter.numel() == 0 for parameter in runner.routed_experts.parameters())
+    runner.routed_experts.to(dtype=torch.bfloat16)
+    assert all(
+        parameter.dtype == torch.bfloat16 for parameter in runner.routed_experts.parameters()
+    )
+
+
 def test_vllm_factory_rejects_native_expert_parallel_under_global_dp(
     monkeypatch,
 ) -> None:
