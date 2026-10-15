@@ -1,5 +1,8 @@
 model:
   name: {{ model.name }}
+{% if ascend_decode_graph %}
+  instance_id: {{ ascend_decode_graph.instance_id }}
+{% endif %}
   weight_version: {{ model.weight_version }}
   num_layers: {{ model.num_layers }}
   experts_per_layer: {{ model.experts_per_layer }}
@@ -11,6 +14,9 @@ model:
 
 worker:
   id: {{ pool.id }}-{{ worker.id }}
+{% if ascend_decode_graph %}
+  ascend_decode_graph: {{ ascend_decode_graph | tojson }}
+{% endif %}
   backend: torch
   device: {{ worker.device_name }}
   max_batch_tokens: {{ expert.runtime.max_batch_tokens }}
@@ -33,7 +39,7 @@ transport:
 {% else %}
   type: grpc
   max_pending_batches_per_device: {{ expert.runtime.max_pending_batches_per_device }}
-  listen: 0.0.0.0:51234
+  listen: 0.0.0.0:{{ worker.port if ascend_decode_graph else 51234 }}
   advertise: {{ pool.address }}:{{ worker.port }}
 {% endif %}
 
@@ -51,7 +57,7 @@ weight_manager:
 {% if transport.type == "transfer_engine" %}
     listen: 0.0.0.0:{{ worker.peer_port }}
 {% else %}
-    listen: 0.0.0.0:52234
+    listen: 0.0.0.0:{{ worker.peer_port if ascend_decode_graph else 52234 }}
 {% endif %}
     advertise: http://{{ pool.address }}:{{ worker.peer_port }}
   weight_server_endpoint: http://{{ control.address }}:{{ control.weight_server_port }}

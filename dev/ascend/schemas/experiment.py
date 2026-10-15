@@ -7,6 +7,8 @@ from pathlib import Path
 from pydantic import AnyHttpUrl, Field, model_validator
 
 from enum import StrEnum
+from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+
 from .config import ConfigModel
 
 
@@ -57,6 +59,7 @@ class ExperimentConfig(ConfigModel):
     serve: ServeConfig
     run: RunConfig
     tracing: TracingConfig = Field(default_factory=TracingConfig)
+    ascend_decode_graph: AscendGraphConfig | None = None
 
     @classmethod
     def from_yaml(cls, file: Path) -> Self:

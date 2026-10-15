@@ -103,6 +103,25 @@ for the short run and Jaeger UI procedure. `serve.enforce_eager` independently
 keeps eager execution on when tracing is disabled, which is useful for an
 overhead comparison.
 
+## Fixed DeepSeek Decode graphs
+
+`experiment.ascend_decode_graph` optionally accepts the shared graph deployment
+fields: session/instance/Worker/weight identity, control and rendezvous endpoints,
+routed layer IDs, capture sizes and timeout. It defaults to absent. The
+[DeepSeek-V2-Lite graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
+describes the exact separate engine installation and startup readiness gate.
+
+The generator validates one host, one Frontend and one Worker, BF16 DeepSeek
+geometry, layers1..26, matching identity, unused graph ports and one active
+Worker batch. It emits `ascend-decode-graph.json`, identical Worker settings,
+Frontend identity/mounts and native `FULL_DECODE_ONLY` flags. Both processes use
+host networking even when ordinary Prefill Transport is gRPC. Default deployments
+retain their existing output. The pinned DeepSeek lane has passed trained-weight
+GMM, full-model replay, natural-EOS and batch/padding checks, normal graph close,
+and both peer-exit watchdog directions. Repeated matched generation measurements
+show an end-to-end benefit; the recipe records the qualified scope and observed
+greedy-token difference.
+
 ## File tree
 
 ```text

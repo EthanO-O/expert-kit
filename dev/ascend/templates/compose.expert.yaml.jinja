@@ -4,6 +4,9 @@ services:
 {% for worker in pool.workers %}
   {{ worker.id }}:
     image: {{ images.expert }}
+{% if ascend_decode_graph %}
+    entrypoint: ["ek-worker"]
+{% else %}
     entrypoint:
       - uv
       - run
@@ -11,6 +14,7 @@ services:
       - --package
       - expertkit-worker
       - ek-worker
+{% endif %}
     command: ["--config", "/etc/expert-kit/worker.yaml"]
     privileged: true
     ipc: host
@@ -25,12 +29,12 @@ services:
       - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
       - /usr/local/dcmi:/usr/local/dcmi:ro
       - /dev/devmm_svm:/dev/devmm_svm
-{% if transport.type == "transfer_engine" %}
+{% if transport.type == "transfer_engine" or ascend_decode_graph %}
       - /etc/hccn.conf:/etc/hccn.conf:ro
 {% endif %}
     environment:
       RUST_LOG: info
-{% if transport.type == "transfer_engine" %}
+{% if transport.type == "transfer_engine" or ascend_decode_graph %}
       ASCEND_USE_ASYNC_TRANSFER: "0"
       ASCEND_BUFFER_POOL: "0:0"
       ASCEND_USE_SHORT_CONNECTION: "0"

@@ -1,10 +1,21 @@
 served-model-name: {{ model.name }}
 model: /model/{{ model.name }}
 host: 0.0.0.0
-port: {{ attention.vllm_port if transport.type == "transfer_engine" else 8000 }}
+port: {{ attention.vllm_port if transport.type == "transfer_engine" or ascend_decode_graph else 8000 }}
 gpu-memory-utilization: {{ serve.gpu_memory_utilization }}
 max-model-len: {{ serve.max_model_len }}
 data-parallel-size: {{ attention.dp_size }}
 {% if serve.enforce_eager or tracing.enabled %}
 enforce-eager: true
+{% endif %}
+{% if ascend_decode_graph %}
+async-scheduling: false
+enable-prefix-caching: false
+dtype: bfloat16
+trust-remote-code: true
+max-num-batched-tokens: 2048
+max-num-seqs: {{ ascend_decode_graph.capture_sizes | max }}
+compilation-config:
+  cudagraph_mode: FULL_DECODE_ONLY
+  cudagraph_capture_sizes: {{ ascend_decode_graph.capture_sizes | tojson }}
 {% endif %}

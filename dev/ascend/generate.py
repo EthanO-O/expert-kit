@@ -55,6 +55,11 @@ def generate_root_config(
             **template_context,
         )
 
+    if context.ascend_decode_graph is not None:
+        (output / "ascend-decode-graph.json").write_text(
+            context.ascend_decode_graph.model_dump_json(indent=2) + "\n"
+        )
+
     if context.transport.type == "transfer_engine":
         spec = create_render_spec(output, ConfigFileNames.A_TRANSPORT)
         renderer.render_to_file(spec.output, spec.template, **template_context)

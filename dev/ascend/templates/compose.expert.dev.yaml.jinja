@@ -1,7 +1,7 @@
 services:
 {% for worker in pool.workers %}
   {{ worker.id }}:
-{% if transport.type == "transfer_engine" %}
+{% if transport.type == "transfer_engine" or ascend_decode_graph %}
     network_mode: host
 {% else %}
     ports:

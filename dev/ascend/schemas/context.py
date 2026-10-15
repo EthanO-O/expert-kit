@@ -7,6 +7,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, computed_field, model_serializer, model_validator
 
+from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+
 from .cluster import (
     AscendTransportConfig,
     AttentionConfig,
@@ -51,6 +53,7 @@ class TemplateContext(BaseModel):
     serve: ServeConfig
     run: RunConfig
     tracing: TracingConfig
+    ascend_decode_graph: AscendGraphConfig | None = None
     results_path: Path
 
     @classmethod
@@ -97,6 +100,7 @@ class TemplateContext(BaseModel):
             serve=experiment.serve,
             run=run,
             tracing=experiment.tracing,
+            ascend_decode_graph=experiment.ascend_decode_graph,
             results_path=cluster.paths.results,
         )
 
@@ -146,6 +150,70 @@ class TemplateContext(BaseModel):
             # Same node, check if attention and control shares any port
             check_duplicate_ports(attention_ports, control_ports)
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_decode_graph(self) -> Self:
+        """Restrict graph deployment to fixed resident DeepSeek BF16 on one host."""
+        graph = self.ascend_decode_graph
+        if graph is None:
+            return self
+        if len(self.attention.config.devices) != 1 or self.expert.total_workers != 1:
+            raise ValueError("ascend_decode_graph requires one Frontend and one Worker")
+        pool = self.expert.pools[0]
+        worker = pool.config.workers[0]
+        if pool.config.node != self.attention.config.node:
+            raise ValueError("ascend_decode_graph currently requires one host")
+        model = self.model.config
+        if (
+            model.num_layers,
+            model.experts_per_layer,
+            model.hidden_dim,
+            model.intermediate_dim,
+            model.topk,
+            str(model.weight_dtype),
+            str(model.activation_dtype),
+        ) != (27, 64, 2048, 1408, 6, "bf16", "bf16"):
+            raise ValueError(
+                "ascend_decode_graph requires DeepSeek-V2-Lite BF16 geometry"
+            )
+        if graph.layer_ids != tuple(range(1, 27)):
+            raise ValueError(
+                "ascend_decode_graph requires routed layers 1..26; layer 0 is dense"
+            )
+        if (
+            graph.worker_id != f"{pool.config.id}-{worker.id}"
+            or graph.weight_version != model.weight_version
+        ):
+            raise ValueError(
+                "ascend_decode_graph identity must match Worker and model weights"
+            )
+        host, _, port_text = graph.control_endpoint.rpartition(":")
+        address = str(pool.node.address)
+        if host != address or graph.rendezvous_host != address:
+            raise ValueError(
+                "ascend_decode_graph endpoints must use the Worker host address"
+            )
+        graph_ports = {int(port_text), graph.rendezvous_port}
+        occupied = pool.config.allocated_ports | self.attention.config.allocated_ports
+        if self.control.config.node == pool.config.node:
+            occupied |= self.control.config.allocated_ports
+        if len(graph_ports) != 2 or graph_ports & occupied:
+            raise DuplicatePortError(
+                "ascend_decode_graph ports must be distinct and unallocated"
+            )
+        if self.serve.enforce_eager or self.tracing.enabled:
+            raise ValueError(
+                "ascend_decode_graph requires graph execution with tracing disabled"
+            )
+        if self.expert.runtime.max_active_batches_per_device != 1:
+            raise ValueError(
+                "ascend_decode_graph requires max_active_batches_per_device=1"
+            )
+        if max(graph.capture_sizes) > self.expert.runtime.max_batch_tokens:
+            raise ValueError(
+                "ascend_decode_graph capacity exceeds Worker max_batch_tokens"
+            )
         return self
 
     @computed_field

@@ -17,7 +17,7 @@ services:
         - CMD
         - python3
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:{{ attention.vllm_port if transport.type == 'transfer_engine' else 8000 }}/health', timeout=2)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:{{ attention.vllm_port if transport.type == 'transfer_engine' or ascend_decode_graph else 8000 }}/health', timeout=2)"
       interval: 10s
       timeout: 3s
       retries: 12
@@ -25,31 +25,49 @@ services:
     volumes:
       - *model-mount
       - ./vllm-serve.yaml:/configs/vllm-serve.yaml:ro
+{% if ascend_decode_graph %}
+      - ./ascend-decode-graph.json:/configs/ascend-decode-graph.json:ro
+{% endif %}
       - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
       - /usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro
       - /etc/ascend_install.info:/etc/ascend_install.info:ro
       - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
       - /usr/local/dcmi:/usr/local/dcmi:ro
       - /dev/devmm_svm:/dev/devmm_svm
-{% if transport.type == "transfer_engine" %}
+{% if transport.type == "transfer_engine" or ascend_decode_graph %}
       - /etc/hccn.conf:/etc/hccn.conf:ro
+{% if transport.type == "transfer_engine" %}
       - ./a-transport.toml:/configs/a-transport.toml:ro
+{% endif %}
 {% endif %}
     entrypoint: ["vllm"]
     command:
       - serve
       - --config
       - /configs/vllm-serve.yaml
+{% if ascend_decode_graph %}
+{# vLLM 0.30 root CLI drops false YAML values before the serve parser sees them. #}
+      - --no-async-scheduling
+      - --no-enable-prefix-caching
+{% endif %}
     environment:
       EK_ENABLE: "1"
+{% if ascend_decode_graph %}
+      EK_INSTANCE_ID: "{{ ascend_decode_graph.instance_id }}"
+      EK_ASCEND_DECODE_GRAPH_CONFIG: /configs/ascend-decode-graph.json
+      VLLM_USE_V2_MODEL_RUNNER: "0"
+      VLLM_PLUGINS: ascend,register_expertkit
+{% endif %}
       EK_ADDR: {{ control.address }}:{{ control.frontend_control_port }}
 {% if tracing.enabled %}
       EK_TRACE_ENDPOINT: {{ tracing.endpoint | tojson }}
       EK_TRACE_SAMPLE_RATIO: "{{ tracing.sample_ratio }}"
 {% endif %}
       ASCEND_RT_VISIBLE_DEVICES: {{ attention.visible_devices }}
+{% if transport.type == "transfer_engine" or ascend_decode_graph %}
 {% if transport.type == "transfer_engine" %}
       EK_TRANSPORT_CONFIG: /configs/a-transport.toml
+{% endif %}
       ASCEND_USE_ASYNC_TRANSFER: "0"
       ASCEND_BUFFER_POOL: "0:0"
       ASCEND_USE_SHORT_CONNECTION: "0"
@@ -89,8 +107,12 @@ services:
       EK_ENABLE: "0"
       TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       VLLM_PLUGINS: ""
+{% if ascend_decode_graph %}
+    network_mode: host
+{% else %}
     networks:
       - expert-kit-network
+{% endif %}
 
 networks:
   expert-kit-network:

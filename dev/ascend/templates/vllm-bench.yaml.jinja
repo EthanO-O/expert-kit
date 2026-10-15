@@ -2,7 +2,7 @@ backend: vllm
 model: {{ model.name }}
 tokenizer: /model/{{ model.name }}
 endpoint: /v1/completions
-{% if transport.type == "transfer_engine" %}
+{% if transport.type == "transfer_engine" or ascend_decode_graph %}
 base-url: http://{{ attention.address }}:{{ attention.vllm_port }}
 {% else %}
 base-url: http://attention:8000
