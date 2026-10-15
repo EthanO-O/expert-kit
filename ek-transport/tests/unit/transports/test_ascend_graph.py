@@ -1,9 +1,11 @@
 """Check bounded graph control over its real gRPC boundary on CPU."""
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import grpc
 import pytest
+import torch
 from pydantic import ValidationError
 
 from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
@@ -116,3 +118,147 @@ def test_real_grpc_control_matches_steps_and_poison_after_restart() -> None:
         finally:
             control.close()
             server.stop(0).wait(2)
+
+
+def two_worker_config(ports=(12344, 12345)):
+    """Use canonical rank order with disjoint contiguous ownership."""
+    data = config_for().model_dump(exclude={"worker_id", "control_endpoint"})
+    data["workers"] = [
+        {
+            "worker_id": f"worker{rank}",
+            "control_endpoint": f"127.0.0.1:{port}",
+            "expert_start": rank * 32,
+            "expert_end": (rank + 1) * 32,
+        }
+        for rank, port in enumerate(ports)
+    ]
+    return AscendGraphConfig.model_validate(data)
+
+
+def test_canonical_participants_preserve_legacy_identity_and_reject_partial_ownership():
+    legacy = config_for()
+    explicit = legacy.model_dump(exclude={"worker_id", "control_endpoint"})
+    explicit["workers"] = [legacy.participants[0].model_dump()]
+    assert AscendGraphConfig.model_validate(explicit).identity() == legacy.identity()
+    two = two_worker_config()
+    assert two.worker_rank("worker1") == 2
+    with pytest.raises(ValueError, match="absent"):
+        two.worker_rank("missing")
+    for change in (
+        {"expert_start": 31},
+        {"worker_id": "worker0"},
+        {"control_endpoint": two.participants[0].control_endpoint},
+    ):
+        invalid = two.model_dump()
+        invalid["workers"][1].update(change)
+        with pytest.raises(ValidationError):
+            AscendGraphConfig.model_validate(invalid)
+    with pytest.raises(ValidationError):
+        AscendGraphConfig.model_validate({**two.model_dump(), "worker_id": "legacy"})
+
+
+def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_ownership():
+    begin_barrier = threading.Barrier(2, timeout=2)
+    finish_arrived = [threading.Event(), threading.Event()]
+    release_finish = threading.Event()
+    requests = [[], []]
+    fail_finish = [False]
+    servers = []
+    ports = []
+
+    def begin_for(rank):
+        def begin(request, context):
+            requests[rank].append(request)
+            begin_barrier.wait()
+            return {
+                "state": "ready",
+                "sequence": request["sequence"],
+                "worker_start_id": f"start-{rank}",
+                "ready_revision": 7 + rank,
+            }
+
+        return begin
+
+    def finish_for(rank):
+        def finish(request, context):
+            finish_arrived[rank].set()
+            if rank == 1:
+                assert release_finish.wait(2)
+                if fail_finish[0]:
+                    context.abort(grpc.StatusCode.INTERNAL, "peer completion failed")
+            return {"state": "complete", "sequence": request["sequence"]}
+
+        return finish
+
+    with ThreadPoolExecutor(max_workers=4) as rpc_executor, ThreadPoolExecutor(1) as caller:
+        for rank in range(2):
+            server = grpc.server(rpc_executor)
+            server.add_generic_rpc_handlers((control_handler(begin_for(rank), finish_for(rank)),))
+            ports.append(server.add_insecure_port("127.0.0.1:0"))
+            server.start()
+            servers.append(server)
+        control = GraphStepControl(two_worker_config(ports))
+        try:
+            control.begin("prepare")
+            deadline = control._deadline
+            pending = caller.submit(control.finish)
+            assert all(event.wait(2) for event in finish_arrived)
+            assert control._active is not None and control._deadline == deadline
+            release_finish.set()
+            pending.result(timeout=2)
+            control.begin("capture", 4)
+            for rank in range(2):
+                assert requests[rank][-1]["worker_start_id"] == f"start-{rank}"
+                assert requests[rank][-1]["ready_revision"] == 7 + rank
+            fail_finish[0] = True
+            with pytest.raises(grpc.RpcError):
+                control.finish()
+            assert control._poisoned and control._active is not None and control._deadline > 0
+            with pytest.raises(RuntimeError, match="poisoned"):
+                control.begin("replay", 4)
+        finally:
+            release_finish.set()
+            control.close()
+            for server in servers:
+                server.stop(0).wait(2)
+
+
+def test_fp32_reduce_zeroes_frontend_each_layer_and_preserves_worker_partial():
+    from expertkit_transport.transports.ascend_graph.session import (
+        GraphLayerBuffers,
+        HcclGraphSession,
+    )
+
+    class Group:
+        def __init__(self, rank):
+            self.rank = rank
+            self.seen = []
+
+        def reduce(self, tensors, options):
+            self.seen.append(tensors[0].clone())
+            assert options.rootRank == 0
+            if self.rank == 0:
+                assert torch.count_nonzero(tensors[0]) == 0
+                tensors[0].fill_(1.234567)
+            return self
+
+        def wait(self):
+            return None
+
+    for rank in (0, 1, 2):
+        session = HcclGraphSession.__new__(HcclGraphSession)
+        session.rank = rank
+        session._group = Group(rank)
+        buffers = GraphLayerBuffers(
+            torch.empty(2, 4),
+            torch.empty(2, 2),
+            torch.empty(2, 2),
+            torch.empty(2, 4, dtype=torch.bfloat16),
+            torch.full((2, 4), 9.0),
+        )
+        for _ in range(2):
+            session.combine(buffers)
+        if rank == 0:
+            assert torch.equal(buffers.output, torch.full_like(buffers.output, 1.234567))
+        else:
+            assert all(torch.equal(value, torch.full((2, 4), 9.0)) for value in session._group.seen)

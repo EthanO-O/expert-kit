@@ -344,9 +344,11 @@ async def build_worker_application(
                     "Ascend graph instance does not match the resolved Controller instance"
                 )
             assert device_admission is not None
+            participant = graph_config.participants[graph_config.worker_rank(config.worker.id) - 1]
             graph_execution = AscendDecodeGraphExecution(
                 graph_config,
                 worker_start_id=worker_start_id,
+                worker_id=config.worker.id,
                 device=device,
                 hidden_dim=config.model.hidden_dim,
                 top_k=config.model.top_k,
@@ -359,6 +361,7 @@ async def build_worker_application(
                     top_k=config.model.top_k,
                     acquire_many=manager.acquire_many,
                     ready_revision=lambda: manager.ready_revision,
+                    expert_range=(participant.expert_start, participant.expert_end),
                 ),
             )
 

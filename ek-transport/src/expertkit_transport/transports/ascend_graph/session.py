@@ -1,4 +1,4 @@
-"""Address-stable HCCL buffers used inside a fixed two-rank device graph."""
+"""Address-stable HCCL buffers used inside a fixed one/two-Worker device graph."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ class GraphLayerBuffers:
     expert_ids: torch.Tensor
     routing_weights: torch.Tensor
     output: torch.Tensor
+    partial_output: torch.Tensor | None = None
 
 
 class HcclGraphSession:
@@ -34,8 +35,9 @@ class HcclGraphSession:
         hidden_dim: int,
         top_k: int,
     ) -> None:
-        if rank not in (0, 1) or device.type != "npu":
-            raise ValueError("Ascend graph session requires rank 0/1 and an indexed NPU")
+        world_size = len(config.participants) + 1
+        if not 0 <= rank < world_size or device.type != "npu":
+            raise ValueError("Ascend graph session requires a configured rank and an indexed NPU")
         self.config = config
         self.rank = rank
         self.device = device
@@ -47,7 +49,7 @@ class HcclGraphSession:
         self._store = distributed.TCPStore(
             config.rendezvous_host,
             config.rendezvous_port,
-            2,
+            world_size,
             is_master=rank == 1,
             timeout=timeout,
             wait_for_workers=False,
@@ -57,7 +59,7 @@ class HcclGraphSession:
 
         options = ProcessGroupHCCL.Options()
         options._timeout = timeout
-        self._group = ProcessGroupHCCL(self._prefix_store, rank, 2, options)
+        self._group = ProcessGroupHCCL(self._prefix_store, rank, world_size, options)
         self._buffers: dict[int, GraphLayerBuffers] = {}
 
     def buffers(self, capacity: int) -> GraphLayerBuffers:
@@ -70,6 +72,9 @@ class HcclGraphSession:
                 torch.zeros(capacity, self._top_k, dtype=torch.int32, device=self.device),
                 torch.zeros(capacity, self._top_k, dtype=torch.float32, device=self.device),
                 torch.empty(capacity, self._hidden_dim, dtype=torch.bfloat16, device=self.device),
+                torch.empty(capacity, self._hidden_dim, dtype=torch.float32, device=self.device)
+                if len(self.config.participants) == 2
+                else None,
             )
         return self._buffers[capacity]
 
@@ -95,8 +100,25 @@ class HcclGraphSession:
         buffers.expert_ids.copy_(expert_ids)
         buffers.routing_weights.copy_(routing_weights)
         self.receive_inputs(buffers)
-        self.broadcast(buffers.output, 1)
+        self.combine(buffers)
         return buffers.output
+
+    def combine(self, buffers: GraphLayerBuffers) -> None:
+        """Reduce FP32 shard sums and cast once at the Frontend, inside capture."""
+        partial = buffers.partial_output
+        if partial is None:
+            self.broadcast(buffers.output, 1)
+            return
+        if self.rank == 0:
+            # This write must replay for every layer, not just initialize storage.
+            partial.zero_()
+        options = distributed.ReduceOptions()
+        options.rootRank = 0
+        options.rootTensor = 0
+        options.reduceOp = distributed.ReduceOp.SUM
+        self._group.reduce([partial], options).wait()
+        if self.rank == 0:
+            buffers.output.copy_(partial)
 
     def quarantine(self) -> None:
         """Keep every process-group and buffer reference until process termination."""

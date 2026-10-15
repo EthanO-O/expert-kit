@@ -104,6 +104,7 @@ async def _callsite_scenario(graph_first):
     graph.config = SimpleNamespace(capture_sizes=(1,))
     graph._admission = admission
     graph._device = torch.device("cpu")
+    graph._rank = 1
     graph._stream = None
     graph._prepare_weights = prepare
     graph._hidden_dim = 4

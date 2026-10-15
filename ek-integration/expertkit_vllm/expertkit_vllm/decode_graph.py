@@ -149,7 +149,7 @@ class DecodeGraphSession:
         buffers = self._data.buffers(capacity)
         for _ in self.config.layer_ids:
             self._data.receive_inputs(buffers)
-            self._data.broadcast(buffers.output, 1)
+            self._data.combine(buffers)
         torch.npu.current_stream().synchronize()
         self._finish()
 

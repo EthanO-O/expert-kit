@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import grpc
@@ -58,86 +60,135 @@ def control_handler(
     )
 
 
+@dataclass
+class _PeerControl:
+    channel: grpc.Channel
+    begin: Any
+    finish: Any
+    worker_start_id: str | None = None
+    ready_revision: int | None = None
+
+
 class GraphStepControl:
-    """Serialize one graph session with gRPC deadlines and explicit completion."""
+    """Coordinate all fixed Workers under one absolute step deadline.
+
+    Every peer RPC is submitted before waiting for any peer: graph preparation
+    and collectives can require all ranks to join before any one finishes.
+    """
 
     def __init__(self, config: AscendGraphConfig) -> None:
         self.config = config
-        self._channel = grpc.insecure_channel(
-            config.control_endpoint,
-            options=[
-                ("grpc.max_send_message_length", MAX_CONTROL_BYTES),
-                ("grpc.max_receive_message_length", MAX_CONTROL_BYTES),
-            ],
-        )
-        self._begin = self._channel.unary_unary(
-            f"/{SERVICE}/Begin",
-            request_serializer=encode_message,
-            response_deserializer=decode_message,
-        )
-        self._finish = self._channel.unary_unary(
-            f"/{SERVICE}/Finish",
-            request_serializer=encode_message,
-            response_deserializer=decode_message,
-        )
+        self._peers: list[_PeerControl] = []
+        for worker in config.participants:
+            channel = grpc.insecure_channel(
+                worker.control_endpoint,
+                options=[
+                    ("grpc.max_send_message_length", MAX_CONTROL_BYTES),
+                    ("grpc.max_receive_message_length", MAX_CONTROL_BYTES),
+                ],
+            )
+            methods = [
+                channel.unary_unary(
+                    f"/{SERVICE}/{name}",
+                    request_serializer=encode_message,
+                    response_deserializer=decode_message,
+                )
+                for name in ("Begin", "Finish")
+            ]
+            self._peers.append(_PeerControl(channel, *methods))
         self._sequence = 0
         self._active: dict[str, object] | None = None
+        self._requests: list[dict[str, object]] = []
         self._poisoned = False
-        self.worker_start_id: str | None = None
-        self.ready_revision: int | None = None
+        self._deadline = 0.0
+
+    @property
+    def worker_start_id(self) -> str | None:
+        """Expose the original single-Worker identity for existing diagnostics."""
+        return self._peers[0].worker_start_id
+
+    @property
+    def ready_revision(self) -> int | None:
+        """Expose the original single-Worker revision for existing diagnostics."""
+        return self._peers[0].ready_revision
+
+    def _remaining(self) -> float:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("graph group step deadline expired")
+        return remaining
+
+    def _fanout(self, method: str) -> list[dict[str, Any]]:
+        futures = []
+        try:
+            for peer, request in zip(self._peers, self._requests, strict=True):
+                futures.append(getattr(peer, method).future(request, timeout=self._remaining()))
+            return [future.result(timeout=self._remaining()) for future in futures]
+        except BaseException:
+            self._poisoned = True
+            for future in futures:
+                future.cancel()
+            raise
 
     def begin(self, phase: str, capacity: int = 0) -> None:
-        """Wait until the Worker owns device admission and can start this phase."""
+        """Wait until every Worker owns admission, preserving independent identities."""
         if self._poisoned or self._active is not None:
             raise RuntimeError("graph control is poisoned or already executing a step")
         self._sequence += 1
-        request = {
-            "version": 1,
-            "identity": self.config.identity(),
-            "sequence": self._sequence,
-            "phase": phase,
-            "capacity": capacity,
-            "worker_start_id": self.worker_start_id,
-            "ready_revision": self.ready_revision,
-        }
-        self._active = request
+        self._deadline = time.monotonic() + self.config.timeout_seconds
+        self._requests = [
+            {
+                "version": 1,
+                "identity": self.config.identity(),
+                "sequence": self._sequence,
+                "phase": phase,
+                "capacity": capacity,
+                "worker_start_id": peer.worker_start_id,
+                "ready_revision": peer.ready_revision,
+            }
+            for peer in self._peers
+        ]
+        self._active = self._requests[0]
         try:
-            reply = self._begin(request, timeout=self.config.timeout_seconds)
-            if reply.get("sequence") != self._sequence or reply.get("state") != "ready":
-                raise RuntimeError("Worker acknowledged the wrong graph step")
-            start_id = reply.get("worker_start_id")
-            revision = reply.get("ready_revision")
-            if not isinstance(start_id, str) or not isinstance(revision, int):
-                raise RuntimeError("Worker graph identity is invalid")
-            if self.worker_start_id is not None and start_id != self.worker_start_id:
-                raise RuntimeError("Worker restarted during graph execution")
-            if self.ready_revision is not None and revision != self.ready_revision:
-                raise RuntimeError("Worker weights changed during graph execution")
-            self.worker_start_id = start_id
-            self.ready_revision = revision
+            replies = self._fanout("begin")
+            for peer, reply in zip(self._peers, replies, strict=True):
+                if reply.get("sequence") != self._sequence or reply.get("state") != "ready":
+                    raise RuntimeError("Worker acknowledged the wrong graph step")
+                start_id = reply.get("worker_start_id")
+                revision = reply.get("ready_revision")
+                if not isinstance(start_id, str) or type(revision) is not int:
+                    raise RuntimeError("Worker graph identity is invalid")
+                if peer.worker_start_id is not None and start_id != peer.worker_start_id:
+                    raise RuntimeError("Worker restarted during graph execution")
+                if peer.ready_revision is not None and revision != peer.ready_revision:
+                    raise RuntimeError("Worker weights changed during graph execution")
+                peer.worker_start_id = start_id
+                peer.ready_revision = revision
         except BaseException:
             self._poisoned = True
             raise
 
     def finish(self) -> None:
-        """Prove Worker completion before admitting another step."""
-        request = self._active
-        if self._poisoned or request is None:
+        """Prove every Worker's completion before admitting another step."""
+        if self._poisoned or self._active is None:
             raise RuntimeError("graph control has no healthy active step")
         try:
-            reply = self._finish(request, timeout=self.config.timeout_seconds)
-            if reply.get("sequence") != self._sequence or reply.get("state") != "complete":
-                raise RuntimeError("Worker did not complete the matching graph step")
+            for reply in self._fanout("finish"):
+                if reply.get("sequence") != self._sequence or reply.get("state") != "complete":
+                    raise RuntimeError("Worker did not complete the matching graph step")
         except BaseException:
             self._poisoned = True
             raise
         self._active = None
+        self._requests.clear()
+        self._deadline = 0.0
 
     def poison(self) -> None:
-        """Stop admission after any partially submitted or unproven graph work."""
+        """Stop all admission after any partially submitted or unproven graph work."""
         self._poisoned = True
 
     def close(self) -> None:
-        """Close the Host channel without asserting device completion."""
+        """Close Host channels without asserting any device completion."""
         self._poisoned = True
-        self._channel.close()
+        for peer in self._peers:
+            peer.channel.close()

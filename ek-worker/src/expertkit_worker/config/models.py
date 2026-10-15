@@ -443,10 +443,8 @@ class WorkerConfig(_StrictModel):
                 or self.model.expert_compute != "swiglu"
             ):
                 raise ValueError("Ascend Decode graphs require one active NPU Torch BF16 slot")
-            if (
-                graph.worker_id != self.worker.id
-                or graph.weight_version != self.model.weight_version
-            ):
+            graph.worker_rank(self.worker.id)
+            if graph.weight_version != self.model.weight_version:
                 raise ValueError("Ascend graph deployment identity does not match the Worker")
             if self.model.instance_id is not None and graph.instance_id != self.model.instance_id:
                 raise ValueError("Ascend graph model instance does not match the Worker")

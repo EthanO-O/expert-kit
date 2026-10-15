@@ -45,9 +45,11 @@ class AscendDecodeGraphExecution:
         admission: DeviceAdmission,
         prepare_weights: Callable[[], ResidentExpertGraphWeights],
         terminate: Callable[[int], object] = os._exit,
+        worker_id: str | None = None,
     ) -> None:
         self.config = config
         self._worker_start_id = worker_start_id
+        self._rank = config.worker_rank(worker_id or config.participants[0].worker_id)
         self._device = device
         self._hidden_dim = hidden_dim
         self._top_k = top_k
@@ -84,7 +86,12 @@ class AscendDecodeGraphExecution:
         """Start Host control only; NPU setup waits for an explicit PREPARE."""
         if self._monitor is not None:
             return
-        if self._server.add_insecure_port(self.config.control_endpoint) == 0:
+        if (
+            self._server.add_insecure_port(
+                self.config.participants[self._rank - 1].control_endpoint
+            )
+            == 0
+        ):
             raise RuntimeError("cannot bind Ascend graph control endpoint")
         self._server.start()
         self._monitor = asyncio.create_task(self._watch(), name="worker-graph-watchdog")
@@ -262,7 +269,7 @@ class AscendDecodeGraphExecution:
                         self._weights = self._prepare_weights()
                         self._session = HcclGraphSession(
                             self.config,
-                            rank=1,
+                            rank=self._rank,
                             device=self._device,
                             hidden_dim=self._hidden_dim,
                             top_k=self._top_k,
@@ -303,9 +310,9 @@ class AscendDecodeGraphExecution:
                 buffers.hidden,
                 buffers.expert_ids,
                 buffers.routing_weights,
-                buffers.output,
+                buffers.partial_output if buffers.partial_output is not None else buffers.output,
             )
-            self._session.broadcast(buffers.output, 1)
+            self._session.combine(buffers)
 
     def _destroy(self) -> None:
         def completed() -> None:

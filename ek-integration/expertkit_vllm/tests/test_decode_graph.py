@@ -60,8 +60,7 @@ def graph_runtime(monkeypatch):
         def receive_inputs(self, buffers):
             events.append("warmup-input")
 
-        def broadcast(self, tensor, source):
-            assert source == 1
+        def combine(self, buffers):
             events.append("warmup-output")
 
         def exchange(self, hidden, ids, routing):
