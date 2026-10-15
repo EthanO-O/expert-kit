@@ -15,7 +15,7 @@ dependencies = [
     "pydantic>=2.12,<3",
     "PyYAML>=6,<7",
     "structlog>=25.4,<26",
-    "torch==2.11.0",
+    "torch>=2.10,<2.12",
 ]
 
 [project.scripts]
@@ -35,6 +35,7 @@ observability = [
     "prometheus-client==0.25.0",
 ]
 npu = [
+  "torch==2.11.0",
   "torch-npu==2.11.0rc1",
 ]
 

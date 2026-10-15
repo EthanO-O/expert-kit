@@ -1,16 +1,16 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.14' and sys_platform == 'darwin'",
-    "python_full_version == '3.13.*' and sys_platform == 'darwin'",
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "(python_full_version >= '3.14' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.14' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'darwin'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
     "(python_full_version == '3.13.*' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.13' and sys_platform == 'darwin'",
     "(python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
@@ -880,7 +880,7 @@ observability = [
     { name = "expertkit-worker", extra = ["observability"] },
 ]
 vllm = [
-    { name = "expertkit-vllm" },
+    { name = "expertkit-vllm", extra = ["engine"] },
 ]
 
 [package.dev-dependencies]
@@ -904,7 +904,7 @@ requires-dist = [
     { name = "expertkit-torch", editable = "ek-integration/expertkit_torch" },
     { name = "expertkit-torch", extras = ["npu"], marker = "extra == 'npu'", editable = "ek-integration/expertkit_torch" },
     { name = "expertkit-transport", editable = "ek-transport" },
-    { name = "expertkit-vllm", marker = "extra == 'vllm'", editable = "ek-integration/expertkit_vllm" },
+    { name = "expertkit-vllm", extras = ["engine"], marker = "extra == 'vllm'", editable = "ek-integration/expertkit_vllm" },
     { name = "expertkit-worker", editable = "ek-worker" },
     { name = "expertkit-worker", extras = ["fused"], marker = "extra == 'fused'", editable = "ek-worker" },
     { name = "expertkit-worker", extras = ["ggml"], marker = "extra == 'ggml'", editable = "ek-worker" },
@@ -991,6 +991,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+ascend-graph = [
+    { name = "pydantic" },
+]
 observability = [
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-sdk" },
@@ -1000,14 +1003,15 @@ observability = [
 requires-dist = [
     { name = "expertkit-proto", editable = "ek-proto" },
     { name = "grpcio", specifier = "==1.71.0" },
-    { name = "numpy", specifier = ">=2.1,<3" },
+    { name = "numpy", specifier = ">=1.26,<3" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'observability'", specifier = "==1.39.1" },
     { name = "opentelemetry-sdk", marker = "extra == 'observability'", specifier = "==1.39.1" },
     { name = "protobuf", specifier = "==5.29.6" },
+    { name = "pydantic", marker = "extra == 'ascend-graph'", specifier = ">=2.12,<3" },
     { name = "torch", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'", specifier = ">=2.10,<2.12" },
     { name = "torch", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", specifier = ">=2.10,<2.12", index = "https://download.pytorch.org/whl/cpu" },
 ]
-provides-extras = ["observability"]
+provides-extras = ["ascend-graph", "observability"]
 
 [[package]]
 name = "expertkit-vllm"
@@ -1015,14 +1019,23 @@ version = "0.1.0"
 source = { editable = "ek-integration/expertkit_vllm" }
 dependencies = [
     { name = "expertkit-transport" },
+]
+
+[package.optional-dependencies]
+ascend-graph = [
+    { name = "expertkit-transport", extra = ["ascend-graph"] },
+]
+engine = [
     { name = "vllm" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "expertkit-transport", editable = "ek-transport" },
-    { name = "vllm", specifier = "==0.25.1" },
+    { name = "expertkit-transport", extras = ["ascend-graph"], marker = "extra == 'ascend-graph'", editable = "ek-transport" },
+    { name = "vllm", marker = "extra == 'engine'", specifier = "==0.25.1" },
 ]
+provides-extras = ["engine", "ascend-graph"]
 
 [[package]]
 name = "expertkit-worker"
@@ -1048,6 +1061,8 @@ ggml = [
     { name = "ggml-python" },
 ]
 npu = [
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
     { name = "torch-npu" },
 ]
 observability = [
@@ -1076,8 +1091,10 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "structlog", specifier = ">=25.4,<26" },
-    { name = "torch", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'", specifier = "==2.11.0" },
-    { name = "torch", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'", specifier = ">=2.10,<2.12" },
+    { name = "torch", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", specifier = ">=2.10,<2.12", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'npu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "(platform_machine != 'aarch64' and extra == 'npu') or (sys_platform != 'linux' and extra == 'npu')", specifier = "==2.11.0" },
     { name = "torch-npu", marker = "extra == 'npu'", specifier = "==2.11.0rc1" },
     { name = "triton", marker = "extra == 'fused'", specifier = "==3.6.0" },
 ]
@@ -4337,9 +4354,9 @@ version = "2.11.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'darwin'",
-    "python_full_version == '3.13.*' and sys_platform == 'darwin'",
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "(python_full_version >= '3.14' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.14' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version == '3.13.*' and sys_platform == 'darwin'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
     "(python_full_version == '3.13.*' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
     "python_full_version < '3.13' and sys_platform == 'darwin'",

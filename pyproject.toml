@@ -19,7 +19,7 @@ npu = [
     "expertkit-torch[npu]==0.1.0",
     "expertkit-worker[npu]==0.1.0",
 ]
-vllm = ["expertkit-vllm==0.1.0"]
+vllm = ["expertkit-vllm[engine]==0.1.0"]
 
 [dependency-groups]
 dev = [
