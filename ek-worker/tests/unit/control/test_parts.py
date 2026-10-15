@@ -156,3 +156,23 @@ def test_drain_assembler_bounds_incomplete_authorizations() -> None:
 
     with pytest.raises(ValueError, match="too many incomplete"):
         assembler.add(_drain_part(65, 0, 2, (0,)))
+
+
+def test_whole_worker_drain_before_first_topology_accepts_zero_version() -> None:
+    assembler = DrainAuthorizationAssembler(max_experts=1)
+
+    complete = assembler.add(_drain_part(1, 0, 1, (), topology_version=0, stop_all=True))
+
+    assert complete is not None
+    assert complete.min_topology_version == 0
+    assert complete.stop_accepting_all_computation is True
+    assert complete.experts == ()
+
+
+@pytest.mark.parametrize("field", ["drain_id", "placement_generation"])
+def test_drain_identifiers_still_require_positive_values(field: str) -> None:
+    part = _drain_part(1, 0, 1, (), topology_version=0, stop_all=True)
+    setattr(part, field, 0)
+
+    with pytest.raises(ValueError, match=f"{field} must be a positive uint64"):
+        DrainAuthorizationAssembler(max_experts=1).add(part)

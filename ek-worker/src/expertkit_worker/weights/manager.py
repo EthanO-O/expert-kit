@@ -229,6 +229,11 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
 
         return self._ready.acquire_many(layer_id, distinct_expert_ids)
 
+    @property
+    def ready_revision(self) -> int:
+        """Expose invalidation before ready-weight withdrawal waits for graphs."""
+        return self._ready.revision
+
     async def apply_targets(
         self,
         placement_generation: int,

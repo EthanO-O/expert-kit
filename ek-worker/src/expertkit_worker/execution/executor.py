@@ -29,6 +29,7 @@ from expertkit_worker.backends import (
     InvalidBackendInput,
     UnsupportedBackendBatch,
 )
+from expertkit_worker.execution.admission import DeviceAdmission
 from expertkit_worker.execution.slot import ExecutionResult, ExecutionSlot
 from expertkit_worker.observability.api import NoopWorkerMetrics, WorkerMetrics
 
@@ -79,6 +80,7 @@ class WorkerExecutor:
         clock: Callable[[], float] = time.monotonic,
         metrics: WorkerMetrics | None = None,
         tracer: Tracer | None = None,
+        device_admission: DeviceAdmission | None = None,
     ) -> None:
         if isinstance(instance_id, bool) or not isinstance(instance_id, int) or instance_id <= 0:
             raise ValueError("instance_id must be a positive integer")
@@ -95,6 +97,7 @@ class WorkerExecutor:
         self._clock = clock
         self._metrics = metrics or NoopWorkerMetrics()
         self._tracer = tracer
+        self._device_admission = device_admission
         self._slots: list[ExecutionSlot] = []
         try:
             for _ in range(slot_count):
@@ -299,7 +302,7 @@ class WorkerExecutor:
     ) -> ExecutionResult:
         loop = asyncio.get_running_loop()
         tracer = self._tracer if span is not None else None
-        execute = partial(
+        run = partial(
             slot.execute,
             received,
             self._backend,
@@ -307,6 +310,15 @@ class WorkerExecutor:
             tracer=tracer,
             batch_span=span,
         )
+
+        def execute() -> ExecutionResult:
+            if self._device_admission is None:
+                return run()
+            # Slot execution waits for device computation and output staging;
+            # graph steps cannot overlap this lifetime even from another peer.
+            with self._device_admission.use():
+                return run()
+
         if tracer is None:
             work = loop.run_in_executor(self._executor, execute)
         else:

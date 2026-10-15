@@ -53,6 +53,7 @@ from expertkit_worker.execution import (
     ExecutionSlotFactory,
     WorkerExecutor,
 )
+from expertkit_worker.execution.admission import DeviceAdmission
 from expertkit_worker.observability import create_observability
 from expertkit_worker.weights import (
     DirectIOWeightDiskCache,
@@ -181,6 +182,9 @@ async def build_worker_application(
     weight_services: WeightServices | None = None
     transport_runtime = None
     worker_start_id = new_start_id()
+    graph_config = config.worker.ascend_decode_graph
+    device_admission = DeviceAdmission() if graph_config is not None else None
+    graph_execution = None
     try:
         disk_cache = await create_weight_disk_cache(config)
         adapter = create_weight_adapter(
@@ -282,6 +286,7 @@ async def build_worker_application(
             slot_count=config.worker.max_active_batches_per_device,
             metrics=metrics,
             tracer=observability.tracer,
+            device_admission=device_admission,
         )
         resource_plan = plan_device_resources(
             device_memory_limit_bytes=int(config.worker.device_memory_limit),
@@ -327,6 +332,36 @@ async def build_worker_application(
         peer_server = weight_services.peer_server
         manager_holder[0] = manager
 
+        if graph_config is not None:
+            from expertkit_worker.backends.torch.decode_graph import ResidentExpertGraphWeights
+            from expertkit_worker.execution.decode_graph import (
+                AscendDecodeGraphExecution,
+                GraphWorkerExecution,
+            )
+
+            if graph_config.instance_id != instance_id:
+                raise ValueError(
+                    "Ascend graph instance does not match the resolved Controller instance"
+                )
+            assert device_admission is not None
+            graph_execution = AscendDecodeGraphExecution(
+                graph_config,
+                worker_start_id=worker_start_id,
+                device=device,
+                hidden_dim=config.model.hidden_dim,
+                top_k=config.model.top_k,
+                admission=device_admission,
+                prepare_weights=lambda: ResidentExpertGraphWeights(
+                    layer_ids=graph_config.layer_ids,
+                    experts_per_layer=config.model.experts_per_layer,
+                    hidden_dim=config.model.hidden_dim,
+                    intermediate_dim=config.model.expert_intermediate_dim,
+                    top_k=config.model.top_k,
+                    acquire_many=manager.acquire_many,
+                    ready_revision=lambda: manager.ready_revision,
+                ),
+            )
+
         control = create_controller_supervisor(
             config,
             instance_id=instance_id,
@@ -355,13 +390,19 @@ async def build_worker_application(
             transfer=transfer,
             manager=manager,
             peer_server=peer_server,
-            execution=execution,
+            execution=(
+                GraphWorkerExecution(execution, graph_execution)
+                if graph_execution is not None
+                else execution
+            ),
             control=control,
             disk_cache=disk_cache,
             observability=observability,
         )
     except BaseException:
         try:
+            if graph_execution is not None:
+                await graph_execution.close()
             if execution is not None:
                 await execution.close()
             elif receiver is not None:

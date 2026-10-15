@@ -77,6 +77,17 @@ class ReadyWeightTable[T]:
         ]
         self._condition = threading.Condition(threading.Lock())
         self._quarantined = False
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        """Return a storage revision changed before withdrawal can wait for users.
+
+        Graph owners freeze this value after acquiring their leases and check it
+        before admitting work. Lease acquisition and release do not change it.
+        """
+        with self._condition:
+            return self._revision
 
     @property
     def quarantined(self) -> bool:
@@ -92,6 +103,7 @@ class ReadyWeightTable[T]:
             if self._quarantined:
                 return
             self._quarantined = True
+            self._revision += 1
             retain_until_process_exit(self)
             for layer in self._entries:
                 for entry in layer:
@@ -111,6 +123,7 @@ class ReadyWeightTable[T]:
             if self._entries[layer_id][expert_id] is not None:
                 raise RuntimeError("ready weight position is already occupied")
             self._entries[layer_id][expert_id] = _ReadyEntry(value)
+            self._revision += 1
             self._condition.notify_all()
 
     def acquire_many(
@@ -158,7 +171,9 @@ class ReadyWeightTable[T]:
             entry = self._entries[layer_id][expert_id]
             if entry is None:
                 raise WeightsNotReady((expert_id,))
-            entry.accepting = False
+            if entry.accepting:
+                entry.accepting = False
+                self._revision += 1
             self._condition.notify_all()
 
     def finish_withdrawal(

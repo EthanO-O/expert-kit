@@ -172,7 +172,7 @@ class DrainAuthorizationAssembler:
             raise TypeError("drain part has the wrong protobuf type")
         _validate_positive_uint64("drain_id", part.drain_id)
         _validate_positive_uint64("placement_generation", part.placement_generation)
-        _validate_positive_uint64("min_topology_version", part.min_topology_version)
+        # Protobuf bounds this watermark to uint64; zero precedes the first publication.
         encoded = _validate_part(
             part,
             part_index=part.part_index,

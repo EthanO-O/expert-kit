@@ -7,6 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
 from pydantic import (
     AfterValidator,
     AnyHttpUrl,
@@ -190,6 +191,7 @@ class WorkerProcessConfig(_StrictModel):
     device_memory_limit: PositiveByteSize
     shutdown_grace_secs: float = Field(default=30.0, gt=0)
     ggml: GgmlConfig | None = None
+    ascend_decode_graph: AscendGraphConfig | None = None
 
     @model_validator(mode="after")
     def validate_backend(self) -> WorkerProcessConfig:
@@ -429,4 +431,27 @@ class WorkerConfig(_StrictModel):
                 raise ValueError(
                     "the fused backend supports only FP16 or BF16 activations and weights"
                 )
+        graph = self.worker.ascend_decode_graph
+        if graph is not None:
+            if (
+                self.worker.backend is not BackendName.TORCH
+                or not self.worker.device.startswith("npu:")
+                or self.worker.max_active_batches_per_device != 1
+                or self.model.activation_dtype is not ActivationDType.BF16
+                or self.model.weight_dtype is not ActivationDType.BF16
+                or self.model.quantization is not None
+                or self.model.expert_compute != "swiglu"
+            ):
+                raise ValueError("Ascend Decode graphs require one active NPU Torch BF16 slot")
+            if (
+                graph.worker_id != self.worker.id
+                or graph.weight_version != self.model.weight_version
+            ):
+                raise ValueError("Ascend graph deployment identity does not match the Worker")
+            if self.model.instance_id is not None and graph.instance_id != self.model.instance_id:
+                raise ValueError("Ascend graph model instance does not match the Worker")
+            if graph.layer_ids[-1] >= self.model.num_layers:
+                raise ValueError("Ascend graph layer IDs exceed the configured model")
+            if graph.capture_sizes[-1] > self.worker.max_batch_tokens:
+                raise ValueError("Ascend graph capacity exceeds worker.max_batch_tokens")
         return self
