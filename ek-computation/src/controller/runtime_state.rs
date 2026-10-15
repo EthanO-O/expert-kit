@@ -1007,6 +1007,11 @@ impl ControllerRuntimeState {
                 requested: current_version,
             });
         }
+        // Version zero is a fresh watcher, not an installed historical view.
+        // Publish the current routes before allowing its first computation.
+        if current_version == 0 {
+            return Ok(snapshot_messages(instance_id, topology));
+        }
         if current_version == topology.version {
             return Ok(Vec::new());
         }
@@ -1799,6 +1804,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_topology_watch_starts_at_current_snapshot_with_retained_history() {
+        let state = ControllerRuntimeState::new(8);
+        register_live_worker(&state).await;
+        let placement = state
+            .set_targets("worker-0", "start-0", vec![target(1, 2), target(1, 3)])
+            .await
+            .unwrap();
+        for (sequence, reports) in [vec![ready(1, 2)], vec![ready(1, 3)]]
+            .into_iter()
+            .enumerate()
+        {
+            state
+                .apply_state_report(
+                    "worker-0",
+                    "start-0",
+                    placement.generation,
+                    sequence as u64 + 1,
+                    sequence == 0,
+                    reports,
+                )
+                .await
+                .unwrap();
+        }
+        let initial = state.topology_messages(7, 0).await.unwrap();
+        assert_eq!(initial.len(), 1);
+        let Some(topology_message::Message::Snapshot(snapshot)) = &initial[0].message else {
+            panic!("a fresh watcher must not start from a historical partial revision");
+        };
+        assert_eq!(snapshot.topology_version, 2);
+        assert_eq!(
+            snapshot
+                .routes
+                .iter()
+                .map(|route| route.expert_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let resumed = state.topology_messages(7, 1).await.unwrap();
+        let Some(topology_message::Message::Update(update)) = &resumed[0].message else {
+            panic!("a nonzero installed version must retain delta resume");
+        };
+        assert_eq!(update.previous_version, 1);
+        assert_eq!(update.topology_version, 2);
+        assert_eq!(update.changes.len(), 1);
+        assert_eq!(update.changes[0].expert_id, 3);
+    }
+
+    #[tokio::test]
     async fn ready_routes_require_target_and_live_worker() {
         let state = ControllerRuntimeState::new(8);
         let lease = register_live_worker(&state).await;
@@ -1821,15 +1874,15 @@ mod tests {
             .await
             .unwrap();
         let messages = state.topology_messages(7, 0).await.unwrap();
-        let topology_message::Message::Update(update) = messages[0].message.as_ref().unwrap()
+        let topology_message::Message::Snapshot(snapshot) = messages[0].message.as_ref().unwrap()
         else {
-            panic!("expected retained update");
+            panic!("expected current snapshot");
         };
-        assert_eq!(update.changes.len(), 1);
-        assert_eq!(update.changes[0].expert_id, 2);
-        assert_eq!(update.changes[0].replicas[0].worker_id, "worker-0");
+        assert_eq!(snapshot.routes.len(), 1);
+        assert_eq!(snapshot.routes[0].expert_id, 2);
+        assert_eq!(snapshot.routes[0].replicas[0].worker_id, "worker-0");
         assert_eq!(
-            update.changes[0].replicas[0].transport_type,
+            snapshot.routes[0].replicas[0].transport_type,
             WorkerTransportType::WorkerTransportGrpc as i32
         );
 
