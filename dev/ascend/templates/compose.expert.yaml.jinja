@@ -34,6 +34,9 @@ services:
 {% endif %}
     environment:
       RUST_LOG: info
+{% if ascend_decode_graph %}
+      ASCEND_RT_VISIBLE_DEVICES: "{{ worker.device }}"
+{% endif %}
 {% if transport.type == "transfer_engine" or ascend_decode_graph %}
       ASCEND_USE_ASYNC_TRANSFER: "0"
       ASCEND_BUFFER_POOL: "0:0"

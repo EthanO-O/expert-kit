@@ -1,4 +1,4 @@
-"""Validate the public fixed 1A1F graph deployment materialization."""
+"""Validate the public fixed one/two-Worker graph deployment materialization."""
 
 import json
 import os
@@ -150,6 +150,66 @@ def test_graph_generation_rejects_unsupported_deployments(tmp_path, case):
         experiment["serve"]["enforce_eager"] = True
     else:
         cluster["expert"]["runtime"]["max_active_batches_per_device"] = 2
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode != 0
+    assert not (tmp_path / "generated").exists()
+
+
+def test_two_worker_generation_shares_rank_manifest_and_checks_all_ports(tmp_path):
+    cluster, experiment = _inputs(tmp_path)
+    cluster["pools"][0]["devices"] = [1, 2]
+    graph = experiment["ascend_decode_graph"]
+    del graph["worker_id"], graph["control_endpoint"]
+    graph["workers"] = [
+        {
+            "worker_id": f"worker-pool1-worker-{index:02d}",
+            "control_endpoint": f"192.0.2.10:{18079 + index}",
+            "expert_start": index * 32,
+            "expert_end": (index + 1) * 32,
+        }
+        for index in range(2)
+    ]
+    graph["rendezvous_port"] = 18081
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "generated"
+    shared = json.loads((output / "ascend-decode-graph.json").read_text())
+    for index in range(2):
+        worker = yaml.safe_load(
+            (output / f"worker-pool1/workers/worker-{index:02d}.yaml").read_text()
+        )
+        assert worker["worker"]["ascend_decode_graph"] == shared
+        assert worker["worker"]["device"] == "npu:0"
+        assert worker["worker"]["id"] == shared["workers"][index]["worker_id"]
+    graph["workers"][1]["control_endpoint"] = "192.0.2.10:53235"
+    # A fresh output directory makes the rejected render independent of the first.
+    other = tmp_path / "collision"
+    other.mkdir()
+    rejected = _generate(other, cluster, experiment)
+    assert rejected.returncode != 0
+    assert not (other / "generated").exists()
+
+
+@pytest.mark.parametrize("case", ["duplicate-workers", "multiple-pools"])
+def test_graph_generation_rejects_shared_worker_devices_and_multiple_pools(tmp_path, case):
+    cluster, experiment = _inputs(tmp_path)
+    cluster["pools"][0]["devices"] = [1, 1]
+    graph = experiment["ascend_decode_graph"]
+    del graph["worker_id"], graph["control_endpoint"]
+    graph["workers"] = [
+        {
+            "worker_id": f"worker-pool1-worker-{index:02d}",
+            "control_endpoint": f"192.0.2.10:{18079 + index}",
+            "expert_start": index * 32,
+            "expert_end": (index + 1) * 32,
+        }
+        for index in range(2)
+    ]
+    graph["rendezvous_port"] = 18081
+    if case == "multiple-pools":
+        cluster["pools"][0]["devices"] = [1]
+        cluster["pools"].append({**cluster["pools"][0], "id": "worker-pool2", "devices": [2]})
+        graph["workers"][1]["worker_id"] = "worker-pool2-worker-00"
     result = _generate(tmp_path, cluster, experiment)
     assert result.returncode != 0
     assert not (tmp_path / "generated").exists()

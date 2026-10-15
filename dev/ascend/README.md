@@ -111,16 +111,24 @@ routed layer IDs, capture sizes and timeout. It defaults to absent. The
 [DeepSeek-V2-Lite graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
 describes the exact separate engine installation and startup readiness gate.
 
-The generator validates one host, one Frontend and one Worker, BF16 DeepSeek
+The generator validates one host, one Frontend and one expert pool with one or two
+Workers on distinct physical devices, BF16 DeepSeek
 geometry, layers1..26, matching identity, unused graph ports and one active
 Worker batch. It emits `ascend-decode-graph.json`, identical Worker settings,
-Frontend identity/mounts and native `FULL_DECODE_ONLY` flags. Both processes use
+Frontend identity/mounts and native `FULL_DECODE_ONLY` flags. All participants use
 host networking even when ordinary Prefill Transport is gRPC. Default deployments
-retain their existing output. The pinned DeepSeek lane has passed trained-weight
-GMM, full-model replay, natural-EOS and batch/padding checks, normal graph close,
-and both peer-exit watchdog directions. Repeated matched generation measurements
-show an end-to-end benefit; the recipe records the qualified scope and observed
-greedy-token difference.
+retain their existing output. Two Workers require explicit, disjoint desired
+placement of experts 0..31 and 32..63 on every routed layer; the generator does
+not create these Controller assignments. Start the Frontend only after actual
+READY routes prove all 1,664 experts have the declared owner and process start ID.
+The pinned single- and two-Worker DeepSeek deployments have passed trained-weight
+GMM, full-model replay, natural-EOS and batch/padding checks, healthy graph close,
+and the legacy single-Worker JSON regression. Fault tests kill each role after
+all Begin acknowledgements and before Frontend native replay; all survivors
+self-terminate within the bounded deadline before external cleanup. Repeated
+matched generation measurements with a native Transformers reference show an
+end-to-end benefit. The recipe records fixed-capacity padding cost, placement,
+and the observed Chinese greedy-token difference.
 
 ## File tree
 

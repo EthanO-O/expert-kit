@@ -158,12 +158,22 @@ class TemplateContext(BaseModel):
         graph = self.ascend_decode_graph
         if graph is None:
             return self
-        if len(self.attention.config.devices) != 1 or self.expert.total_workers != 1:
-            raise ValueError("ascend_decode_graph requires one Frontend and one Worker")
-        pool = self.expert.pools[0]
-        worker = pool.config.workers[0]
-        if pool.config.node != self.attention.config.node:
+        if len(self.attention.config.devices) != 1 or self.expert.total_workers != len(
+            graph.participants
+        ):
+            raise ValueError(
+                "ascend_decode_graph requires one Frontend and matching Workers"
+            )
+        if len(self.expert.pools) != 1:
+            raise ValueError("ascend_decode_graph currently requires one expert pool")
+        pool = self.expert.pools[0].config
+        if pool.node != self.attention.config.node:
             raise ValueError("ascend_decode_graph currently requires one host")
+        devices = [*self.attention.config.devices, *pool.devices]
+        if len(set(devices)) != len(devices):
+            raise DuplicateDeviceError(
+                "ascend_decode_graph requires a distinct physical device for every role"
+            )
         model = self.model.config
         if (
             model.num_layers,
@@ -181,24 +191,36 @@ class TemplateContext(BaseModel):
             raise ValueError(
                 "ascend_decode_graph requires routed layers 1..26; layer 0 is dense"
             )
-        if (
-            graph.worker_id != f"{pool.config.id}-{worker.id}"
-            or graph.weight_version != model.weight_version
-        ):
+        generated_workers = {
+            f"{pool.config.id}-{worker.id}": pool
+            for pool in self.expert.pools
+            for worker in pool.config.workers
+        }
+        if {
+            worker.worker_id for worker in graph.participants
+        } != generated_workers.keys() or graph.weight_version != model.weight_version:
             raise ValueError(
-                "ascend_decode_graph identity must match Worker and model weights"
+                "ascend_decode_graph identity must match Workers and model weights"
             )
-        host, _, port_text = graph.control_endpoint.rpartition(":")
-        address = str(pool.node.address)
-        if host != address or graph.rendezvous_host != address:
+        graph_ports = {graph.rendezvous_port}
+        occupied = self.attention.config.allocated_ports.copy()
+        for pool in self.expert.pools:
+            occupied |= pool.config.allocated_ports
+        address = str(self.attention.node.address)
+        if graph.rendezvous_host != address:
             raise ValueError(
                 "ascend_decode_graph endpoints must use the Worker host address"
             )
-        graph_ports = {int(port_text), graph.rendezvous_port}
-        occupied = pool.config.allocated_ports | self.attention.config.allocated_ports
-        if self.control.config.node == pool.config.node:
+        for worker in graph.participants:
+            host, _, port_text = worker.control_endpoint.rpartition(":")
+            if host != address:
+                raise ValueError(
+                    "ascend_decode_graph endpoints must use the Worker host address"
+                )
+            graph_ports.add(int(port_text))
+        if self.control.config.node == self.attention.config.node:
             occupied |= self.control.config.allocated_ports
-        if len(graph_ports) != 2 or graph_ports & occupied:
+        if len(graph_ports) != len(graph.participants) + 1 or graph_ports & occupied:
             raise DuplicatePortError(
                 "ascend_decode_graph ports must be distinct and unallocated"
             )
