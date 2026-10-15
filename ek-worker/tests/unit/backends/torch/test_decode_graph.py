@@ -19,6 +19,7 @@ class CpuExpertOperators:
     def __init__(self) -> None:
         self.weight_addresses: list[list[int]] = []
         self.counts: list[list[int]] = []
+        self.gmm_counts: list[list[int]] = []
 
     def npu_moe_init_routing_v2(self, hidden_states, expert_ids, **options):
         assert options["row_idx_type"] == 1
@@ -35,6 +36,7 @@ class CpuExpertOperators:
         assert options["group_type"] == 0
         assert options["group_list_type"] == 1
         self.weight_addresses.append([weight.data_ptr() for weight in weights])
+        self.gmm_counts.append(options["group_list"].tolist())
         output = []
         start = 0
         for weight, count in zip(weights, options["group_list"].tolist(), strict=True):
@@ -215,3 +217,86 @@ def test_withdrawal_during_prepare_releases_every_acquired_layer():
         )
     assert table.usage_count(0, 2) == 0
     assert table.usage_count(1, 2) == 0
+
+
+@pytest.mark.parametrize("capacity", [1, 3, 32])
+def test_sharded_weights_cover_global_routes_and_mask_padding_before_weighting(capacity):
+    generator = torch.Generator().manual_seed(43)
+    tables = [ReadyWeightTable(1, 6), ReadyWeightTable(1, 6)]
+    weights = {}
+    residents = []
+    operators = []
+    for rank, (start, end) in enumerate(((0, 3), (3, 6))):
+        for expert in range(start, end):
+            weight = TorchExpertWeights(
+                *(
+                    torch.randn(shape, generator=generator).bfloat16() / 4
+                    for shape in [(6, 4), (6, 4), (4, 6)]
+                )
+            )
+            weights[0, expert] = weight
+            tables[rank].publish(0, expert, weight)
+        op = CpuExpertOperators()
+        operators.append(op)
+        residents.append(
+            ResidentExpertGraphWeights(
+                layer_ids=(0,),
+                experts_per_layer=6,
+                hidden_dim=4,
+                intermediate_dim=6,
+                top_k=2,
+                acquire_many=tables[rank].acquire_many,
+                ready_revision=lambda table=tables[rank]: table.revision,
+                operators=op,
+                expert_range=(start, end),
+            )
+        )
+    try:
+        for pair in ([0, 2], [3, 5], [0, 5], [2, 3]):
+            hidden = torch.randn(capacity, 4, generator=generator).bfloat16()
+            ids = torch.tensor([pair] * capacity, dtype=torch.int32)
+            routing = torch.tensor([[0.1234567, 0.7654321]] * capacity)
+            partials = [torch.full((capacity, 4), float("nan")) for _ in residents]
+            for rank, (resident, op, partial) in enumerate(
+                zip(residents, operators, partials, strict=True)
+            ):
+                local_count = int(((ids >= rank * 3) & (ids < (rank + 1) * 3)).sum())
+                original = op.npu_grouped_matmul
+                calls = [0]
+
+                def poison_padding(
+                    inputs,
+                    matrices,
+                    original=original,
+                    calls=calls,
+                    local_count=local_count,
+                    **options,
+                ):
+                    result = original(inputs, matrices, **options)
+                    calls[0] += 1
+                    if calls[0] == 3:
+                        result[0][local_count:] = float("nan")
+                    return result
+
+                op.npu_grouped_matmul = poison_padding
+                try:
+                    resident.compute(0, hidden, ids, routing, partial)
+                finally:
+                    op.npu_grouped_matmul = original
+                assert torch.isfinite(partial).all()
+                assert all(sum(counts) == capacity * 2 for counts in op.gmm_counts)
+                assert all(len(addresses) == 3 for addresses in op.weight_addresses)
+                if local_count == 0:
+                    assert torch.count_nonzero(partial) == 0
+                    assert op.gmm_counts[-1] == [0, 0, capacity * 2]
+            combined = (partials[0] + partials[1]).bfloat16()
+            torch.testing.assert_close(
+                combined, reference(hidden, ids, routing, weights, 0), rtol=0, atol=0
+            )
+        for rank, table in enumerate(tables):
+            assert [table.usage_count(0, expert) for expert in range(6)] == (
+                [1, 1, 1, 0, 0, 0] if rank == 0 else [0, 0, 0, 1, 1, 1]
+            )
+    finally:
+        for resident in residents:
+            resident.close(wait_for_completion=lambda: None)

@@ -1,6 +1,6 @@
 """Resident BF16 expert computation using device routing and Ascend GMM.
 
-The owner acquires all experts before capture and retains them through every
+The owner acquires all local experts before capture and retains them through every
 replay. This module owns no communication or device graph; its caller orders
 device completion before closing the resident weights.
 """
@@ -45,7 +45,7 @@ class _LayerWeights:
 
 
 class ResidentExpertGraphWeights:
-    """Retain all routed experts and compute without Host routing decisions.
+    """Retain all local routed experts and compute without Host routing decisions.
 
     Inputs contain valid expert IDs for every row, including padded rows. The
     model's native router guarantees IDs and finite FP32 routing weights; this
@@ -63,6 +63,7 @@ class ResidentExpertGraphWeights:
         acquire_many: Callable[[int, tuple[int, ...]], ReadyWeightLease[TorchExpertWeights]],
         ready_revision: Callable[[], int],
         operators: ExpertGraphOperators | None = None,
+        expert_range: tuple[int, int] | None = None,
     ) -> None:
         for name, value in (
             ("experts_per_layer", experts_per_layer),
@@ -81,6 +82,11 @@ class ResidentExpertGraphWeights:
             or tuple(sorted(set(layers))) != layers
         ):
             raise ValueError("layer_ids must be nonempty, sorted, unique and nonnegative")
+        start, end = expert_range if expert_range is not None else (0, experts_per_layer)
+        if not 0 <= start < end <= experts_per_layer:
+            raise ValueError("resident expert interval must be within the model")
+        self._expert_start = start
+        self._expert_end = end
         self._operators = operators
         self._ready_revision = ready_revision
         self._revision = ready_revision()
@@ -92,7 +98,7 @@ class ResidentExpertGraphWeights:
         self._device: torch.device | None = None
         self._closed = False
         self._quarantined = False
-        expert_ids = tuple(range(experts_per_layer))
+        expert_ids = tuple(range(start, end))
         try:
             for layer_id in layers:
                 lease = acquire_many(layer_id, expert_ids)
@@ -144,13 +150,13 @@ class ResidentExpertGraphWeights:
         routing_weights: torch.Tensor,
         prepared_output: torch.Tensor,
     ) -> None:
-        """Write one layer's FP32-weighted expert sum into prepared BF16 output.
+        """Write the local FP32-weighted sum into prepared BF16 or FP32 output.
 
         Args:
             hidden_states: BF16 device matrix shaped [capacity, hidden_dim].
             expert_ids: Int32 device matrix shaped [capacity, top_k], all IDs valid.
             routing_weights: FP32 device matrix aligned with expert_ids.
-            prepared_output: Caller-owned BF16 output with hidden_states' shape.
+            prepared_output: Caller-owned BF16/FP32 output with hidden_states' shape.
 
         Note:
             The caller checks require_current before admitting a whole step and
@@ -175,7 +181,22 @@ class ResidentExpertGraphWeights:
             quant_mode=-1,
             row_idx_type=1,
         )
-        group_list = counts.to(torch.int64)
+        group_list = counts[self._expert_start : self._expert_end].to(torch.int64)
+        local_rows = None
+        if self._expert_start != 0 or self._expert_end != self._experts_per_layer:
+            # All global assignments are packed, so every source index is defined.
+            # The local prefix is useful; fixed tail gathers stay in bounds.
+            rows = torch.arange(capacity * self._top_k, device=hidden_states.device)
+            offset = counts[: self._expert_start].sum()
+            indices = (rows + offset).clamp(max=capacity * self._top_k - 1).long()
+            packed = packed.index_select(0, indices)
+            original_rows = original_rows.index_select(0, indices)
+            local_count = group_list.sum()
+            local_rows = rows < local_count
+            # GMM requires group counts to cover its fixed input shape. Charge
+            # harmless padding rows to the last real local expert, then mask them.
+            group_list = group_list.clone()
+            group_list[-1] += capacity * self._top_k - local_count
 
         def project(inputs: torch.Tensor, matrices: list[torch.Tensor]) -> torch.Tensor:
             return operators.npu_grouped_matmul(
@@ -190,11 +211,16 @@ class ResidentExpertGraphWeights:
         gate = project(packed, weights.gate)
         up = project(packed, weights.up)
         down = project(functional.silu(gate) * up, weights.down)
+        if local_rows is not None:
+            # Padding must contribute zero, even if its projections contain NaNs.
+            down_fp32 = torch.where(local_rows.unsqueeze(1), down.float(), 0.0)
+        else:
+            down_fp32 = down.float()
         original_rows = original_rows.to(torch.int64)
         token_indices = original_rows.div(self._top_k, rounding_mode="floor")
         routing = routing_weights.flatten().index_select(0, original_rows).unsqueeze(1)
         accumulator = torch.zeros_like(hidden_states, dtype=torch.float32)
-        accumulator.index_add_(0, token_indices, down.float() * routing)
+        accumulator.index_add_(0, token_indices, down_fp32 * routing)
         prepared_output.copy_(accumulator)
 
     def close(self, *, wait_for_completion: Callable[[], None]) -> None:
@@ -226,8 +252,8 @@ class ResidentExpertGraphWeights:
         retain_until_process_exit(self)
 
     def _validate_weights(self, lease: ReadyWeightLease[TorchExpertWeights]) -> None:
-        if lease.expert_ids != tuple(range(self._experts_per_layer)):
-            raise ValueError("resident graph requires every expert in logical order")
+        if lease.expert_ids != tuple(range(self._expert_start, self._expert_end)):
+            raise ValueError("resident graph requires its local experts in logical order")
         for weight in lease.objects:
             if not isinstance(weight, TorchExpertWeights):
                 raise ValueError("resident graph requires unquantized Torch expert weights")
@@ -260,7 +286,7 @@ class ResidentExpertGraphWeights:
             raise ValueError("resident graph routing weights have the wrong shape")
         if (
             hidden_states.dtype != torch.bfloat16
-            or output.dtype != torch.bfloat16
+            or output.dtype not in (torch.bfloat16, torch.float32)
             or expert_ids.dtype != torch.int32
             or routing_weights.dtype != torch.float32
         ):
