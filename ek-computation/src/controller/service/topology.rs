@@ -11,7 +11,8 @@ use crate::{
         runtime_state::ControllerRuntimeState, service::instance::DefaultInstanceResolver,
     },
     proto::ek::control::v2::{
-        TopologyMessage, WatchTopologyRequest, topology_service_server::TopologyService,
+        TopologyMessage, WatchTopologyRequest, topology_message,
+        topology_service_server::TopologyService,
     },
 };
 
@@ -77,12 +78,9 @@ impl TopologyService for TopologyServiceImpl {
                             return;
                         }
                     };
-                    for message in messages {
-                        if sender.send(Ok(message)).await.is_err() {
-                            return;
-                        }
+                    if !send_topology_messages(&sender, messages, &mut installed_version).await {
+                        return;
                     }
-                    installed_version = newest;
                     sent_initial = true;
                     continue;
                 }
@@ -95,6 +93,28 @@ impl TopologyService for TopologyServiceImpl {
     }
 }
 
+async fn send_topology_messages(
+    sender: &mpsc::Sender<Result<TopologyMessage, Status>>,
+    messages: Vec<TopologyMessage>,
+    installed_version: &mut u64,
+) -> bool {
+    let mut sent_version = *installed_version;
+    for message in messages {
+        sent_version = match message.message.as_ref() {
+            Some(topology_message::Message::Snapshot(part)) => part.topology_version,
+            Some(topology_message::Message::Update(part)) => part.topology_version,
+            None => sent_version,
+        };
+        if sender.send(Ok(message)).await.is_err() {
+            return false;
+        }
+    }
+    // The message read can include revisions published after the version read.
+    // Commit its actual final version only after the entire batch is sent.
+    *installed_version = sent_version;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -105,7 +125,13 @@ mod tests {
     use super::*;
     use crate::{
         controller::service::instance::ResolvedDefaultInstance,
-        proto::ek::control::v2::topology_message,
+        proto::ek::{
+            control::v2::{
+                ExpertState, ExpertStateKind, RegisterWorkerRequest, TargetExpert, WorkerDevice,
+                WorkerRunState, WorkerTransportType, topology_message,
+            },
+            worker::v2::ActivationDType,
+        },
     };
 
     struct FakeInstanceResolver;
@@ -131,6 +157,133 @@ mod tests {
 
     fn instance_resolver() -> Arc<dyn DefaultInstanceResolver> {
         Arc::new(FakeInstanceResolver)
+    }
+
+    #[tokio::test]
+    async fn topology_cursor_tracks_the_batch_read_after_a_new_revision() {
+        for installed in [1, 0] {
+            let state = ControllerRuntimeState::new(8);
+            state
+                .register(RegisterWorkerRequest {
+                    worker_id: "worker".to_owned(),
+                    start_id: "start".to_owned(),
+                    instance_id: 7,
+                    computation_endpoint: "127.0.0.1:50051".to_owned(),
+                    peer_weight_endpoint: "http://127.0.0.1:50052".to_owned(),
+                    backend: "torch".to_owned(),
+                    activation_dtype: ActivationDType::ActivationDtypeBf16 as i32,
+                    device: Some(WorkerDevice {
+                        device: "cuda:0".to_owned(),
+                        max_experts: 256,
+                    }),
+                    max_batch_tokens: 4096,
+                    max_active_batches_per_device: 2,
+                    max_pending_batches_per_device: 2,
+                    transport_type: WorkerTransportType::WorkerTransportGrpc as i32,
+                })
+                .await
+                .unwrap();
+            let lease = state.open_heartbeat("worker", "start").await.unwrap();
+            state
+                .heartbeat(
+                    "worker",
+                    "start",
+                    lease,
+                    1,
+                    WorkerRunState::WorkerRunning as i32,
+                )
+                .await
+                .unwrap();
+            let placement = state
+                .set_targets(
+                    "worker",
+                    "start",
+                    (0..66)
+                        .map(|expert_id| TargetExpert {
+                            layer_id: 1,
+                            expert_id,
+                            target_device: "cuda:0".to_owned(),
+                            peer_weight_endpoints: vec![],
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            let ready = |expert_id| ExpertState {
+                layer_id: 1,
+                expert_id,
+                state: ExpertStateKind::ExpertReady as i32,
+                failure: None,
+            };
+            state
+                .apply_state_report(
+                    "worker",
+                    "start",
+                    placement.generation,
+                    1,
+                    true,
+                    vec![ready(0)],
+                )
+                .await
+                .unwrap();
+            let observed_version = state.topology_version(7).await;
+            assert_eq!(observed_version, 1);
+            // Advance real state between the watch loop's two independent reads.
+            state
+                .apply_state_report(
+                    "worker",
+                    "start",
+                    placement.generation,
+                    2,
+                    false,
+                    (1..66).map(ready).collect(),
+                )
+                .await
+                .unwrap();
+            let messages = state.topology_messages(7, installed).await.unwrap();
+            assert_eq!(messages.len(), 2);
+            let (sender, mut receiver) = mpsc::channel(1);
+            let mut incomplete_version = installed;
+            let (sent, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    send_topology_messages(&sender, messages.clone(), &mut incomplete_version),
+                    async {
+                        receiver.recv().await.unwrap().unwrap();
+                        receiver.close();
+                    }
+                )
+            })
+            .await
+            .unwrap();
+            assert!(!sent);
+            assert_eq!(incomplete_version, installed);
+            let (sender, mut receiver) = mpsc::channel(TOPOLOGY_STREAM_BUFFER);
+            let mut installed_version = installed;
+            assert!(send_topology_messages(&sender, messages, &mut installed_version).await);
+            assert_eq!(installed_version, 2);
+            assert!(
+                state
+                    .topology_messages(7, installed_version)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            for part_index in 0..2 {
+                let message = receiver.try_recv().unwrap().unwrap();
+                let (version, index, count) = match message.message.unwrap() {
+                    topology_message::Message::Snapshot(part) => {
+                        assert_eq!(installed, 0);
+                        (part.topology_version, part.part_index, part.part_count)
+                    }
+                    topology_message::Message::Update(part) => {
+                        assert_eq!(installed, 1);
+                        assert_eq!(part.previous_version, 1);
+                        (part.topology_version, part.part_index, part.part_count)
+                    }
+                };
+                assert_eq!((version, index, count), (2, part_index, 2));
+            }
+        }
     }
 
     #[tokio::test]
