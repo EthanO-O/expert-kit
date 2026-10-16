@@ -24,8 +24,8 @@ worker:
 {% if ascend_decode_graph %}
   ascend_decode_graph: {{ ascend_decode_graph | tojson }}
 {% endif %}
-  backend: torch
-  device: {{ "npu:0" if ascend_decode_graph else worker.device_name }}
+  backend: {{ pool.backend }}
+  device: {{ worker.device_name }}
   max_batch_tokens: {{ expert.runtime.max_batch_tokens }}
   max_active_batches_per_device: {{ expert.runtime.max_active_batches_per_device }}
   device_memory_limit: {{ expert.runtime.device_memory_limit }}

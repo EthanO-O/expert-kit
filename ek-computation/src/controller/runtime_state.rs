@@ -1059,7 +1059,7 @@ fn validate_registration(registration: &RegisterWorkerRequest) -> Result<(), Con
             "identity, instance, and backend are required",
         ));
     }
-    if !matches!(registration.backend.as_str(), "torch" | "ggml" | "fused") {
+    if !matches!(registration.backend.as_str(), "torch" | "ggml" | "fused" | "ascend_fused" ) {
         return Err(ControllerStateError::InvalidRegistration(
             "backend is not supported",
         ));

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 import yaml
+from expertkit_worker.config import BackendName
 from pydantic import Field, computed_field, model_validator
 
 from .config import ConfigModel
@@ -168,6 +169,7 @@ class PoolConfig(ConfigModel):
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
     )
     node: str
+    backend: BackendName
     devices: list[int]
     start_worker_port: int
     start_peer_port: int
