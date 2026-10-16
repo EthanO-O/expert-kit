@@ -105,6 +105,59 @@ def test_torch_backend_accepts_indexed_npu_device(tmp_path: Path) -> None:
     assert config.worker.device == "npu:0"
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (None, None),
+        ("num_layers", 2),
+        ("experts_per_layer", 5),
+        ("hidden_dim", 32),
+        ("expert_intermediate_dim", 64),
+        ("top_k", 3),
+        ("activation_dtype", "fp16"),
+        ("weight_dtype", "fp16"),
+        ("expert_compute", "deepseek_v4"),
+        ("swiglu_limit", 1.0),
+        (
+            "quantization",
+            {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": True},
+        ),
+    ],
+)
+def test_graph_worker_checks_complete_shared_model(tmp_path, field, value):
+    raw = _config(tmp_path, backend="torch", device="npu:0")
+    raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
+    shared_model = {
+        key: value
+        for key, value in raw["model"].items()
+        if key not in {"instance_id", "name", "weight_version"}
+    }
+    shared_model.update(
+        activation="silu", expert_compute="swiglu", swiglu_limit=0.0, quantization=None
+    )
+    raw["worker"].update(
+        max_active_batches_per_device=1,
+        ascend_decode_graph={
+            "session_id": "worker-graph-model-0061",
+            "instance_id": 1,
+            "weight_version": "v1",
+            "worker_id": "worker-0",
+            "control_endpoint": "127.0.0.1:18079",
+            "rendezvous_host": "127.0.0.1",
+            "rendezvous_port": 18080,
+            "layer_ids": [0],
+            "capture_sizes": [1],
+            "model": shared_model,
+        },
+    )
+    if field is None:
+        assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph is not None
+    else:
+        raw["model"][field] = value
+        with pytest.raises(ValidationError):
+            WorkerConfig.model_validate(raw)
+
+
 @pytest.mark.parametrize("device", ["npu", "npu:x", "cuda", "cuda:x"])
 def test_torch_backend_rejects_unindexed_or_invalid_accelerator(
     tmp_path: Path,

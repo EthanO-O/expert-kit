@@ -16,6 +16,7 @@ import structlog
 import torch
 from expertkit_transport.ascend_graph import AscendGraphConfig, GraphStepControl, HcclGraphSession
 from expertkit_transport.quarantine import retain_until_process_exit
+from expertkit_transport.transports.ascend_graph.config import AscendGraphModel
 
 logger = structlog.get_logger(__name__)
 _ACTIVE: ContextVar[DecodeGraphSession | None] = ContextVar("ek_decode_graph_session", default=None)
@@ -57,23 +58,57 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
         raise ValueError(
             "Ascend Decode graphs require the qualified vLLM 0.30/Torch-NPU 2.10 stack"
         )
-    expected = {
-        "model_type": "deepseek_v2",
-        "num_hidden_layers": 27,
-        "first_k_dense_replace": 1,
-        "hidden_size": 2048,
-        "moe_intermediate_size": 1408,
-        "n_routed_experts": 64,
-        "num_experts_per_tok": 6,
-        "n_shared_experts": 2,
-        "scoring_func": "softmax",
-        "norm_topk_prob": False,
-        "routed_scaling_factor": 1.0,
-    }
+    if hf.model_type == "deepseek_v2":
+        expected = {
+            "num_hidden_layers": 27,
+            "first_k_dense_replace": 1,
+            "hidden_size": 2048,
+            "moe_intermediate_size": 1408,
+            "n_routed_experts": 64,
+            "num_experts_per_tok": 6,
+            "n_shared_experts": 2,
+            "scoring_func": "softmax",
+            "norm_topk_prob": False,
+            "routed_scaling_factor": 1.0,
+        }
+        experts_per_layer = hf.n_routed_experts
+        routed_layers = tuple(range(1, hf.num_hidden_layers))
+    elif hf.model_type == "qwen3_moe":
+        expected = {
+            "num_hidden_layers": 48,
+            "hidden_size": 2048,
+            "moe_intermediate_size": 768,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "decoder_sparse_step": 1,
+            "norm_topk_prob": True,
+            "mlp_only_layers": [],
+        }
+        if getattr(hf, "shared_expert_intermediate_size", 0) != 0:
+            raise ValueError("Qwen3 graph shared experts do not match the qualified model")
+        experts_per_layer = hf.num_experts
+        routed_layers = tuple(range(hf.num_hidden_layers))
+    else:
+        raise ValueError("Ascend Decode graph model is not qualified")
     if any(getattr(hf, name, None) != value for name, value in expected.items()):
-        raise ValueError("Ascend Decode graph model does not match DeepSeek-V2-Lite BF16")
-    if config.layer_ids != tuple(range(1, 27)):
-        raise ValueError("DeepSeek-V2-Lite graph requires all routed layers 1..26")
+        raise ValueError("Ascend Decode graph model does not match qualified BF16 semantics")
+    native_model = AscendGraphModel(
+        num_layers=hf.num_hidden_layers,
+        experts_per_layer=experts_per_layer,
+        hidden_dim=hf.hidden_size,
+        expert_intermediate_dim=hf.moe_intermediate_size,
+        top_k=hf.num_experts_per_tok,
+        activation_dtype="bf16",
+        weight_dtype="bf16",
+        activation=hf.hidden_act,
+        expert_compute="swiglu",
+        swiglu_limit=0.0,
+        quantization=None,
+    )
+    if config.model != native_model:
+        raise ValueError("Ascend graph model declaration does not match the native Frontend model")
+    if config.layer_ids != routed_layers:
+        raise ValueError("Ascend graph requires every routed model layer in native order")
     if (
         parallel.tensor_parallel_size != 1
         or parallel.data_parallel_size != 1
@@ -120,7 +155,13 @@ class DecodeGraphSession:
         self._watchdog.start()
         try:
             self._begin("prepare")
-            self._data = HcclGraphSession(config, rank=0, device=device, hidden_dim=2048, top_k=6)
+            self._data = HcclGraphSession(
+                config,
+                rank=0,
+                device=device,
+                hidden_dim=config.model.hidden_dim,
+                top_k=config.model.top_k,
+            )
             for capacity in config.capture_sizes:
                 self._data.buffers(capacity)
             torch.npu.current_stream().synchronize()
@@ -162,8 +203,8 @@ class DecodeGraphSession:
         if (
             self._layer_index >= len(self.config.layer_ids)
             or layer_id != self.config.layer_ids[self._layer_index]
-            or hidden.shape != (self._capacity, 2048)
-            or ids.shape != (self._capacity, 6)
+            or hidden.shape != (self._capacity, self.config.model.hidden_dim)
+            or ids.shape != (self._capacity, self.config.model.top_k)
             or routing.shape != ids.shape
             or hidden.dtype != torch.bfloat16
             or ids.dtype != torch.int32

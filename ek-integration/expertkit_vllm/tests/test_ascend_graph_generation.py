@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parents[3]
 ASCEND = ROOT / "dev/ascend"
@@ -66,6 +67,19 @@ def _generate(tmp_path, cluster, experiment):
         text=True,
         capture_output=True,
         timeout=30,
+    )
+
+
+def test_graph_generation_reports_missing_model_as_validation_error(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ASCEND))
+    from schemas.experiment import ExperimentConfig
+
+    _, experiment = _inputs(tmp_path)
+    del experiment["model"]
+    with pytest.raises(ValidationError) as error:
+        ExperimentConfig.model_validate(experiment)
+    assert any(
+        row["loc"] == ("model",) and row["type"] == "missing" for row in error.value.errors()
     )
 
 
@@ -188,6 +202,63 @@ def test_two_worker_generation_shares_rank_manifest_and_checks_all_ports(tmp_pat
     rejected = _generate(other, cluster, experiment)
     assert rejected.returncode != 0
     assert not (other / "generated").exists()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_qwen_generation_derives_model_before_expert_interval_validation(tmp_path, explicit):
+    cluster, experiment = _inputs(tmp_path)
+    experiment["model"].update(
+        name="Qwen3-30B-A3B-Instruct-2507",
+        num_layers=48,
+        experts_per_layer=128,
+        intermediate_dim=768,
+        topk=8,
+    )
+    cluster["pools"][0]["devices"] = [1, 2]
+    graph = experiment["ascend_decode_graph"]
+    del graph["worker_id"], graph["control_endpoint"]
+    graph["layer_ids"] = list(range(48))
+    graph["rendezvous_port"] = 18081
+    graph["workers"] = [
+        {
+            "worker_id": f"worker-pool1-worker-{index:02d}",
+            "control_endpoint": f"192.0.2.10:{18079 + index}",
+            "expert_start": index * 64,
+            "expert_end": (index + 1) * 64,
+        }
+        for index in range(2)
+    ]
+    declaration = {
+        "num_layers": 48,
+        "experts_per_layer": 128,
+        "hidden_dim": 2048,
+        "expert_intermediate_dim": 768,
+        "top_k": 8,
+        "activation_dtype": "bf16",
+        "weight_dtype": "bf16",
+        "activation": "silu",
+        "expert_compute": "swiglu",
+        "swiglu_limit": 0.0,
+        "quantization": None,
+    }
+    if explicit:
+        graph["model"] = declaration.copy()
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    shared = json.loads((tmp_path / "generated/ascend-decode-graph.json").read_text())
+    assert shared["model"] == declaration
+    for index in range(2):
+        worker = yaml.safe_load(
+            (tmp_path / f"generated/worker-pool1/workers/worker-{index:02d}.yaml").read_text()
+        )
+        assert worker["worker"]["ascend_decode_graph"] == shared
+        assert worker["model"]["top_k"] == 8
+    conflicting = tmp_path / "conflicting"
+    conflicting.mkdir()
+    graph["model"] = {**declaration, "hidden_dim": 4096}
+    rejected = _generate(conflicting, cluster, experiment)
+    assert rejected.returncode != 0
+    assert "model declaration" in rejected.stderr
 
 
 @pytest.mark.parametrize("case", ["duplicate-workers", "multiple-pools"])

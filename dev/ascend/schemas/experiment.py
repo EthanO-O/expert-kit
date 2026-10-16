@@ -3,11 +3,15 @@
 from __future__ import annotations
 import yaml
 from typing import Self
+from typing import Any
 from pathlib import Path
 from pydantic import AnyHttpUrl, Field, model_validator
 
 from enum import StrEnum
-from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.transports.ascend_graph.config import (
+    AscendGraphConfig,
+    AscendGraphModel,
+)
 
 from .config import ConfigModel
 
@@ -61,6 +65,21 @@ class ExperimentConfig(ConfigModel):
     tracing: TracingConfig = Field(default_factory=TracingConfig)
     ascend_decode_graph: AscendGraphConfig | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def derive_graph_model(cls, data: Any) -> Any:
+        """Fill an omitted shared model before validating its expert intervals."""
+        if not isinstance(data, dict):
+            return data
+        graph = data.get("ascend_decode_graph")
+        if isinstance(graph, dict) and "model" not in graph and "model" in data:
+            model = ModelConfig.model_validate(data["model"])
+            return {
+                **data,
+                "ascend_decode_graph": {**graph, "model": model.graph_model()},
+            }
+        return data
+
     @classmethod
     def from_yaml(cls, file: Path) -> Self:
         data = yaml.safe_load(file.read_text())
@@ -92,6 +111,22 @@ class ModelConfig(ConfigModel):
     topk: int
     weight_dtype: Dtype
     activation_dtype: Dtype
+
+    def graph_model(self) -> AscendGraphModel:
+        """Map existing deployment geometry to the shared BF16 computation contract."""
+        return AscendGraphModel(
+            num_layers=self.num_layers,
+            experts_per_layer=self.experts_per_layer,
+            hidden_dim=self.hidden_dim,
+            expert_intermediate_dim=self.intermediate_dim,
+            top_k=self.topk,
+            activation_dtype=str(self.activation_dtype),
+            weight_dtype=str(self.weight_dtype),
+            activation="silu",
+            expert_compute="swiglu",
+            swiglu_limit=0.0,
+            quantization=None,
+        )
 
 
 class DatasetConfig(ConfigModel):

@@ -450,6 +450,11 @@ class WorkerConfig(_StrictModel):
                 raise ValueError("Ascend graph model instance does not match the Worker")
             if graph.layer_ids[-1] >= self.model.num_layers:
                 raise ValueError("Ascend graph layer IDs exceed the configured model")
+            worker_model = self.model.model_dump(
+                mode="json", include=set(type(graph.model).model_fields)
+            )
+            if graph.model.model_dump(mode="json") != worker_model:
+                raise ValueError("Ascend graph model declaration does not match the Worker model")
             if graph.capture_sizes[-1] > self.worker.max_batch_tokens:
                 raise ValueError("Ascend graph capacity exceeds worker.max_batch_tokens")
         return self

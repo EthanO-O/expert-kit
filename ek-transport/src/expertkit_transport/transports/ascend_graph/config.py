@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
@@ -16,6 +17,60 @@ def _validate_endpoint(endpoint: str) -> None:
         raise ValueError("graph addresses must be hostnames without a URL scheme or whitespace")
 
 
+class AscendGraphQuantization(BaseModel):
+    """Declare the physical ModelSlim format independently of computation dtype."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    type: Literal["modelslim-w8a8-dynamic"]
+    bits: Literal[8]
+    group_size: None
+    symmetric: Literal[True]
+
+
+class AscendGraphModel(BaseModel):
+    """Fix geometry and expert computation semantics shared by every rank."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    num_layers: int = Field(gt=0)
+    experts_per_layer: int = Field(gt=0)
+    hidden_dim: int = Field(gt=0)
+    expert_intermediate_dim: int = Field(gt=0)
+    top_k: int = Field(gt=0)
+    activation_dtype: Literal["bf16"]
+    weight_dtype: Literal["bf16"]
+    activation: Literal["silu"]
+    expert_compute: Literal["swiglu", "deepseek_v4"]
+    swiglu_limit: float = Field(ge=0, allow_inf_nan=False)
+    quantization: AscendGraphQuantization | None
+
+    @model_validator(mode="after")
+    def validate_computation(self) -> AscendGraphModel:
+        """Reject impossible routing or inconsistent activation declarations."""
+        if self.top_k > self.experts_per_layer:
+            raise ValueError("graph top_k cannot exceed experts_per_layer")
+        if self.expert_compute == "swiglu" and self.swiglu_limit != 0:
+            raise ValueError("graph swiglu_limit requires deepseek_v4 computation")
+        return self
+
+
+def _legacy_v2_model() -> AscendGraphModel:
+    return AscendGraphModel(
+        num_layers=27,
+        experts_per_layer=64,
+        hidden_dim=2048,
+        expert_intermediate_dim=1408,
+        top_k=6,
+        activation_dtype="bf16",
+        weight_dtype="bf16",
+        activation="silu",
+        expert_compute="swiglu",
+        swiglu_limit=0.0,
+        quantization=None,
+    )
+
+
 class AscendGraphWorker(BaseModel):
     """Identify one fixed Worker and its contiguous global expert interval."""
 
@@ -23,8 +78,8 @@ class AscendGraphWorker(BaseModel):
 
     worker_id: str = Field(min_length=1, max_length=128)
     control_endpoint: str = Field(min_length=3, max_length=256)
-    expert_start: int = Field(ge=0, lt=64)
-    expert_end: int = Field(gt=0, le=64)
+    expert_start: int = Field(ge=0)
+    expert_end: int = Field(gt=0)
 
     @model_validator(mode="after")
     def validate_worker(self) -> AscendGraphWorker:
@@ -48,6 +103,7 @@ class AscendGraphConfig(BaseModel):
     instance_id: int = Field(gt=0)
     worker_id: str | None = Field(default=None, min_length=1, max_length=128)
     weight_version: str = Field(min_length=1, max_length=256)
+    model: AscendGraphModel = Field(default_factory=_legacy_v2_model)
     control_endpoint: str | None = Field(default=None, min_length=3, max_length=256)
     workers: tuple[AscendGraphWorker, ...] = Field(default=(), strict=False)
     rendezvous_host: str = Field(min_length=1, max_length=253)
@@ -75,15 +131,20 @@ class AscendGraphConfig(BaseModel):
         elif self.worker_id is None or self.control_endpoint is None:
             raise ValueError("provide workers or both legacy Worker fields")
         participants = self.participants
-        expected = ((0, 64),) if len(participants) == 1 else ((0, 32), (32, 64))
+        boundaries = [0, *(worker.expert_end for worker in participants)]
         if (
             len(participants) not in (1, 2)
-            or tuple((worker.expert_start, worker.expert_end) for worker in participants)
-            != expected
+            or boundaries[-1] != self.model.experts_per_layer
+            or any(
+                worker.expert_start != start
+                for worker, start in zip(participants, boundaries[:-1], strict=True)
+            )
         ):
             raise ValueError(
-                "graph Workers must partition all 64 experts into one or two fixed intervals"
+                "graph Workers must partition all model experts into one or two fixed intervals"
             )
+        if self.layer_ids[-1] >= self.model.num_layers:
+            raise ValueError("graph layer IDs exceed model.num_layers")
         if len({worker.worker_id for worker in participants}) != len(participants):
             raise ValueError("graph Worker IDs must be distinct")
         if len({worker.control_endpoint for worker in participants}) != len(participants):
@@ -108,7 +169,7 @@ class AscendGraphConfig(BaseModel):
                 worker_id=self.worker_id,
                 control_endpoint=self.control_endpoint,
                 expert_start=0,
-                expert_end=64,
+                expert_end=self.model.experts_per_layer,
             ),
         )
 

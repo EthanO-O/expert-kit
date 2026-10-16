@@ -154,7 +154,7 @@ class TemplateContext(BaseModel):
 
     @model_validator(mode="after")
     def validate_decode_graph(self) -> Self:
-        """Restrict graph deployment to fixed resident DeepSeek BF16 on one host."""
+        """Restrict graph deployment to fixed resident BF16 experts on one host."""
         graph = self.ascend_decode_graph
         if graph is None:
             return self
@@ -175,21 +175,28 @@ class TemplateContext(BaseModel):
                 "ascend_decode_graph requires a distinct physical device for every role"
             )
         model = self.model.config
-        if (
+        if graph.model != model.graph_model():
+            raise ValueError(
+                "ascend_decode_graph model declaration must match model configuration"
+            )
+        geometry = (
             model.num_layers,
             model.experts_per_layer,
             model.hidden_dim,
             model.intermediate_dim,
             model.topk,
-            str(model.weight_dtype),
-            str(model.activation_dtype),
-        ) != (27, 64, 2048, 1408, 6, "bf16", "bf16"):
+        )
+        if geometry == (27, 64, 2048, 1408, 6):
+            routed_layers = tuple(range(1, 27))
+        elif geometry == (48, 128, 2048, 768, 8):
+            routed_layers = tuple(range(48))
+        else:
             raise ValueError(
-                "ascend_decode_graph requires DeepSeek-V2-Lite BF16 geometry"
+                "ascend_decode_graph requires qualified V2-Lite or Qwen3 BF16 geometry"
             )
-        if graph.layer_ids != tuple(range(1, 27)):
+        if graph.layer_ids != routed_layers:
             raise ValueError(
-                "ascend_decode_graph requires routed layers 1..26; layer 0 is dense"
+                "ascend_decode_graph layer order must match all routed model layers"
             )
         generated_workers = {
             f"{pool.config.id}-{worker.id}": pool

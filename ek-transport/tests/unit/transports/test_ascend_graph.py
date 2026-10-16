@@ -157,6 +157,108 @@ def test_canonical_participants_preserve_legacy_identity_and_reject_partial_owne
         AscendGraphConfig.model_validate({**two.model_dump(), "worker_id": "legacy"})
 
 
+def test_shared_model_normalizes_legacy_json_and_covers_qwen_intervals():
+    legacy = config_for()
+    assert legacy.model.model_dump() == {
+        "num_layers": 27,
+        "experts_per_layer": 64,
+        "hidden_dim": 2048,
+        "expert_intermediate_dim": 1408,
+        "top_k": 6,
+        "activation_dtype": "bf16",
+        "weight_dtype": "bf16",
+        "activation": "silu",
+        "expert_compute": "swiglu",
+        "swiglu_limit": 0.0,
+        "quantization": None,
+    }
+    assert (
+        AscendGraphConfig.model_validate_json(legacy.model_dump_json()).identity()
+        == legacy.identity()
+    )
+    two = two_worker_config()
+    old = two.model_dump(exclude={"model"})
+    assert AscendGraphConfig.model_validate(old).identity() == two.identity()
+    qwen = two.model_dump()
+    qwen["model"].update(num_layers=48, experts_per_layer=128, expert_intermediate_dim=768, top_k=8)
+    qwen["layer_ids"] = list(range(48))
+    for index, worker in enumerate(qwen["workers"]):
+        worker.update(expert_start=index * 64, expert_end=(index + 1) * 64)
+    parsed = AscendGraphConfig.model_validate(qwen)
+    assert parsed.participants[1].expert_end == 128
+    assert parsed.identity()["model"] == parsed.model.model_dump(mode="json")
+    qwen["workers"][1]["expert_end"] = 129
+    with pytest.raises(ValidationError, match="partition"):
+        AscendGraphConfig.model_validate(qwen)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"num_layers": 28},
+        {"hidden_dim": 4096},
+        {"expert_intermediate_dim": 768},
+        {"top_k": 8},
+        {"expert_compute": "deepseek_v4", "swiglu_limit": 7.0},
+        {
+            "quantization": {
+                "type": "modelslim-w8a8-dynamic",
+                "bits": 8,
+                "group_size": None,
+                "symmetric": True,
+            }
+        },
+    ],
+)
+def test_model_computation_fields_change_group_identity(update):
+    original = config_for()
+    model = {**original.model.model_dump(), **update}
+    changed = config_for(model=model)
+    assert changed.identity() != original.identity()
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"hidden_dim": True},
+        {"top_k": 65},
+        {"activation_dtype": "fp16"},
+        {"weight_dtype": "int8"},
+        {"activation": "gelu"},
+        {"swiglu_limit": 1.0},
+        {
+            "quantization": {
+                "type": "modelslim-w8a8-dynamic",
+                "bits": 4,
+                "group_size": None,
+                "symmetric": True,
+            }
+        },
+    ],
+)
+def test_shared_model_rejects_invalid_computation(update):
+    with pytest.raises(ValidationError):
+        config_for(model={**config_for().model.model_dump(), **update})
+
+
+def test_explicit_model_is_complete_and_layers_are_bounded():
+    with pytest.raises(ValidationError):
+        config_for(model={"hidden_dim": 2048})
+    with pytest.raises(ValidationError, match=r"model.num_layers"):
+        config_for(layer_ids=[27])
+
+
+def test_buffer_geometry_conflict_fails_before_process_group_creation():
+    from types import SimpleNamespace
+
+    from expertkit_transport.transports.ascend_graph.session import HcclGraphSession
+
+    with pytest.raises(ValueError, match="buffer geometry"):
+        HcclGraphSession(
+            config_for(), rank=0, device=SimpleNamespace(type="npu"), hidden_dim=1, top_k=6
+        )
+
+
 def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_ownership():
     begin_barrier = threading.Barrier(2, timeout=2)
     finish_arrived = [threading.Event(), threading.Event()]

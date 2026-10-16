@@ -257,7 +257,8 @@ def test_partial_native_submission_poisoned_without_fallback(graph_runtime):
 
 
 @pytest.mark.parametrize("max_sequences", [32, 64, 128])
-def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequences):
+@pytest.mark.parametrize("model_kind", ["v2", "qwen"])
+def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequences, model_kind):
     monkeypatch.setattr(
         graph,
         "version",
@@ -292,7 +293,32 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
         scoring_func="softmax",
         norm_topk_prob=False,
         routed_scaling_factor=1.0,
+        hidden_act="silu",
     )
+    if model_kind == "qwen":
+        hf = SimpleNamespace(
+            model_type="qwen3_moe",
+            num_hidden_layers=48,
+            hidden_size=2048,
+            moe_intermediate_size=768,
+            num_experts=128,
+            num_experts_per_tok=8,
+            decoder_sparse_step=1,
+            norm_topk_prob=True,
+            mlp_only_layers=[],
+            hidden_act="silu",
+        )
+        declaration = config.model.model_dump()
+        declaration.update(
+            num_layers=48, experts_per_layer=128, expert_intermediate_dim=768, top_k=8
+        )
+        config = AscendGraphConfig.model_validate(
+            {
+                **config.model_dump(),
+                "model": declaration,
+                "layer_ids": list(range(48)),
+            }
+        )
     runtime = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=hf, enforce_eager=False, dtype=torch.bfloat16, quantization=None
@@ -317,3 +343,59 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
             graph.validate_graph_model(runtime, config)
     else:
         graph.validate_graph_model(runtime, config)
+        for field, value in (("hidden_dim", 4096), ("top_k", 1), ("num_layers", 49)):
+            declaration = config.model.model_dump()
+            declaration[field] = value
+            conflicting = AscendGraphConfig.model_validate(
+                {**config.model_dump(), "model": declaration}
+            )
+            with pytest.raises(ValueError, match="declaration does not match"):
+                graph.validate_graph_model(runtime, conflicting)
+        declaration = config.model.model_dump()
+        declaration["quantization"] = {
+            "type": "modelslim-w8a8-dynamic",
+            "bits": 8,
+            "group_size": None,
+            "symmetric": True,
+        }
+        conflicting = AscendGraphConfig.model_validate(
+            {**config.model_dump(), "model": declaration}
+        )
+        with pytest.raises(ValueError, match="declaration does not match"):
+            graph.validate_graph_model(runtime, conflicting)
+
+
+def test_exchange_uses_shared_hidden_and_top_k_without_device_reads():
+    config = AscendGraphConfig(
+        session_id="frontend-buffer-0061",
+        instance_id=1,
+        worker_id="worker",
+        weight_version="version",
+        control_endpoint="127.0.0.1:18079",
+        rendezvous_host="127.0.0.1",
+        rendezvous_port=18080,
+        layer_ids=(0,),
+        model={
+            "num_layers": 48,
+            "experts_per_layer": 128,
+            "hidden_dim": 16,
+            "expert_intermediate_dim": 768,
+            "top_k": 8,
+            "activation_dtype": "bf16",
+            "weight_dtype": "bf16",
+            "activation": "silu",
+            "expert_compute": "swiglu",
+            "swiglu_limit": 0.0,
+            "quantization": None,
+        },
+    )
+    session = graph.DecodeGraphSession.__new__(graph.DecodeGraphSession)
+    session.config, session._poisoned, session._layer_index, session._capacity = config, False, 0, 4
+    session._data = SimpleNamespace(exchange=lambda hidden, *_: hidden)
+    hidden = torch.zeros(4, 16, dtype=torch.bfloat16)
+    ids = torch.zeros(4, 8, dtype=torch.int32)
+    routing = torch.zeros(4, 8, dtype=torch.float32)
+    assert session.exchange(0, hidden, ids, routing) is hidden
+    session._layer_index = 0
+    with pytest.raises(ValueError, match="Tensor contract"):
+        session.exchange(0, hidden, ids[:, :6], routing[:, :6])

@@ -38,6 +38,8 @@ class HcclGraphSession:
         world_size = len(config.participants) + 1
         if not 0 <= rank < world_size or device.type != "npu":
             raise ValueError("Ascend graph session requires a configured rank and an indexed NPU")
+        if (hidden_dim, top_k) != (config.model.hidden_dim, config.model.top_k):
+            raise ValueError("Ascend graph buffer geometry does not match the shared model")
         self.config = config
         self.rank = rank
         self.device = device
