@@ -210,6 +210,23 @@ filesystem and are marked separately.
 
 ## Quantized routed experts
 
+### Ascend ModelSlim resident Decode graphs
+
+The ModelSlim Qwen resident path is enabled explicitly through
+`worker.ascend_decode_graph` with the `modelslim-w8a8-dynamic` recipe. Its fused
+ordered reduction requires the optional Triton-Ascend package with an Ascend
+backend. Install a build compatible with the existing torch-npu and CANN stack
+before enabling this path; the Worker does not install or upgrade it at startup.
+The qualified stack used torch 2.10.0, torch-npu 2.10.0.post4, CANN 9.1.0, and
+triton-ascend 3.2.2 (Triton module version 3.5.0).
+
+Missing Triton or its Ascend backend causes an explicit startup error for this
+path. Kernel compilation and warmup happen before graph capture; failures retain
+the resident weights in quarantine until process exit. Ordinary ModelSlim
+execution, BF16 resident graphs, and CPU/CUDA imports do not load these kernels.
+
+### Checkpoint recipes
+
 Weight Server reads checkpoint `config.json` and publishes the **routed expert**
 recipe through `/meta/model/{model}`. The Worker selects an adapter at startup and
 validates the tensors against that recipe. Original V4 declares global FP8 but

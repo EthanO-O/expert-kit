@@ -14,6 +14,7 @@ from collections.abc import Callable, Sequence
 from typing import Protocol, cast
 
 import torch
+from torch.nn import functional
 
 from expertkit_worker.backends.torch.decode_graph import (
     ExpertGraphOperators,
@@ -63,6 +64,8 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
             ReadyWeightLease[TorchModelSlimW8A8Weights], list[torch.Tensor]
         ] = {}
         self._scale_temporaries: list[torch.Tensor] = []
+        self._combine_temporaries: list[torch.Tensor] = []
+        self._ordered_combine: Callable[..., None] | None = None
         super().__init__(
             layer_ids=layer_ids,
             experts_per_layer=experts_per_layer,
@@ -93,6 +96,22 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         except BaseException:
             self.close(wait_for_completion=lambda: None)
             raise
+        if (
+            self._device is not None
+            and self._device.type == "npu"
+            and operators is None
+            and experts_per_layer == 128
+            and hidden_dim == 2048
+            and intermediate_dim == 768
+            and top_k == 8
+            and expert_compute == "swiglu"
+            and expert_range in ((0, 64), (64, 128))
+        ):
+            try:
+                self._prepare_ordered_combine()
+            except BaseException:
+                self.quarantine()
+                raise
 
     def compute(
         self,
@@ -107,6 +126,14 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         FP32 destinations carry BF16-rounded partial sums for transport. Local
         FP32 accumulation follows expert order before this output boundary.
         """
+        if self._closed or self._quarantined:
+            raise RuntimeError("resident graph weights are closed or quarantined")
+        if self._ordered_combine is not None:
+            self._validate_inputs(hidden_states, expert_ids, routing_weights, prepared_output)
+            self._compute_qwen(
+                layer_id, hidden_states, expert_ids, routing_weights, prepared_output
+            )
+            return
         if prepared_output.dtype == torch.bfloat16:
             super().compute(layer_id, hidden_states, expert_ids, routing_weights, prepared_output)
             return
@@ -114,6 +141,101 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         local_output = torch.empty_like(hidden_states)
         super().compute(layer_id, hidden_states, expert_ids, routing_weights, local_output)
         prepared_output.copy_(local_output)
+
+    def _prepare_ordered_combine(self) -> None:
+        """Compile both destination dtypes before capture, retaining failed work."""
+        try:
+            from triton.backends import backends
+        except ModuleNotFoundError as error:
+            if error.name not in ("triton", "triton.backends"):
+                raise
+            raise RuntimeError(
+                "ModelSlim ascend_decode_graph requires Triton-Ascend with the Ascend "
+                "backend; install a build compatible with the torch-npu/CANN stack"
+            ) from error
+        if "ascend" not in backends:
+            raise RuntimeError(
+                "ModelSlim ascend_decode_graph requires Triton-Ascend with the Ascend "
+                "backend; the installed Triton has no Ascend backend"
+            )
+        from expertkit_worker.backends.torch.ascend_moe_ops import ordered_combine
+
+        def allocate(shape: tuple[int, ...], dtype: torch.dtype, fill: int) -> torch.Tensor:
+            tensor = torch.empty(shape, dtype=dtype, device=self._device)
+            self._combine_temporaries.append(tensor)
+            tensor.fill_(fill)
+            return tensor
+
+        down = allocate((8, self._hidden_dim), torch.bfloat16, 0)
+        ids = allocate((1, 8), torch.int32, self._expert_start)
+        routing = allocate((1, 8), torch.float32, 1)
+        inverse = allocate((8,), torch.int32, 0)
+        inverse.copy_(torch.arange(8, dtype=torch.int32))
+        offset = allocate((), torch.int64, 0)
+        count = allocate((), torch.int64, 8)
+        for dtype in (torch.bfloat16, torch.float32):
+            output = allocate((1, self._hidden_dim), dtype, 0)
+            ordered_combine(
+                down,
+                ids,
+                routing,
+                inverse,
+                offset,
+                count,
+                output,
+                expert_start=self._expert_start,
+                expert_end=self._expert_end,
+            )
+        torch.npu.synchronize(self._device)
+        self._combine_temporaries.clear()
+        self._ordered_combine = ordered_combine
+
+    def _compute_qwen(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Keep the three projections and write one expert-ordered local sum."""
+        operators = self._operators
+        assert operators is not None and self._ordered_combine is not None
+        capacity = hidden_states.shape[0] * self._top_k
+        packed, inverse, counts, _ = operators.npu_moe_init_routing_v2(
+            hidden_states,
+            expert_ids,
+            active_num=capacity,
+            expert_num=self._experts_per_layer,
+            drop_pad_mode=0,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, self._experts_per_layer],
+            quant_mode=-1,
+            row_idx_type=0,
+        )
+        group_list = counts[self._expert_start : self._expert_end].to(torch.int64)
+        offset = counts[: self._expert_start].sum()
+        count = group_list.sum()
+        rows = torch.arange(capacity, device=hidden_states.device)
+        packed = packed.index_select(0, (rows + offset).clamp(max=capacity - 1).long())
+        group_list = group_list.clone()
+        group_list[-1] += capacity - count
+        weights = self._layers[layer_id]
+        gate = self._project(packed, weights, 0, group_list)
+        up = self._project(packed, weights, 1, group_list)
+        down = self._project(functional.silu(gate) * up, weights, 2, group_list)
+        self._ordered_combine(
+            down,
+            expert_ids,
+            routing_weights,
+            inverse,
+            offset,
+            count,
+            output,
+            expert_start=self._expert_start,
+            expert_end=self._expert_end,
+        )
 
     def _accumulate(
         self,
@@ -168,6 +290,8 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
             self._scales.clear()
             self._scale_temporaries.clear()
             self._fp32_scales.clear()
+            self._combine_temporaries.clear()
+            self._ordered_combine = None
 
     def _prepare_projections(self) -> bool:
         """Retain GMM views and synchronously guard scales before capture begins."""

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as functional
@@ -36,7 +39,11 @@ class CpuModelSlimOperators:
     def npu_moe_init_routing_v2(self, hidden, ids, **options):
         order = ids.flatten().argsort(stable=True)
         counts = torch.bincount(ids.flatten().long(), minlength=options["expert_num"])
-        return hidden[order // ids.shape[1]], order, counts, None
+        indices = order
+        if options["row_idx_type"] == 0:
+            indices = torch.empty_like(order, dtype=torch.int32)
+            indices[order] = torch.arange(order.numel(), dtype=torch.int32)
+        return hidden[order // ids.shape[1]], indices, counts, None
 
     def npu_dynamic_quant(self, inputs, *, dst_type):
         assert dst_type is torch.int8
@@ -64,8 +71,26 @@ class CpuModelSlimOperators:
         return [torch.cat(outputs)]
 
 
+def cpu_ordered_combine(
+    down, ids, routing, inverse, offset, count, output, *, expert_start, expert_end
+):
+    """Model the independent kernel boundary with stable expert-order FP32 sums."""
+    accumulator = torch.zeros_like(output, dtype=torch.float32)
+    for row in range(ids.shape[0]):
+        order = sorted(range(ids.shape[1]), key=lambda column: (ids[row, column].item(), column))
+        for column in order:
+            expert = ids[row, column].item()
+            position = int(inverse[row * ids.shape[1] + column] - offset)
+            if expert_start <= expert < expert_end and 0 <= position < count:
+                accumulator[row] += down[position].float() * routing[row, column]
+    output.copy_(accumulator.bfloat16())
+
+
+@pytest.mark.parametrize("direct_combine", [False, True])
 @pytest.mark.parametrize("expert_range", [(0, 2), (2, 3)])
-def test_original_i8_storage_and_lossless_scales_follow_shared_routing(expert_range):
+def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
+    expert_range, direct_combine
+):
     generator = torch.Generator().manual_seed(61)
     table = ReadyWeightTable(1, 3)
     weights = {}
@@ -95,8 +120,10 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(expert_ra
         operators=operators,
         expert_range=expert_range,
     )
+    if direct_combine:
+        resident._ordered_combine = cpu_ordered_combine
     try:
-        for pair in ((0, 1), (2, 2), (1, 2)):
+        for pair in ((0, 1), (2, 2), (1, 2), (2, 1)):
             hidden = torch.randn(3, 4, generator=generator).bfloat16()
             hidden[0].zero_()
             ids = torch.tensor([pair] * 3, dtype=torch.int32)
@@ -105,7 +132,8 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(expert_ra
             resident.compute(0, hidden, ids, routing, output)
             reference = torch.zeros_like(output)
             for row in range(3):
-                for column, expert in enumerate(pair):
+                for column in sorted(range(2), key=lambda column: (pair[column], column)):
+                    expert = pair[column]
                     if expert not in weights:
                         continue
                     weight = weights[expert]
@@ -144,6 +172,9 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(expert_ra
     assert not resident._scales
     assert not resident._matrices
     assert not resident._fp32_scales
+    assert resident._ordered_combine is None
+    with pytest.raises(RuntimeError, match="closed or quarantined"):
+        resident.compute(0, hidden, ids, routing, output)
 
 
 def test_modelslim_graph_rejects_float_ready_weights_and_releases_lease():
@@ -720,3 +751,84 @@ def test_fp32_scale_table_failure_retains_published_tables_and_lease(monkeypatch
     assert table.quarantined and table.usage_count(0, 0) == 1
     resident.close(wait_for_completion=lambda: None)
     assert sum(len(values) for values in resident._fp32_scales.values()) == 1
+
+
+@pytest.mark.parametrize("missing", ["triton", "ascend"])
+def test_optional_ordered_combine_reports_missing_ascend_dependency(monkeypatch, missing):
+    table = single_expert_table()
+    resident = single_expert_resident(table)
+    if missing == "triton":
+        monkeypatch.setitem(sys.modules, "triton", None)
+        monkeypatch.setitem(sys.modules, "triton.backends", None)
+    else:
+        monkeypatch.setitem(sys.modules, "triton.backends", SimpleNamespace(backends={}))
+    try:
+        with pytest.raises(RuntimeError, match="requires Triton-Ascend with the Ascend backend"):
+            resident._prepare_ordered_combine()
+        assert resident._combine_temporaries == []
+    finally:
+        resident.close(wait_for_completion=lambda: None)
+
+
+def test_ordered_combine_precompile_failure_quarantines_allocations_and_lease(monkeypatch):
+    retained = []
+    monkeypatch.setattr(
+        "expertkit_worker.backends.torch.decode_graph.retain_until_process_exit", retained.append
+    )
+
+    class NpuDevice:
+        type = "npu"
+
+        def __eq__(self, other):
+            return other is self or other == torch.device("cpu")
+
+    device = NpuDevice()
+    monkeypatch.setattr(TorchModelSlimW8A8Weights, "device", property(lambda self: device))
+    monkeypatch.setitem(sys.modules, "torch_npu", CpuModelSlimOperators())
+    monkeypatch.setitem(
+        sys.modules, "triton.backends", SimpleNamespace(backends={"ascend": object()})
+    )
+
+    def failed_compile(*args, **kwargs):
+        raise RuntimeError("ordered combine compilation failed")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "expertkit_worker.backends.torch.ascend_moe_ops",
+        SimpleNamespace(ordered_combine=failed_compile),
+    )
+    original_empty = torch.empty
+
+    def allocate_on_cpu(*args, **kwargs):
+        if kwargs.get("device") is device:
+            kwargs["device"] = "cpu"
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate_on_cpu)
+    gate = torch.zeros(2048, 768, dtype=torch.int8)
+    down = torch.zeros(768, 2048, dtype=torch.int8)
+    weight = TorchModelSlimW8A8Weights(
+        (gate, gate, down),
+        (torch.ones(768), torch.ones(768), torch.ones(2048)),
+        torch.bfloat16,
+    )
+    table = ReadyWeightTable(1, 128)
+    for expert in range(64):
+        table.publish(0, expert, weight)
+    with pytest.raises(RuntimeError, match="ordered combine compilation failed"):
+        ResidentModelSlimExpertGraphWeights(
+            layer_ids=(0,),
+            experts_per_layer=128,
+            hidden_dim=2048,
+            intermediate_dim=768,
+            top_k=8,
+            acquire_many=table.acquire_many,
+            ready_revision=lambda: table.revision,
+            expert_range=(0, 64),
+        )
+    resident = retained[0]
+    assert resident._quarantined and table.quarantined
+    assert table.usage_count(0, 0) == table.usage_count(0, 63) == 1
+    assert len(resident._combine_temporaries) == 7
+    resident.close(wait_for_completion=lambda: None)
+    assert len(resident._combine_temporaries) == 7
