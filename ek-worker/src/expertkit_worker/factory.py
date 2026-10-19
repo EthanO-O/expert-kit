@@ -29,6 +29,7 @@ from expertkit_worker.backends.factory import (
 )
 from expertkit_worker.config import (
     GrpcTransportConfig,
+    QuantizationType,
     ShmTransportConfig,
     TransferEngineTransportConfig,
     WorkerConfig,
@@ -339,6 +340,17 @@ async def build_worker_application(
                 GraphWorkerExecution,
             )
 
+            resident_weights = ResidentExpertGraphWeights
+            if (
+                config.model.quantization is not None
+                and config.model.quantization.type is QuantizationType.MODELSLIM_W8A8_DYNAMIC
+            ):
+                from expertkit_worker.backends.torch.modelslim_decode_graph import (
+                    ResidentModelSlimExpertGraphWeights,
+                )
+
+                resident_weights = ResidentModelSlimExpertGraphWeights
+
             if graph_config.instance_id != instance_id:
                 raise ValueError(
                     "Ascend graph instance does not match the resolved Controller instance"
@@ -353,7 +365,7 @@ async def build_worker_application(
                 hidden_dim=config.model.hidden_dim,
                 top_k=config.model.top_k,
                 admission=device_admission,
-                prepare_weights=lambda: ResidentExpertGraphWeights(
+                prepare_weights=lambda: resident_weights(
                     layer_ids=graph_config.layer_ids,
                     experts_per_layer=config.model.experts_per_layer,
                     hidden_dim=config.model.hidden_dim,

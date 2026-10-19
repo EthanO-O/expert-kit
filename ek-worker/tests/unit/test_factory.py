@@ -9,6 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -109,6 +110,115 @@ def test_factory_builds_and_closes_ggml_worker(tmp_path: Path) -> None:
         await application.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recipe", [None, "modelslim-w8a8-dynamic"], ids=["bf16", "modelslim"])
+def test_factory_selects_graph_resident_from_validated_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recipe: str | None
+) -> None:
+    import expertkit_worker.backends.torch.decode_graph as bf16_graph
+    import expertkit_worker.backends.torch.modelslim_decode_graph as modelslim_graph
+    import expertkit_worker.execution.decode_graph as graph_execution
+    import expertkit_worker.factory as factory
+    from expertkit_worker.backends import BackendResourceEstimate
+
+    raw = _config(tmp_path).model_dump(mode="json")
+    raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
+    if recipe is not None:
+        raw["model"]["quantization"] = {
+            "type": recipe,
+            "bits": 8,
+            "group_size": None,
+            "symmetric": True,
+        }
+    shared_model = {
+        key: value
+        for key, value in raw["model"].items()
+        if key not in {"instance_id", "name", "weight_version"}
+    }
+    raw["worker"].update(
+        device="npu:0",
+        ascend_decode_graph={
+            "session_id": "worker-graph-factory-0061",
+            "instance_id": 7,
+            "weight_version": "test",
+            "workers": [
+                {
+                    "worker_id": "other",
+                    "control_endpoint": "127.0.0.1:18078",
+                    "expert_start": 0,
+                    "expert_end": 2,
+                },
+                {
+                    "worker_id": "worker-0",
+                    "control_endpoint": "127.0.0.1:18079",
+                    "expert_start": 2,
+                    "expert_end": 4,
+                },
+            ],
+            "rendezvous_host": "127.0.0.1",
+            "rendezvous_port": 18080,
+            "layer_ids": [0, 1],
+            "capture_sizes": [1],
+            "model": shared_model,
+        },
+    )
+    config = WorkerConfig.model_validate(raw)
+    runtime = Mock(device=torch.device("cpu"))
+    runtime.memory_info.return_value = (2 << 30, 2 << 30)
+    adapter = Mock(backend_name="fixture")
+    adapter.conversion_temporary_bytes.return_value = 0
+    backend = Mock()
+    backend.estimate_resources.return_value = BackendResourceEstimate(0)
+    manager = Mock(ready_revision=17)
+    services = Mock(manager=manager)
+    ordinary = Mock(fixed_device_bytes=0, fixed_host_staging_bytes=0)
+    resident_types = [Mock(), Mock()]
+    graph_factory = Mock()
+    monkeypatch.setattr(factory, "resolve_model_metadata", AsyncMock(return_value=config))
+    monkeypatch.setattr(
+        factory, "_create_device_wiring", lambda _device: Mock(runtime=runtime, create_slot=Mock())
+    )
+    monkeypatch.setattr(factory, "create_observability", Mock())
+    monkeypatch.setattr(factory, "create_weight_disk_cache", AsyncMock())
+    monkeypatch.setattr(factory, "create_weight_adapter", Mock(return_value=adapter))
+    monkeypatch.setattr(factory, "create_compute_backend", Mock(return_value=backend))
+    monkeypatch.setattr(
+        factory, "GrpcWorkerBatchReceiver", Mock(return_value=Mock(fixed_device_bytes=0))
+    )
+    monkeypatch.setattr(factory, "WorkerExecutor", Mock(return_value=ordinary))
+    monkeypatch.setattr(factory, "create_weight_services", AsyncMock(return_value=services))
+    monkeypatch.setattr(factory, "create_controller_supervisor", Mock())
+    monkeypatch.setattr(bf16_graph, "ResidentExpertGraphWeights", resident_types[0])
+    monkeypatch.setattr(modelslim_graph, "ResidentModelSlimExpertGraphWeights", resident_types[1])
+    monkeypatch.setattr(graph_execution, "AscendDecodeGraphExecution", graph_factory)
+
+    application = asyncio.run(build_worker_application(config, instance_resolver=_resolve_instance))
+
+    assert application._execution._ordinary is ordinary
+    assert application._execution._graph is graph_factory.return_value
+    for resident in resident_types:
+        resident.assert_not_called()
+    options = graph_factory.call_args.kwargs
+    assert options["worker_id"] == "worker-0"
+    selected, other = resident_types if recipe is None else resident_types[::-1]
+    assert options["prepare_weights"]() is selected.return_value
+    other.assert_not_called()
+    selected.assert_called_once()
+    prepared = selected.call_args.kwargs
+    assert prepared == {
+        "layer_ids": (0, 1),
+        "experts_per_layer": config.model.experts_per_layer,
+        "hidden_dim": config.model.hidden_dim,
+        "intermediate_dim": config.model.expert_intermediate_dim,
+        "top_k": config.model.top_k,
+        "acquire_many": manager.acquire_many,
+        "ready_revision": prepared["ready_revision"],
+        "expert_range": (2, 4),
+    }
+    assert prepared["ready_revision"]() == 17
+    manager.ready_revision = 18
+    assert prepared["ready_revision"]() == 18
 
 
 @pytest.mark.cuda

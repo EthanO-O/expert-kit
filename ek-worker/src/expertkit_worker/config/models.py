@@ -439,7 +439,10 @@ class WorkerConfig(_StrictModel):
                 or self.worker.max_active_batches_per_device != 1
                 or self.model.activation_dtype is not ActivationDType.BF16
                 or self.model.weight_dtype is not ActivationDType.BF16
-                or self.model.quantization is not None
+                or (
+                    self.model.quantization is not None
+                    and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
+                )
                 or self.model.expert_compute != "swiglu"
             ):
                 raise ValueError("Ascend Decode graphs require one active NPU Torch BF16 slot")

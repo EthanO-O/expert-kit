@@ -300,3 +300,40 @@ def test_sharded_weights_cover_global_routes_and_mask_padding_before_weighting(c
     finally:
         for resident in residents:
             resident.close(wait_for_completion=lambda: None)
+
+
+@pytest.mark.parametrize(
+    "expert_compute,swiglu_limit,experts,expert_range,error",
+    [
+        ("deepseek_v4", 10.0, 2, (0, 2), "ModelSlim"),
+        ("deepseek_v4", 0.0, 2, (0, 2), "limit"),
+        ("swiglu", 10.0, 2, (0, 2), "limit"),
+        ("swiglu", 0.0, 256, (224, 256), "128"),
+        ("deepseek_v4", 10.0, 256, (0, 129), "128"),
+        ("deepseek_v4", 10.0, 257, (224, 256), "256"),
+        ("deepseek_v4", 10.0, 256, (255, 256), "two"),
+    ],
+)
+def test_recipe_and_local_group_limits_reject_before_computation(
+    expert_compute, swiglu_limit, experts, expert_range, error
+):
+    table = ReadyWeightTable(1, experts)
+    for expert in range(*expert_range):
+        table.publish(
+            0, expert, TorchExpertWeights(*(torch.ones(4, 4).bfloat16() for _ in range(3)))
+        )
+    with pytest.raises(ValueError, match=error):
+        ResidentExpertGraphWeights(
+            layer_ids=(0,),
+            experts_per_layer=experts,
+            hidden_dim=4,
+            intermediate_dim=4,
+            top_k=2,
+            acquire_many=table.acquire_many,
+            ready_revision=lambda: table.revision,
+            operators=CpuExpertOperators(),
+            expert_range=expert_range,
+            expert_compute=expert_compute,
+            swiglu_limit=swiglu_limit,
+        )
+    assert all(table.usage_count(0, expert) == 0 for expert in range(*expert_range))

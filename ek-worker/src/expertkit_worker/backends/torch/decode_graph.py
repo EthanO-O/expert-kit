@@ -8,7 +8,6 @@ device completion before closing the resident weights.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from importlib import import_module
 from typing import Protocol
 
@@ -36,14 +35,6 @@ class ExpertGraphOperators(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
-class _LayerWeights:
-    lease: ReadyWeightLease[TorchExpertWeights]
-    gate: list[torch.Tensor]
-    up: list[torch.Tensor]
-    down: list[torch.Tensor]
-
-
 class ResidentExpertGraphWeights:
     """Retain all local routed experts and compute without Host routing decisions.
 
@@ -64,6 +55,8 @@ class ResidentExpertGraphWeights:
         ready_revision: Callable[[], int],
         operators: ExpertGraphOperators | None = None,
         expert_range: tuple[int, int] | None = None,
+        expert_compute: str = "swiglu",
+        swiglu_limit: float = 0.0,
     ) -> None:
         for name, value in (
             ("experts_per_layer", experts_per_layer),
@@ -73,8 +66,14 @@ class ResidentExpertGraphWeights:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if experts_per_layer > 128 or top_k > experts_per_layer:
-            raise ValueError("resident GMM requires top_k <= experts_per_layer <= 128")
+        if not (
+            (expert_compute == "swiglu" and swiglu_limit == 0)
+            or (expert_compute == "deepseek_v4" and swiglu_limit == 10)
+        ):
+            raise ValueError("resident graph requires swiglu limit0 or deepseek_v4 limit10")
+        max_experts = 256 if expert_compute == "deepseek_v4" else 128
+        if experts_per_layer > max_experts or top_k > experts_per_layer:
+            raise ValueError(f"resident graph requires top_k <= experts_per_layer <= {max_experts}")
         layers = tuple(layer_ids)
         if (
             not layers
@@ -85,6 +84,12 @@ class ResidentExpertGraphWeights:
         start, end = expert_range if expert_range is not None else (0, experts_per_layer)
         if not 0 <= start < end <= experts_per_layer:
             raise ValueError("resident expert interval must be within the model")
+        if end - start > 128:
+            raise ValueError("resident GMM requires at most 128 local experts")
+        if expert_compute == "deepseek_v4" and end - start < 2:
+            raise ValueError("resident V4 INT32 GMM requires at least two local experts")
+        self._expert_compute = expert_compute
+        self._swiglu_limit = swiglu_limit
         self._expert_start = start
         self._expert_end = end
         self._operators = operators
@@ -94,7 +99,7 @@ class ResidentExpertGraphWeights:
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
         self._experts_per_layer = experts_per_layer
-        self._layers: dict[int, _LayerWeights] = {}
+        self._layers: dict[int, ReadyWeightLease[TorchExpertWeights]] = {}
         self._device: torch.device | None = None
         self._closed = False
         self._quarantined = False
@@ -104,24 +109,18 @@ class ResidentExpertGraphWeights:
                 lease = acquire_many(layer_id, expert_ids)
                 try:
                     self._validate_weights(lease)
-                    weight_views = _LayerWeights(
-                        lease,
-                        [weight.gate_proj.t() for weight in lease.objects],
-                        [weight.up_proj.t() for weight in lease.objects],
-                        [weight.down_proj.t() for weight in lease.objects],
-                    )
                 except BaseException:
                     lease.close()
                     raise
-                self._layers[layer_id] = weight_views
+                self._layers[layer_id] = lease
             self.require_current()
             if operators is None:
                 if self._device is None or self._device.type != "npu":
                     raise ValueError("resident Ascend graph weights require an NPU device")
                 self._operators = import_module("torch_npu")
         except BaseException:
-            for weights in self._layers.values():
-                weights.lease.close()
+            for lease in self._layers.values():
+                lease.close()
             self._layers.clear()
             raise
 
@@ -181,8 +180,11 @@ class ResidentExpertGraphWeights:
             quant_mode=-1,
             row_idx_type=1,
         )
+        global_original_rows = original_rows
         group_list = counts[self._expert_start : self._expert_end].to(torch.int64)
         local_rows = None
+        offset: int | torch.Tensor = 0
+        local_count: int | torch.Tensor = capacity * self._top_k
         if self._expert_start != 0 or self._expert_end != self._experts_per_layer:
             # All global assignments are packed, so every source index is defined.
             # The local prefix is useful; fixed tail gathers stay in bounds.
@@ -198,30 +200,57 @@ class ResidentExpertGraphWeights:
             group_list = group_list.clone()
             group_list[-1] += capacity * self._top_k - local_count
 
-        def project(inputs: torch.Tensor, matrices: list[torch.Tensor]) -> torch.Tensor:
-            return operators.npu_grouped_matmul(
-                [inputs],
-                matrices,
-                group_list=group_list,
-                split_item=2,
-                group_type=0,
-                group_list_type=1,
-            )[0]
-
-        gate = project(packed, weights.gate)
-        up = project(packed, weights.up)
-        down = project(functional.silu(gate) * up, weights.down)
+        original_rows = original_rows.to(torch.int64)
+        token_indices = original_rows.div(self._top_k, rounding_mode="floor")
+        routing = routing_weights.flatten().index_select(0, original_rows).unsqueeze(1)
+        gate = self._project(packed, weights, 0, group_list)
+        up = self._project(packed, weights, 1, group_list)
+        if self._expert_compute == "deepseek_v4":
+            gate = gate.float().clamp(max=self._swiglu_limit)
+            up = up.float().clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
+            intermediate = (functional.silu(gate) * up * routing).to(torch.bfloat16)
+        else:
+            intermediate = functional.silu(gate) * up
+        down = self._project(intermediate, weights, 2, group_list)
         if local_rows is not None:
             # Padding must contribute zero, even if its projections contain NaNs.
             down_fp32 = torch.where(local_rows.unsqueeze(1), down.float(), 0.0)
         else:
             down_fp32 = down.float()
-        original_rows = original_rows.to(torch.int64)
-        token_indices = original_rows.div(self._top_k, rounding_mode="floor")
-        routing = routing_weights.flatten().index_select(0, original_rows).unsqueeze(1)
-        accumulator = torch.zeros_like(hidden_states, dtype=torch.float32)
-        accumulator.index_add_(0, token_indices, down_fp32 * routing)
+        contribution = down_fp32 if self._expert_compute == "deepseek_v4" else down_fp32 * routing
+        accumulator = self._accumulate(
+            hidden_states,
+            token_indices,
+            contribution,
+            expert_ids=expert_ids,
+            original_rows=global_original_rows,
+            local_offset=offset,
+            local_count=local_count,
+        )
         prepared_output.copy_(accumulator)
+
+    def _accumulate(
+        self,
+        hidden_states: torch.Tensor,
+        token_indices: torch.Tensor,
+        contribution: torch.Tensor,
+        *,
+        expert_ids: torch.Tensor,
+        original_rows: torch.Tensor,
+        local_offset: int | torch.Tensor,
+        local_count: int | torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the FP32 local sum using the original indexed reduction.
+
+        Args:
+            original_rows: Complete global assignment permutation before local
+                gathers duplicate any padding rows.
+            local_offset: Device-computed start of this shard's packed rows.
+            local_count: Real assignment count before charging padding to GMM.
+        """
+        accumulator = torch.zeros_like(hidden_states, dtype=torch.float32)
+        accumulator.index_add_(0, token_indices, contribution)
+        return accumulator
 
     def close(self, *, wait_for_completion: Callable[[], None]) -> None:
         """Release leases only after the owning device work has completed.
@@ -237,8 +266,8 @@ class ResidentExpertGraphWeights:
         except BaseException:
             self.quarantine()
             raise
-        for weights in self._layers.values():
-            weights.lease.close()
+        for lease in self._layers.values():
+            lease.close()
         self._layers.clear()
         self._closed = True
 
@@ -247,11 +276,30 @@ class ResidentExpertGraphWeights:
         if self._closed or self._quarantined:
             return
         self._quarantined = True
-        for weights in self._layers.values():
-            weights.lease.quarantine()
+        for lease in self._layers.values():
+            lease.quarantine()
         retain_until_process_exit(self)
 
+    def _project(
+        self,
+        inputs: torch.Tensor,
+        lease: ReadyWeightLease[TorchExpertWeights],
+        projection: int,
+        group_list: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self._operators is not None
+        return self._operators.npu_grouped_matmul(
+            [inputs],
+            [weight.tensors[projection].t() for weight in lease.objects],
+            group_list=group_list,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
+
     def _validate_weights(self, lease: ReadyWeightLease[TorchExpertWeights]) -> None:
+        if self._expert_compute == "deepseek_v4":
+            raise ValueError("resident V4 graph requires ModelSlim I8 weights")
         if lease.expert_ids != tuple(range(self._expert_start, self._expert_end)):
             raise ValueError("resident graph requires its local experts in logical order")
         for weight in lease.objects:

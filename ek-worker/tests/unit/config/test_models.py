@@ -109,6 +109,10 @@ def test_torch_backend_accepts_indexed_npu_device(tmp_path: Path) -> None:
     "field,value",
     [
         (None, None),
+        (
+            "matching_quantization",
+            {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": True},
+        ),
         ("num_layers", 2),
         ("experts_per_layer", 5),
         ("hidden_dim", 32),
@@ -121,6 +125,15 @@ def test_torch_backend_accepts_indexed_npu_device(tmp_path: Path) -> None:
         (
             "quantization",
             {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": True},
+        ),
+        ("quantization", {"type": "w8a8", "bits": 8, "group_size": None}),
+        ("quantization", {"type": "gptq", "bits": 4, "group_size": 128}),
+        ("quantization", {"type": "fp4", "bits": 4, "group_size": 32}),
+        ("quantization", {"type": "modelslim-w8a8-dynamic", "bits": 4, "group_size": None}),
+        ("quantization", {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": 128}),
+        (
+            "quantization",
+            {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": False},
         ),
     ],
 )
@@ -150,7 +163,10 @@ def test_graph_worker_checks_complete_shared_model(tmp_path, field, value):
             "model": shared_model,
         },
     )
-    if field is None:
+    if field == "matching_quantization":
+        raw["model"]["quantization"] = value
+        shared_model["quantization"] = value
+    if field is None or field == "matching_quantization":
         assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph is not None
     else:
         raw["model"][field] = value
