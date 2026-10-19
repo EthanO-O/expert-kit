@@ -225,6 +225,24 @@ path. Kernel compilation and warmup happen before graph capture; failures retain
 the resident weights in quarantine until process exit. Ordinary ModelSlim
 execution, BF16 resident graphs, and CPU/CUDA imports do not load these kernels.
 
+The fused Qwen NPU computation supports 128 experts, hidden size 2048, expert
+intermediate size 768, top-8 routing, SwiGLU, and BF16 activations. Each
+Worker owns one contiguous 64-expert shard, either `[0, 64)` or `[64, 128)`. Each gate, up, and
+down projection produces BF16 values. Routing weights multiply the
+down-projection results in FP32, and the local sum follows expert ID order and
+route-column order before
+rounding to BF16. An FP32 transport destination carries that BF16-rounded local
+result promoted to FP32.
+
+Full-model resident Decode graphs also require the matching Frontend and
+Transport graph-session integration. Enable the same session and capture
+capacities across the Frontend and both Workers; enabling the Worker option
+alone does not establish a full-model graph session.
+
+Resident ModelSlim weight scales must be finite and positive, and an FP32 to
+BF16 to FP32 round trip must preserve each scale exactly. Construction rejects
+scales that fail this requirement.
+
 ### Checkpoint recipes
 
 Weight Server reads checkpoint `config.json` and publishes the **routed expert**
