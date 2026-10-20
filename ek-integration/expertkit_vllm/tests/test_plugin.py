@@ -143,6 +143,7 @@ def test_pyproject_pins_vllm_and_registers_the_plugin() -> None:
         pyproject = tomllib.load(source)
 
     extras = pyproject["project"]["optional-dependencies"]
+    assert "structlog>=25.4,<26" in pyproject["project"]["dependencies"]
     assert extras["engine"] == ["vllm==0.25.1"]
     assert all(not dependency.startswith("vllm") for dependency in extras["ascend-graph"])
     entry_points = pyproject["project"]["entry-points"]["vllm.general_plugins"]

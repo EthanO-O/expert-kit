@@ -1019,6 +1019,7 @@ version = "0.1.0"
 source = { editable = "ek-integration/expertkit_vllm" }
 dependencies = [
     { name = "expertkit-transport" },
+    { name = "structlog" },
 ]
 
 [package.optional-dependencies]
@@ -1033,6 +1034,7 @@ engine = [
 requires-dist = [
     { name = "expertkit-transport", editable = "ek-transport" },
     { name = "expertkit-transport", extras = ["ascend-graph"], marker = "extra == 'ascend-graph'", editable = "ek-transport" },
+    { name = "structlog", specifier = ">=25.4,<26" },
     { name = "vllm", marker = "extra == 'engine'", specifier = "==0.25.1" },
 ]
 provides-extras = ["engine", "ascend-graph"]
