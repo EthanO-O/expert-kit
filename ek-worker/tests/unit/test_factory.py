@@ -112,10 +112,19 @@ def test_factory_builds_and_closes_ggml_worker(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("recipe", [None, "modelslim-w8a8-dynamic"], ids=["bf16", "modelslim"])
+@pytest.mark.parametrize(
+    ("recipe", "fail_after_graph"),
+    [(None, False), ("modelslim-w8a8-dynamic", False), ("modelslim-w8a8-dynamic", True)],
+    ids=["bf16", "modelslim", "graph-close-failure"],
+)
 def test_factory_selects_graph_resident_from_validated_recipe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recipe: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recipe: str | None,
+    fail_after_graph: bool,
 ) -> None:
+    import expertkit_transport.transports.ascend_graph.control as graph_control
+
     import expertkit_worker.backends.torch.decode_graph as bf16_graph
     import expertkit_worker.backends.torch.modelslim_decode_graph as modelslim_graph
     import expertkit_worker.execution.decode_graph as graph_execution
@@ -172,14 +181,19 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     backend.estimate_resources.return_value = BackendResourceEstimate(0)
     manager = Mock(ready_revision=17)
     services = Mock(manager=manager)
+    services.close = AsyncMock()
     ordinary = Mock(fixed_device_bytes=0, fixed_host_staging_bytes=0)
     resident_types = [Mock(), Mock()]
     graph_factory = Mock()
+    graph_factory.return_value.close = AsyncMock(side_effect=RuntimeError("graph close failed"))
+    control_factory = Mock()
+    monkeypatch.setattr(graph_control, "GraphControlServer", control_factory)
     monkeypatch.setattr(factory, "resolve_model_metadata", AsyncMock(return_value=config))
     monkeypatch.setattr(
         factory, "_create_device_wiring", lambda _device: Mock(runtime=runtime, create_slot=Mock())
     )
-    monkeypatch.setattr(factory, "create_observability", Mock())
+    observability = Mock(close=AsyncMock())
+    monkeypatch.setattr(factory, "create_observability", Mock(return_value=observability))
     monkeypatch.setattr(factory, "create_weight_disk_cache", AsyncMock())
     monkeypatch.setattr(factory, "create_weight_adapter", Mock(return_value=adapter))
     monkeypatch.setattr(factory, "create_compute_backend", Mock(return_value=backend))
@@ -188,15 +202,34 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     )
     monkeypatch.setattr(factory, "WorkerExecutor", Mock(return_value=ordinary))
     monkeypatch.setattr(factory, "create_weight_services", AsyncMock(return_value=services))
-    monkeypatch.setattr(factory, "create_controller_supervisor", Mock())
+    monkeypatch.setattr(
+        factory,
+        "create_controller_supervisor",
+        Mock(side_effect=ValueError("composition failed") if fail_after_graph else None),
+    )
     monkeypatch.setattr(bf16_graph, "ResidentExpertGraphWeights", resident_types[0])
     monkeypatch.setattr(modelslim_graph, "ResidentModelSlimExpertGraphWeights", resident_types[1])
     monkeypatch.setattr(graph_execution, "AscendDecodeGraphExecution", graph_factory)
+
+    if fail_after_graph:
+        with pytest.raises(RuntimeError, match="graph close failed"):
+            asyncio.run(build_worker_application(config, instance_resolver=_resolve_instance))
+        control_factory.return_value.stop.assert_called_once()
+        control_factory.return_value.close.assert_called_once()
+        services.close.assert_awaited_once()
+        observability.close.assert_awaited_once()
+        return
 
     application = asyncio.run(build_worker_application(config, instance_resolver=_resolve_instance))
 
     assert application._execution._ordinary is ordinary
     assert application._execution._graph is graph_factory.return_value
+    assert application._execution._control is control_factory.return_value
+    control_factory.assert_called_once_with(
+        "127.0.0.1:18079",
+        begin=graph_factory.return_value.begin,
+        finish=graph_factory.return_value.finish,
+    )
     for resident in resident_types:
         resident.assert_not_called()
     options = graph_factory.call_args.kwargs

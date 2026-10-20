@@ -9,6 +9,7 @@ import torch
 from pydantic import ValidationError
 
 from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.transports.ascend_graph.contracts import GraphCompletionUnproven
 from expertkit_transport.transports.ascend_graph.control import (
     MAX_CONTROL_BYTES,
     SERVICE,
@@ -77,7 +78,7 @@ def test_real_grpc_control_matches_steps_and_poison_after_restart() -> None:
     requests = []
     start_id = ["start-one"]
 
-    def begin(request, context):
+    def begin(request, *, timeout):
         requests.append(request)
         return {
             "state": "ready",
@@ -86,7 +87,7 @@ def test_real_grpc_control_matches_steps_and_poison_after_restart() -> None:
             "ready_revision": 7,
         }
 
-    def finish(request, context):
+    def finish(request, *, timeout):
         assert request == requests[-1]
         return {"state": "complete", "sequence": request["sequence"]}
 
@@ -269,7 +270,7 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
     ports = []
 
     def begin_for(rank):
-        def begin(request, context):
+        def begin(request, *, timeout):
             requests[rank].append(request)
             begin_barrier.wait()
             return {
@@ -282,12 +283,12 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
         return begin
 
     def finish_for(rank):
-        def finish(request, context):
+        def finish(request, *, timeout):
             finish_arrived[rank].set()
             if rank == 1:
                 assert release_finish.wait(2)
                 if fail_finish[0]:
-                    context.abort(grpc.StatusCode.INTERNAL, "peer completion failed")
+                    raise GraphCompletionUnproven("peer completion failed")
             return {"state": "complete", "sequence": request["sequence"]}
 
         return finish

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -186,6 +187,7 @@ async def build_worker_application(
     graph_config = config.worker.ascend_decode_graph
     device_admission = DeviceAdmission() if graph_config is not None else None
     graph_execution = None
+    graph_control = None
     try:
         disk_cache = await create_weight_disk_cache(config)
         adapter = create_weight_adapter(
@@ -334,6 +336,8 @@ async def build_worker_application(
         manager_holder[0] = manager
 
         if graph_config is not None:
+            from expertkit_transport.transports.ascend_graph.control import GraphControlServer
+
             from expertkit_worker.backends.torch.decode_graph import ResidentExpertGraphWeights
             from expertkit_worker.execution.decode_graph import (
                 AscendDecodeGraphExecution,
@@ -376,6 +380,11 @@ async def build_worker_application(
                     expert_range=(participant.expert_start, participant.expert_end),
                 ),
             )
+            graph_control = GraphControlServer(
+                participant.control_endpoint,
+                begin=graph_execution.begin,
+                finish=graph_execution.finish,
+            )
 
         control = create_controller_supervisor(
             config,
@@ -406,7 +415,7 @@ async def build_worker_application(
             manager=manager,
             peer_server=peer_server,
             execution=(
-                GraphWorkerExecution(execution, graph_execution)
+                GraphWorkerExecution(execution, graph_execution, graph_control)
                 if graph_execution is not None
                 else execution
             ),
@@ -416,8 +425,14 @@ async def build_worker_application(
         )
     except BaseException:
         try:
-            if graph_execution is not None:
-                await graph_execution.close()
+            if graph_control is not None:
+                graph_control.stop()
+            try:
+                if graph_execution is not None:
+                    await graph_execution.close()
+            finally:
+                if graph_control is not None:
+                    await asyncio.to_thread(graph_control.close)
             if execution is not None:
                 await execution.close()
             elif receiver is not None:

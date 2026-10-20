@@ -1,31 +1,30 @@
 """Validate graph command admission without touching an NPU."""
 
 import asyncio
+import socket
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import grpc
 import pytest
 import torch
 from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.transports.ascend_graph.contracts import (
+    GraphCompletionUnproven,
+    GraphControlRejected,
+)
+from expertkit_transport.transports.ascend_graph.control import (
+    SERVICE,
+    GraphControlServer,
+    decode_message,
+    encode_message,
+)
 
+from expertkit_worker.app import WorkerApplication
 from expertkit_worker.execution.admission import DeviceAdmission
 from expertkit_worker.execution.decode_graph import AscendDecodeGraphExecution, GraphWorkerExecution
-
-
-class Aborted(Exception):
-    """Represent the external gRPC server abort boundary."""
-
-
-class Context:
-    """Supply bounded RPC context behavior without a network listener."""
-
-    def abort(self, code, details):
-        raise Aborted(code, details)
-
-    def time_remaining(self):
-        return 2.0
 
 
 @pytest.fixture
@@ -92,9 +91,8 @@ def request_for(execution, **updates):
     ],
 )
 def test_invalid_command_rejected_before_admission(execution, updates):
-    with pytest.raises(Aborted) as result:
-        execution._begin(request_for(execution, **updates), Context())
-    assert result.value.args[0] == grpc.StatusCode.FAILED_PRECONDITION
+    with pytest.raises(GraphControlRejected):
+        execution.begin(request_for(execution, **updates), timeout=2)
     assert execution._sequence == 0
     assert execution._pending is None
 
@@ -112,12 +110,12 @@ def test_finish_requires_exact_pending_command_and_clears_once(execution):
     pending.set_result(None)
     execution._pending = pending
     execution._pending_request = request
-    with pytest.raises(Aborted):
-        execution._finish({**request, "sequence": 2}, Context())
+    with pytest.raises(GraphControlRejected):
+        execution.finish({**request, "sequence": 2}, timeout=2)
     assert execution._pending is pending
-    assert execution._finish(request, Context()) == {"state": "complete", "sequence": 1}
-    with pytest.raises(Aborted):
-        execution._finish(request, Context())
+    assert execution.finish(request, timeout=2) == {"state": "complete", "sequence": 1}
+    with pytest.raises(GraphControlRejected):
+        execution.finish(request, timeout=2)
 
 
 def test_duplicate_finish_cannot_clear_the_next_step(execution):
@@ -141,9 +139,9 @@ def test_duplicate_finish_cannot_clear_the_next_step(execution):
     execution._pending = pending
     execution._pending_request = request
     with ThreadPoolExecutor(max_workers=2) as threads:
-        first = threads.submit(execution._finish, request, Context())
+        first = threads.submit(execution.finish, request, timeout=2)
         assert entered[0].wait(2)
-        second = threads.submit(execution._finish, request, Context())
+        second = threads.submit(execution.finish, request, timeout=2)
         assert entered[1].wait(2)
         release[0].set()
         assert first.result(timeout=2)["state"] == "complete"
@@ -154,12 +152,88 @@ def test_duplicate_finish_cannot_clear_the_next_step(execution):
             execution._pending = next_pending
             execution._pending_request = next_request
         release[1].set()
-        with pytest.raises(Aborted) as error:
+        with pytest.raises(GraphControlRejected, match="already completed"):
             second.result(timeout=2)
-        assert error.value.args[0] == grpc.StatusCode.FAILED_PRECONDITION
         assert execution._pending is next_pending
         assert execution._pending_request == next_request
-        execution._finish(next_request, Context())
+        execution.finish(next_request, timeout=2)
+
+
+def test_finish_timeout_retains_device_future_and_absolute_step_deadline(execution):
+    request = request_for(execution)
+    pending = Future()
+    execution._pending = pending
+    execution._pending_request = request
+    execution._deadline = 123.0
+    with pytest.raises(GraphCompletionUnproven, match="could not be proven"):
+        execution.finish(request, timeout=0)
+    assert execution._poisoned
+    assert execution._pending is pending and not pending.cancelled()
+    assert execution._pending_request == request and execution._deadline == 123.0
+    with pytest.raises(GraphControlRejected, match="cannot admit"):
+        execution.begin(request_for(execution, sequence=2), timeout=2)
+    pending.set_result(None)
+
+
+def test_real_adapter_loopback_preserves_execution_validation_and_exact_finish(execution):
+    server = GraphControlServer("127.0.0.1:0", begin=execution.begin, finish=execution.finish)
+    port = server.start()
+    try:
+        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            begin, finish = [
+                channel.unary_unary(
+                    f"/{SERVICE}/{name}",
+                    request_serializer=encode_message,
+                    response_deserializer=decode_message,
+                )
+                for name in ("Begin", "Finish")
+            ]
+            with pytest.raises(grpc.RpcError) as rejected:
+                begin(request_for(execution, sequence=True), timeout=2)
+            assert rejected.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+            assert execution._pending is None and execution._sequence == 0
+            pending = Future()
+            pending.set_result(None)
+            execution._pending = pending
+            execution._pending_request = request_for(execution)
+            assert finish(request_for(execution), timeout=2) == {
+                "state": "complete",
+                "sequence": 1,
+            }
+            with pytest.raises(grpc.RpcError) as repeated:
+                finish(request_for(execution), timeout=2)
+            assert repeated.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    finally:
+        server.close()
+
+
+def test_real_bind_failure_reaches_application_cleanup(execution):
+    async def scenario(endpoint):
+        ordinary = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+        server = GraphControlServer(endpoint, begin=execution.begin, finish=execution.finish)
+        graph_owner = GraphWorkerExecution(ordinary, execution, server)
+        service = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+        application = WorkerApplication(
+            transfer=service,
+            manager=SimpleNamespace(start=Mock(), close=AsyncMock()),
+            peer_server=service,
+            execution=graph_owner,
+            control=SimpleNamespace(close=AsyncMock()),
+            disk_cache=SimpleNamespace(close=Mock()),
+            observability=service,
+        )
+        with pytest.raises(RuntimeError, match="bind"):
+            await application.run()
+        ordinary.close.assert_awaited_once()
+        assert execution._closed and execution._monitor.done()
+        for pool in (execution._executor, server._executor):
+            with pytest.raises(RuntimeError, match="shutdown"):
+                pool.submit(lambda: None)
+
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        asyncio.run(scenario(f"127.0.0.1:{occupied.getsockname()[1]}"))
 
 
 def test_idle_withdrawal_destroys_graphs_and_releases_real_leases(execution):
@@ -228,7 +302,8 @@ def test_ordinary_completion_does_not_cancel_graph_lifecycle_monitor(execution):
 
         execution._graphs[1] = object()
         execution._monitor = asyncio.create_task(execution._watch())
-        owner = GraphWorkerExecution(Ordinary(), execution)
+        control = SimpleNamespace(start=lambda: None, stop=lambda: None, close=lambda: None)
+        owner = GraphWorkerExecution(Ordinary(), execution, control)
         waiter = asyncio.create_task(owner.wait())
         await asyncio.wait_for(waiting.wait(), timeout=2)
         finished.set()

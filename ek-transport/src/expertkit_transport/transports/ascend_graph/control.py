@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import grpc
 
 from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.transports.ascend_graph.contracts import (
+    GraphAdmissionTimeout,
+    GraphCompletionUnproven,
+    GraphControlRejected,
+    GraphStepCommand,
+)
 
 SERVICE = "expertkit.internal.AscendGraphControl"
 MAX_CONTROL_BYTES = 16 * 1024
@@ -39,8 +45,8 @@ def decode_message(payload: bytes) -> dict[str, Any]:
 
 
 def control_handler(
-    begin: Callable[[dict[str, Any], grpc.ServicerContext], dict[str, object]],
-    finish: Callable[[dict[str, Any], grpc.ServicerContext], dict[str, object]],
+    begin: GraphStepCommand,
+    finish: GraphStepCommand,
 ) -> grpc.GenericRpcHandler:
     """Bind the two coarse-step methods using the existing gRPC dependency."""
 
@@ -50,7 +56,14 @@ def control_handler(
                 message = decode_message(payload)
             except (ValueError, UnicodeError) as error:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-            return method(message, context)
+            try:
+                return method(message, timeout=context.time_remaining())
+            except GraphControlRejected as error:
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+            except GraphAdmissionTimeout as error:
+                context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, str(error))
+            except GraphCompletionUnproven as error:
+                context.abort(grpc.StatusCode.INTERNAL, str(error))
 
         return grpc.unary_unary_rpc_method_handler(invoke, response_serializer=encode_message)
 
@@ -58,6 +71,42 @@ def control_handler(
         SERVICE,
         {name: bind(method) for name, method in (("Begin", begin), ("Finish", finish))},
     )
+
+
+class GraphControlServer:
+    """Own the bounded gRPC endpoint and RPC threads, without owning device work."""
+
+    def __init__(self, endpoint: str, *, begin: GraphStepCommand, finish: GraphStepCommand) -> None:
+        self._endpoint = endpoint
+        self._port: int | None = None
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ek-graph-control")
+        self._server = grpc.server(
+            self._executor,
+            options=[
+                ("grpc.max_receive_message_length", MAX_CONTROL_BYTES),
+                ("grpc.max_send_message_length", MAX_CONTROL_BYTES),
+            ],
+        )
+        self._server.add_generic_rpc_handlers((control_handler(begin, finish),))
+
+    def start(self) -> int:
+        """Bind and start Host control, returning the actual port for loopback clients."""
+        if self._port is None:
+            port = self._server.add_insecure_port(self._endpoint)
+            if port == 0:
+                raise RuntimeError("cannot bind Ascend graph control endpoint")
+            self._server.start()
+            self._port = port
+        return self._port
+
+    def stop(self) -> None:
+        """Reject new RPCs; cancellation does not cancel an admitted device Future."""
+        self._server.stop(grace=0)
+
+    def close(self) -> None:
+        """Join RPC callbacks after the owner has drained or quarantined device work."""
+        self.stop()
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass

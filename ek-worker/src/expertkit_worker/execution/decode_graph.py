@@ -9,25 +9,31 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import grpc
 import structlog
 import torch
 from expertkit_transport.quarantine import retain_until_process_exit
 from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
-from expertkit_transport.transports.ascend_graph.control import MAX_CONTROL_BYTES, control_handler
+from expertkit_transport.transports.ascend_graph.contracts import (
+    GraphAdmissionTimeout,
+    GraphCompletionUnproven,
+    GraphControlRejected,
+)
 from expertkit_transport.transports.ascend_graph.session import HcclGraphSession
 from pydantic import ValidationError
 
 from expertkit_worker.backends.torch.decode_graph import ResidentExpertGraphWeights
 from expertkit_worker.execution.admission import DeviceAdmission
 
+if TYPE_CHECKING:
+    from expertkit_transport.transports.ascend_graph.control import GraphControlServer
+
 logger = structlog.get_logger(__name__)
 
 
 class AscendDecodeGraphExecution:
-    """Own a single graph thread, bounded control service and completion watchdog.
+    """Own a single graph thread, admission state and completion watchdog.
 
     A shared admission lock excludes ordinary slots until the graph stream has
     completed. Device faults terminate the process because a blocked HCCL stream
@@ -61,17 +67,6 @@ class AscendDecodeGraphExecution:
         self._stream: Any = None
         self._graphs: dict[int, Any] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ek-decode-graph")
-        self._rpc_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="ek-graph-control"
-        )
-        self._server = grpc.server(
-            self._rpc_executor,
-            options=[
-                ("grpc.max_receive_message_length", MAX_CONTROL_BYTES),
-                ("grpc.max_send_message_length", MAX_CONTROL_BYTES),
-            ],
-        )
-        self._server.add_generic_rpc_handlers((control_handler(self._begin, self._finish),))
         self._lock = threading.Lock()
         self._sequence = 0
         self._pending: Future[None] | None = None
@@ -83,17 +78,9 @@ class AscendDecodeGraphExecution:
         self._stopped = asyncio.Event()
 
     async def start(self) -> None:
-        """Start Host control only; NPU setup waits for an explicit PREPARE."""
+        """Supervise Host admission; NPU setup waits for an explicit PREPARE."""
         if self._monitor is not None:
             return
-        if (
-            self._server.add_insecure_port(
-                self.config.participants[self._rank - 1].control_endpoint
-            )
-            == 0
-        ):
-            raise RuntimeError("cannot bind Ascend graph control endpoint")
-        self._server.start()
         self._monitor = asyncio.create_task(self._watch(), name="worker-graph-watchdog")
 
     async def wait(self) -> None:
@@ -109,7 +96,6 @@ class AscendDecodeGraphExecution:
             return
         self._closed = True
         self._stopped.set()
-        self._server.stop(grace=0)
         if self._monitor is not None:
             await self._monitor
         work = self._executor.submit(self._destroy)
@@ -121,7 +107,6 @@ class AscendDecodeGraphExecution:
             self._fatal("graph_shutdown_completion_unproven")
             raise
         self._executor.shutdown(wait=True, cancel_futures=True)
-        self._rpc_executor.shutdown(wait=True, cancel_futures=True)
 
     def _validate_request(self, request: dict[str, Any]) -> tuple[str, int]:
         if set(request) != {
@@ -196,31 +181,37 @@ class AscendDecodeGraphExecution:
             raise ValueError("graph control sequence is not the next step")
         return phase, capacity
 
-    def _begin(self, request: dict[str, Any], context: grpc.ServicerContext) -> dict[str, object]:
+    def begin(self, request: dict[str, Any], *, timeout: float | None) -> dict[str, object]:
+        """Admit one step and acknowledge device ownership within a Host wait budget.
+
+        A wait timeout poisons admission but leaves the device Future and weight
+        leases owned until the watchdog or shutdown proves completion.
+        """
         ready = threading.Event()
         with self._lock:
             if self._closed or self._poisoned or self._pending is not None:
-                context.abort(
-                    grpc.StatusCode.FAILED_PRECONDITION, "graph session cannot admit work"
-                )
+                raise GraphControlRejected("graph session cannot admit work")
             try:
                 phase, capacity = self._validate_request(request)
             except (ValueError, RuntimeError) as error:
-                context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+                raise GraphControlRejected(str(error)) from error
             self._sequence = request["sequence"]
             self._deadline = time.monotonic() + self.config.timeout_seconds
             self._pending_request = request
             self._pending = self._executor.submit(self._run, phase, capacity, ready)
             pending = self._pending
         timeout = min(
-            context.time_remaining() or self.config.timeout_seconds, self.config.timeout_seconds
+            timeout if timeout is not None else self.config.timeout_seconds,
+            self.config.timeout_seconds,
         )
         if not ready.wait(timeout):
-            self._poisoned = True
-            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "graph admission timed out")
+            with self._lock:
+                self._poisoned = True
+            raise GraphAdmissionTimeout("graph admission timed out")
         if pending.done() and pending.exception() is not None:
-            self._poisoned = True
-            context.abort(grpc.StatusCode.INTERNAL, "graph phase failed before admission")
+            with self._lock:
+                self._poisoned = True
+            raise GraphCompletionUnproven("graph phase failed before admission")
         return {
             "state": "ready",
             "sequence": self._sequence,
@@ -234,22 +225,25 @@ class AscendDecodeGraphExecution:
             ),
         }
 
-    def _finish(self, request: dict[str, Any], context: grpc.ServicerContext) -> dict[str, object]:
+    def finish(self, request: dict[str, Any], *, timeout: float | None) -> dict[str, object]:
+        """Prove matching completion without extending the admitted step's deadline."""
         with self._lock:
             if request != self._pending_request or self._pending is None:
-                context.abort(grpc.StatusCode.FAILED_PRECONDITION, "no matching graph step")
+                raise GraphControlRejected("no matching graph step")
             pending = self._pending
         try:
             timeout = min(
-                context.time_remaining() or self.config.timeout_seconds, self.config.timeout_seconds
+                timeout if timeout is not None else self.config.timeout_seconds,
+                self.config.timeout_seconds,
             )
             pending.result(timeout=timeout)
-        except BaseException:
-            self._poisoned = True
-            context.abort(grpc.StatusCode.INTERNAL, "graph completion could not be proven")
+        except BaseException as error:
+            with self._lock:
+                self._poisoned = True
+            raise GraphCompletionUnproven("graph completion could not be proven") from error
         with self._lock:
             if self._pending is not pending or self._pending_request != request:
-                context.abort(grpc.StatusCode.FAILED_PRECONDITION, "graph step already completed")
+                raise GraphControlRejected("graph step already completed")
             self._pending = None
             self._pending_request = None
         return {"state": "complete", "sequence": request["sequence"]}
@@ -370,14 +364,18 @@ class AscendDecodeGraphExecution:
 class GraphWorkerExecution:
     """Compose ordinary execution and optional graph execution at one lifecycle."""
 
-    def __init__(self, ordinary: Any, graph: AscendDecodeGraphExecution) -> None:
+    def __init__(
+        self, ordinary: Any, graph: AscendDecodeGraphExecution, control: GraphControlServer
+    ) -> None:
         self._ordinary = ordinary
         self._graph = graph
+        self._control = control
 
     async def start(self) -> None:
         """Start both endpoints; neither creates resident graphs at startup."""
         await self._ordinary.start()
         await self._graph.start()
+        self._control.start()
 
     async def wait(self) -> None:
         """Surface either execution failure to the Worker application supervisor."""
@@ -393,4 +391,10 @@ class GraphWorkerExecution:
 
     async def close(self) -> None:
         """Close both admissions while draining before Weight Manager teardown."""
-        await asyncio.gather(self._ordinary.close(), self._graph.close())
+        # Protocol phase=close finishes before process shutdown. Shutdown rejects
+        # new RPCs without cancelling admitted device work or releasing its leases.
+        self._control.stop()
+        try:
+            await asyncio.gather(self._ordinary.close(), self._graph.close())
+        finally:
+            await asyncio.to_thread(self._control.close)
