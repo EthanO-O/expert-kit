@@ -56,7 +56,7 @@ services:
       EK_INSTANCE_ID: "{{ ascend_decode_graph.instance_id }}"
       EK_ASCEND_DECODE_GRAPH_CONFIG: /configs/ascend-decode-graph.json
       VLLM_USE_V2_MODEL_RUNNER: "0"
-      VLLM_PLUGINS: ascend,register_expertkit
+      VLLM_PLUGINS: ascend,ascend_model,register_expertkit
 {% endif %}
       EK_ADDR: {{ control.address }}:{{ control.frontend_control_port }}
 {% if tracing.enabled %}

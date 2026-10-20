@@ -152,6 +152,12 @@ def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path
     assert serve["safetensors-load-strategy"] == "lazy"
     assert serve["compilation-config"]["mode"] == "VLLM_COMPILE"
     assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+    attention = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
+        "attention"
+    ]
+    assert {"ascend", "ascend_model", "register_expertkit"} <= set(
+        attention["environment"]["VLLM_PLUGINS"].split(",")
+    )
 
 
 @pytest.mark.parametrize("case", ["wrong-limit", "missing-quantization", "partition-gap"])
