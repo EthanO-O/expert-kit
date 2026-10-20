@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections.abc import Awaitable
+from types import SimpleNamespace
 from typing import Any
 
 import grpc
@@ -19,12 +20,15 @@ from expertkit_transport.controller.topology import (
     _WorkerConnectionResources,
 )
 from expertkit_transport.errors import TransportError
-from expertkit_transport.routing import WorkerConnection
+from expertkit_transport.routing import WorkerConnection, WorkerIdentity
 
 
 class FakeTransport:
     def __init__(self) -> None:
         self.closed = False
+
+    async def start(self) -> None:
+        pass
 
     async def close(self) -> None:
         self.closed = True
@@ -139,6 +143,51 @@ def provider(factory: Any) -> ControllerTopologyWatcher:
 
 def run(coroutine: Awaitable[None]) -> None:
     asyncio.run(coroutine)
+
+
+@pytest.mark.parametrize(
+    ("transport_type", "client_limit", "expected"),
+    [
+        (lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE, 1, 1),
+        (lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE, 2, 2),
+        (lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE, 8, 3),
+        (lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE, None, 3),
+        (lifecycle_pb2.WORKER_TRANSPORT_GRPC, 1, 3),
+    ],
+)
+def test_client_capacity_bounds_transport_and_output_pool(
+    monkeypatch, transport_type: int, client_limit: int | None, expected: int
+) -> None:
+    async def scenario() -> None:
+        capacities = []
+
+        def create_transport(**options):
+            capacities.append(options["max_in_flight"])
+            return FakeTransport()
+
+        monkeypatch.setattr(
+            "expertkit_transport.controller.topology.create_worker_transport", create_transport
+        )
+        topology = provider(None)
+        topology._transport_runtime = SimpleNamespace(client_max_in_flight=client_limit)
+        description = WorkerRoute(
+            identity=WorkerIdentity("worker-a", "start-a"),
+            endpoint="worker:50052",
+            device="cpu",
+            max_active_batches=1,
+            max_pending_batches=2,
+            max_batch_tokens=16,
+            transport_type=transport_type,
+        )
+        resource = await topology._create_worker_resources(description)
+        try:
+            assert capacities == [expected]
+            assert resource.pool.capacity == expected
+            assert resource.target.max_in_flight == 3
+        finally:
+            await topology._close_worker_resources(resource)
+
+    run(scenario())
 
 
 def test_multipart_snapshot_is_installed_only_after_resources_are_ready() -> None:

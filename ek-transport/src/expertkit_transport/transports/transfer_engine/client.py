@@ -145,6 +145,8 @@ class TransferEngineWorkerTransport(WorkerTransport):
         resolved_device = torch.device(device)
         if resolved_device != runtime.device:
             raise ValueError("Transfer Engine device must match its shared runtime")
+        if runtime.client_max_in_flight is not None:
+            max_in_flight = min(max_in_flight, runtime.client_max_in_flight)
         self._endpoint = control_endpoint
         self._spec = endpoint_config
         self._device = resolved_device

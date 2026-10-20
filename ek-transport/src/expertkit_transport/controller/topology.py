@@ -370,6 +370,13 @@ class ControllerTopologyWatcher(TopologyProvider):
             task.add_done_callback(self._cleanup_tasks.discard)
 
     async def _create_worker_resources(self, route: WorkerRoute) -> _WorkerConnectionResources:
+        max_in_flight = route.max_in_flight
+        if (
+            route.transport_type == lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE
+            and self._transport_runtime is not None
+            and self._transport_runtime.client_max_in_flight is not None
+        ):
+            max_in_flight = min(max_in_flight, self._transport_runtime.client_max_in_flight)
         transport = create_worker_transport(
             transport_type=route.transport_type,
             endpoint=route.endpoint,
@@ -381,7 +388,7 @@ class ControllerTopologyWatcher(TopologyProvider):
             top_k=self._top_k,
             dtype=self._dtype,
             device=self._device,
-            max_in_flight=route.max_in_flight,
+            max_in_flight=max_in_flight,
             worker_start_id=route.identity.start_id,
             transport_runtime=self._transport_runtime,
         )
@@ -391,7 +398,7 @@ class ControllerTopologyWatcher(TopologyProvider):
                 hidden_dim=self._hidden_dim,
                 dtype=self._dtype,
                 device=self._device,
-                capacity=route.max_in_flight,
+                capacity=max_in_flight,
             )
         except BaseException:
             await transport.close()

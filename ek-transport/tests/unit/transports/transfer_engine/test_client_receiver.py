@@ -78,11 +78,13 @@ class _FakeRuntime:
         *,
         backend: str = "ascend_direct",
         generation: str = "runtime-generation-a",
+        client_max_in_flight: int | None = None,
     ) -> None:
         self._link = link
         self._session_id = session_id
         self._backend = backend
         self._generation = generation
+        self.client_max_in_flight = client_max_in_flight
         self._closed = False
         self.quarantine_reason: str | None = None
         self.invalidated_sessions: list[str] = []
@@ -233,13 +235,16 @@ async def start_pair(
     max_active_batches: int = 1,
     max_pending_batches: int = 1,
     max_in_flight: int = 2,
+    client_max_in_flight: int | None = None,
     session_close_grace_secs: float = 0.2,
     backend: str = "ascend_direct",
     tracer=None,
     interceptors=(),
 ) -> _RunningPair:
     link = _FakeLink()
-    client_runtime = _FakeRuntime(link, "client:19001", backend=backend)
+    client_runtime = _FakeRuntime(
+        link, "client:19001", backend=backend, client_max_in_flight=client_max_in_flight
+    )
     worker_runtime = _FakeRuntime(link, "worker:19002", backend=backend)
     config = endpoint_config()
     receiver = TransferEngineWorkerBatchReceiver(
@@ -284,6 +289,24 @@ async def complete(received: ReceivedBatch, *, multiplier: float = 2) -> None:
     destination.copy_(partial_output)
     received.release_input()
     await received.complete(destination)
+
+
+@pytest.mark.parametrize(("client_limit", "expected"), [(1, 1), (2, 2), (8, 2), (None, 2)])
+def test_direct_client_limit_bounds_registered_slots_and_admission(
+    client_limit: int | None, expected: int
+) -> None:
+    async def scenario() -> None:
+        pair = await start_pair(client_max_in_flight=client_limit)
+        try:
+            session = next(iter(pair.receiver._sessions.values()))
+            assert session.arena.slot_count == expected
+            for _ in range(expected):
+                await pair.transport._acquire(time.monotonic() + 1)
+            assert pair.transport._semaphore.locked()
+        finally:
+            await pair.close()
+
+    asyncio.run(scenario())
 
 
 def test_worker_pulls_three_inputs_and_writes_one_output() -> None:
@@ -369,7 +392,7 @@ def test_unsafe_rejection_quarantines_worker_slot_and_registered_arena() -> None
 
 def test_slot_is_not_reused_until_output_write_is_terminal() -> None:
     async def scenario() -> None:
-        pair = await start_pair(max_in_flight=1)
+        pair = await start_pair(max_in_flight=2, client_max_in_flight=1)
         pair.link.block_writes = True
         first_output = torch.empty((2, 3), dtype=torch.float32)
         second_output = torch.empty((2, 3), dtype=torch.float32)
@@ -578,7 +601,7 @@ def test_frontend_close_barrier_survives_caller_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        pair = await start_pair(max_in_flight=1)
+        pair = await start_pair(max_in_flight=2, client_max_in_flight=1)
         invalidation_started = asyncio.Event()
         allow_invalidation = asyncio.Event()
         original_invalidate = pair.worker_runtime.invalidate_remote_session
