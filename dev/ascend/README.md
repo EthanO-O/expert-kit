@@ -103,7 +103,7 @@ for the short run and Jaeger UI procedure. `serve.enforce_eager` independently
 keeps eager execution on when tracing is disabled, which is useful for an
 overhead comparison.
 
-## Fixed DeepSeek Decode graphs
+## Fixed Decode graphs
 
 `experiment.ascend_decode_graph` optionally accepts the shared graph deployment
 fields: session/instance/Worker/weight identity, control and rendezvous endpoints,
@@ -111,17 +111,40 @@ routed layer IDs, capture sizes and timeout. It defaults to absent. The
 [DeepSeek-V2-Lite graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
 describes the exact separate engine installation and startup readiness gate.
 
-The generator validates one host, one Frontend and one expert pool with one or two
-Workers on distinct physical devices, BF16 DeepSeek
-geometry, layers1..26, matching identity, unused graph ports and one active
-Worker batch. It emits `ascend-decode-graph.json`, identical Worker settings,
-Frontend identity/mounts and native `FULL_DECODE_ONLY` flags. All participants use
-host networking even when ordinary Prefill Transport is gRPC. Default deployments
-retain their existing output. Two Workers require explicit, disjoint desired
-placement of experts 0..31 and 32..63 on every routed layer; the generator does
+The generator validates one host, one Frontend and one expert pool on distinct
+devices, matching identity, unused graph ports and one active Worker batch.
+It accepts the fixed V2-Lite and Qwen3 profiles, and eight ordered 32-expert
+shards for the exact ModelSlim V4 profile. It emits `ascend-decode-graph.json`,
+identical Worker settings, Frontend identity/mounts and native
+`FULL_DECODE_ONLY` flags. All participants use host networking even when
+ordinary Prefill Transport is gRPC. Default deployment behavior is unchanged.
+For V2-Lite, two Workers require explicit, disjoint desired placement of experts
+0..31 and 32..63 on every routed layer; the generator does
 not create these Controller assignments. Start the Frontend only after actual
 READY routes prove all 1,664 experts have the declared owner and process start ID.
-The pinned single- and two-Worker DeepSeek deployments have passed trained-weight
+
+DeepSeek-V4-Flash W8A8 requires a vLLM-Ascend build with native V4 support.
+Declare 43 layers, 256 experts, hidden size 4096, intermediate size 2048 and
+top-k 6, with these additional model fields:
+
+```yaml
+expert_compute: deepseek_v4
+swiglu_limit: 10.0
+quantization:
+  type: modelslim-w8a8-dynamic
+  bits: 8
+  group_size: null
+  symmetric: true
+```
+
+Set `layer_ids` to all integers from 0 through 42 and declare eight complete
+intervals in `ascend_decode_graph.workers`. Place the Frontend and eight Workers
+on separate devices. The generator writes matching Worker declarations and the native
+Ascend quantization setting. Controller placement must make all 11,008 experts
+READY in those declared shards before the Frontend starts. The V2-Lite recipe's
+expert counts and placement do not apply to V4.
+
+The pinned single- and two-Worker V2-Lite deployments have passed trained-weight
 GMM, full-model replay, natural-EOS and batch/padding checks, healthy graph close,
 and the legacy single-Worker JSON regression. Fault tests kill each role after
 all Begin acknowledgements and before Frontend native replay; all survivors

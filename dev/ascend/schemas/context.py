@@ -154,7 +154,7 @@ class TemplateContext(BaseModel):
 
     @model_validator(mode="after")
     def validate_decode_graph(self) -> Self:
-        """Restrict graph deployment to fixed resident BF16 experts on one host."""
+        """Restrict graph deployment to qualified resident experts on one host."""
         graph = self.ascend_decode_graph
         if graph is None:
             return self
@@ -186,13 +186,20 @@ class TemplateContext(BaseModel):
             model.intermediate_dim,
             model.topk,
         )
-        if geometry == (27, 64, 2048, 1408, 6):
+        if geometry == (27, 64, 2048, 1408, 6) and model.expert_compute == "swiglu":
             routed_layers = tuple(range(1, 27))
-        elif geometry == (48, 128, 2048, 768, 8):
+        elif geometry == (48, 128, 2048, 768, 8) and model.expert_compute == "swiglu":
             routed_layers = tuple(range(48))
+        elif (
+            geometry == (43, 256, 4096, 2048, 6)
+            and model.expert_compute == "deepseek_v4"
+            and model.swiglu_limit == 10.0
+            and model.quantization is not None
+        ):
+            routed_layers = tuple(range(43))
         else:
             raise ValueError(
-                "ascend_decode_graph requires qualified V2-Lite or Qwen3 BF16 geometry"
+                "ascend_decode_graph requires qualified V2-Lite, Qwen3 or ModelSlim V4 computation"
             )
         if graph.layer_ids != routed_layers:
             raise ValueError(

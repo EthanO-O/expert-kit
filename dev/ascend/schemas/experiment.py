@@ -3,7 +3,7 @@
 from __future__ import annotations
 import yaml
 from typing import Self
-from typing import Any
+from typing import Any, Literal
 from pathlib import Path
 from pydantic import AnyHttpUrl, Field, model_validator
 
@@ -11,6 +11,7 @@ from enum import StrEnum
 from expertkit_transport.transports.ascend_graph.config import (
     AscendGraphConfig,
     AscendGraphModel,
+    AscendGraphQuantization,
 )
 
 from .config import ConfigModel
@@ -111,9 +112,19 @@ class ModelConfig(ConfigModel):
     topk: int
     weight_dtype: Dtype
     activation_dtype: Dtype
+    expert_compute: Literal["swiglu", "deepseek_v4"] = "swiglu"
+    swiglu_limit: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    quantization: AscendGraphQuantization | None = None
+
+    @model_validator(mode="after")
+    def validate_computation(self) -> Self:
+        """Keep clipping specific to the declared V4 expert expression."""
+        if self.expert_compute == "swiglu" and self.swiglu_limit != 0:
+            raise ValueError("swiglu_limit requires deepseek_v4 expert computation")
+        return self
 
     def graph_model(self) -> AscendGraphModel:
-        """Map existing deployment geometry to the shared BF16 computation contract."""
+        """Map deployment geometry and computation to the shared graph contract."""
         return AscendGraphModel(
             num_layers=self.num_layers,
             experts_per_layer=self.experts_per_layer,
@@ -123,9 +134,9 @@ class ModelConfig(ConfigModel):
             activation_dtype=str(self.activation_dtype),
             weight_dtype=str(self.weight_dtype),
             activation="silu",
-            expert_compute="swiglu",
-            swiglu_limit=0.0,
-            quantization=None,
+            expert_compute=self.expert_compute,
+            swiglu_limit=self.swiglu_limit,
+            quantization=self.quantization,
         )
 
 

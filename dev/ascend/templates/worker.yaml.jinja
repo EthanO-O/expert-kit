@@ -3,7 +3,7 @@ model:
 {% if ascend_decode_graph %}
   instance_id: {{ ascend_decode_graph.instance_id }}
 {% endif %}
-  weight_version: {{ model.weight_version }}
+  weight_version: {{ model.weight_version | tojson }}
   num_layers: {{ model.num_layers }}
   experts_per_layer: {{ model.experts_per_layer }}
   hidden_dim: {{ model.hidden_dim }}
@@ -11,6 +11,13 @@ model:
   top_k: {{ model.topk }}
   activation_dtype: {{ model.activation_dtype }}
   weight_dtype: {{ model.weight_dtype }}
+{% if model.expert_compute != "swiglu" %}
+  expert_compute: {{ model.expert_compute }}
+  swiglu_limit: {{ model.swiglu_limit }}
+{% endif %}
+{% if model.quantization is not none %}
+  quantization: {{ model.quantization | tojson }}
+{% endif %}
 
 worker:
   id: {{ pool.id }}-{{ worker.id }}

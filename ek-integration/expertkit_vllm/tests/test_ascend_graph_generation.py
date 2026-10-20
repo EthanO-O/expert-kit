@@ -1,4 +1,4 @@
-"""Validate the public fixed one/two-Worker graph deployment materialization."""
+"""Validate the public fixed Worker graph deployment materialization."""
 
 import json
 import os
@@ -63,11 +63,125 @@ def _generate(tmp_path, cluster, experiment):
             "--output",
             str(tmp_path / "generated"),
         ],
-        env={**os.environ, "PYTHONPATH": str(ASCEND)},
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                (str(ASCEND), str(ROOT / "ek-transport/src"), os.environ.get("PYTHONPATH", ""))
+            ),
+        },
         text=True,
         capture_output=True,
         timeout=30,
     )
+
+
+def _v4_inputs(tmp_path):
+    cluster, experiment = _inputs(tmp_path)
+    cluster["pools"][0]["devices"] = list(range(1, 9))
+    experiment["model"].update(
+        name="DeepSeek-V4-Flash-0731-w8a8",
+        weight_version="0731",
+        num_layers=43,
+        experts_per_layer=256,
+        hidden_dim=4096,
+        intermediate_dim=2048,
+        topk=6,
+        expert_compute="deepseek_v4",
+        swiglu_limit=10.0,
+        quantization={
+            "type": "modelslim-w8a8-dynamic",
+            "bits": 8,
+            "group_size": None,
+            "symmetric": True,
+        },
+    )
+    graph = experiment["ascend_decode_graph"]
+    del graph["worker_id"], graph["control_endpoint"]
+    graph.update(
+        weight_version="0731",
+        layer_ids=list(range(43)),
+        rendezvous_port=18090,
+        workers=[
+            {
+                "worker_id": f"worker-pool1-worker-{index:02d}",
+                "control_endpoint": f"192.0.2.10:{18079 + index}",
+                "expert_start": index * 32,
+                "expert_end": (index + 1) * 32,
+            }
+            for index in range(8)
+        ],
+    )
+    return cluster, experiment
+
+
+def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path):
+    from expertkit_worker.config import WorkerConfig
+
+    cluster, experiment = _v4_inputs(tmp_path)
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "generated"
+    shared = json.loads((output / "ascend-decode-graph.json").read_text())
+    assert shared["model"]["expert_compute"] == "deepseek_v4"
+    assert shared["model"]["swiglu_limit"] == 10.0
+    assert shared["model"]["quantization"] == experiment["model"]["quantization"]
+    assert shared["layer_ids"] == list(range(43))
+    configs = sorted((output / "worker-pool1/workers").glob("*.yaml"))
+    assert len(configs) == 8
+    for index, path in enumerate(configs):
+        worker = WorkerConfig.model_validate(yaml.safe_load(path.read_text()))
+        assert worker.model.weight_version == "0731"
+        assert worker.model.expert_compute == "deepseek_v4"
+        assert worker.model.swiglu_limit == 10.0
+        assert worker.model.quantization.model_dump(mode="json") == shared["model"]["quantization"]
+        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
+        assert worker.worker.id == shared["workers"][index]["worker_id"]
+        assert (
+            shared["workers"][index]["expert_start"],
+            shared["workers"][index]["expert_end"],
+        ) == (
+            index * 32,
+            (index + 1) * 32,
+        )
+    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
+    assert serve["data-parallel-size"] == 1
+    assert serve["quantization"] == "ascend"
+    assert serve["dtype"] == "bfloat16"
+    assert serve["trust-remote-code"] is False
+    assert serve["load-format"] == "safetensors"
+    assert serve["safetensors-load-strategy"] == "lazy"
+    assert serve["compilation-config"]["mode"] == "VLLM_COMPILE"
+    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+
+
+@pytest.mark.parametrize("case", ["wrong-limit", "missing-quantization", "partition-gap"])
+def test_v4_generation_rejects_unsupported_computation_or_partition(tmp_path, case):
+    cluster, experiment = _v4_inputs(tmp_path)
+    if case == "wrong-limit":
+        experiment["model"]["swiglu_limit"] = 9.0
+    elif case == "missing-quantization":
+        del experiment["model"]["quantization"]
+    else:
+        experiment["ascend_decode_graph"]["workers"][1]["expert_start"] = 33
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode != 0
+    assert not (tmp_path / "generated").exists()
+
+
+def test_v4_ordinary_generation_keeps_native_modelslim_loader(tmp_path):
+    cluster, experiment = _v4_inputs(tmp_path)
+    del experiment["ascend_decode_graph"]
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "generated"
+    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
+    assert serve["quantization"] == "ascend"
+    assert serve["load-format"] == "safetensors"
+    assert serve["safetensors-load-strategy"] == "lazy"
+    assert "compilation-config" not in serve
+    worker = yaml.safe_load((output / "worker-pool1/workers/worker-00.yaml").read_text())
+    assert worker["model"]["quantization"] == experiment["model"]["quantization"]
+    assert "ascend_decode_graph" not in worker["worker"]
 
 
 def test_graph_generation_reports_missing_model_as_validation_error(tmp_path, monkeypatch):

@@ -8,14 +8,28 @@ data-parallel-size: {{ attention.dp_size }}
 {% if serve.enforce_eager or tracing.enabled %}
 enforce-eager: true
 {% endif %}
+{% if model.quantization is not none %}
+quantization: ascend
+{% endif %}
+{% if model.expert_compute == "deepseek_v4" %}
+load-format: safetensors
+safetensors-load-strategy: lazy
+{% endif %}
 {% if ascend_decode_graph %}
 async-scheduling: false
 enable-prefix-caching: false
 dtype: bfloat16
+{% if model.expert_compute == "deepseek_v4" %}
+trust-remote-code: false
+{% else %}
 trust-remote-code: true
+{% endif %}
 max-num-batched-tokens: 2048
 max-num-seqs: {{ ascend_decode_graph.capture_sizes | max }}
 compilation-config:
+{% if model.expert_compute == "deepseek_v4" %}
+  mode: VLLM_COMPILE
+{% endif %}
   cudagraph_mode: FULL_DECODE_ONLY
   cudagraph_capture_sizes: {{ ascend_decode_graph.capture_sizes | tojson }}
 {% endif %}
