@@ -21,12 +21,13 @@ from expertkit_vllm.experts import remote_moe
 
 def _forward(layer, hidden_states):
     # Exercise the real operation on CPU regardless of the installed dispatch key.
-    return remote_moe._remote_moe_impl(
+    remote_moe._remote_moe_impl(
         hidden_states,
         torch.zeros(hidden_states.shape[0], 2),
         None,
         remote_moe._encode_layer_name(layer.layer_name),
     )
+    return hidden_states
 
 
 def _remote_layer(monkeypatch, *, shared: bool, scaling: float):
@@ -59,6 +60,8 @@ def _remote_layer(monkeypatch, *, shared: bool, scaling: float):
     layer._layer_id = 0
     layer.num_experts = 2
     layer.gate = None
+    layer.graph_config = None
+    layer._requires_fp32_gate = False
     layer.expert_selector = Selector()
     layer._shared_experts_module = Shared() if shared else None
     layer.routed_scaling_factor = scaling

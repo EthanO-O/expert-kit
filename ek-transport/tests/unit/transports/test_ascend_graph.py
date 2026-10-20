@@ -365,3 +365,161 @@ def test_fp32_reduce_zeroes_frontend_each_layer_and_preserves_worker_partial():
             assert torch.equal(buffers.output, torch.full_like(buffers.output, 1.234567))
         else:
             assert all(torch.equal(value, torch.full((2, 4), 9.0)) for value in session._group.seen)
+
+
+def v4_config_data():
+    """Declare the exact eight-shard V4 checkpoint geometry."""
+    data = two_worker_config().model_dump()
+    data["model"].update(
+        num_layers=43,
+        experts_per_layer=256,
+        hidden_dim=4096,
+        expert_intermediate_dim=2048,
+        top_k=6,
+        expert_compute="deepseek_v4",
+        swiglu_limit=10.0,
+        quantization={
+            "type": "modelslim-w8a8-dynamic",
+            "bits": 8,
+            "group_size": None,
+            "symmetric": True,
+        },
+    )
+    data["workers"] = [
+        {
+            "worker_id": f"worker{rank}",
+            "control_endpoint": f"127.0.0.1:{12344 + rank}",
+            "expert_start": rank * 32,
+            "expert_end": (rank + 1) * 32,
+        }
+        for rank in range(8)
+    ]
+    return data
+
+
+def test_exact_v4_requires_eight_ordered_32_expert_shards():
+    config = AscendGraphConfig.model_validate(v4_config_data())
+    assert len(config.participants) == 8
+    assert [config.worker_rank(f"worker{rank}") for rank in range(8)] == list(range(1, 9))
+    assert (
+        AscendGraphConfig.model_validate_json(config.model_dump_json()).identity()
+        == config.identity()
+    )
+    for workers in (
+        [{**v4_config_data()["workers"][0], "expert_end": 256}],
+        [
+            {**worker, "expert_start": rank * 128, "expert_end": (rank + 1) * 128}
+            for rank, worker in enumerate(v4_config_data()["workers"][:2])
+        ],
+        list(reversed(v4_config_data()["workers"])),
+    ):
+        with pytest.raises(ValidationError, match="partition"):
+            AscendGraphConfig.model_validate({**v4_config_data(), "workers": workers})
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"num_layers": 42},
+        {"hidden_dim": 2048},
+        {"expert_intermediate_dim": 2047},
+        {"experts_per_layer": 255},
+        {"top_k": 5},
+        {"swiglu_limit": 9.0},
+        {"expert_compute": "swiglu", "swiglu_limit": 0.0},
+        {"quantization": None},
+        {
+            "quantization": {
+                "type": "modelslim-w8a8-dynamic",
+                "bits": 4,
+                "group_size": None,
+                "symmetric": True,
+            }
+        },
+    ],
+)
+def test_eight_workers_reject_near_v4_declarations(update):
+    data = v4_config_data()
+    data["model"].update(update)
+    with pytest.raises(ValidationError):
+        AscendGraphConfig.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "index,update",
+    [
+        (0, {"expert_end": 31}),
+        (1, {"expert_start": 31}),
+        (1, {"expert_start": 33}),
+        (7, {"expert_end": 255}),
+        (1, {"worker_id": "worker0"}),
+        (1, {"control_endpoint": "127.0.0.1:12344"}),
+    ],
+)
+def test_v4_partition_preserves_ownership_and_identity_checks(index, update):
+    data = v4_config_data()
+    data["workers"][index].update(update)
+    with pytest.raises(ValidationError):
+        AscendGraphConfig.model_validate(data)
+
+
+@pytest.mark.parametrize("workers", [1, 2, 8])
+def test_real_buffer_allocation_selects_multiworker_fp32_reduction(workers):
+    from expertkit_transport.transports.ascend_graph.session import HcclGraphSession
+
+    config = (
+        config_for()
+        if workers == 1
+        else two_worker_config()
+        if workers == 2
+        else AscendGraphConfig.model_validate(v4_config_data())
+    )
+
+    class Group:
+        def __init__(self, rank):
+            self.rank = rank
+            self.reductions = 0
+            self.broadcasts = 0
+
+        def reduce(self, tensors, options):
+            self.reductions += 1
+            assert tensors[0].dtype == torch.float32
+            assert options.rootRank == 0
+            if self.rank == 0:
+                assert torch.count_nonzero(tensors[0]) == 0
+                tensors[0].fill_(1.234567)
+            else:
+                assert torch.all(tensors[0] == 9)
+            return self
+
+        def broadcast(self, tensors, options):
+            self.broadcasts += 1
+            assert options.rootRank == 1
+            assert tensors[0].dtype == torch.bfloat16
+            return self
+
+        def wait(self):
+            return None
+
+    for rank in (0, workers):
+        session = HcclGraphSession.__new__(HcclGraphSession)
+        session.config, session.rank = config, rank
+        session.device = torch.device("cpu")
+        session._hidden_dim, session._top_k = config.model.hidden_dim, config.model.top_k
+        session._buffers = {}
+        session._group = Group(rank)
+        buffers = session.buffers(1)
+        assert session.buffers(1) is buffers
+        assert buffers.output.dtype == torch.bfloat16
+        assert (buffers.partial_output is not None) == (workers > 1)
+        if buffers.partial_output is not None:
+            assert buffers.partial_output.dtype == torch.float32
+            buffers.partial_output.fill_(9)
+        for _ in range(2):
+            session.combine(buffers)
+        if workers > 1:
+            assert session._group.reductions == 2 and session._group.broadcasts == 0
+            if rank == 0:
+                assert torch.equal(buffers.output, torch.full_like(buffers.output, 1.234567))
+        else:
+            assert session._group.broadcasts == 2 and session._group.reductions == 0

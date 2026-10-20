@@ -16,7 +16,10 @@ import structlog
 import torch
 from expertkit_transport.ascend_graph import AscendGraphConfig, GraphStepControl, HcclGraphSession
 from expertkit_transport.quarantine import retain_until_process_exit
-from expertkit_transport.transports.ascend_graph.config import AscendGraphModel
+from expertkit_transport.transports.ascend_graph.config import (
+    AscendGraphModel,
+    AscendGraphQuantization,
+)
 
 logger = structlog.get_logger(__name__)
 _ACTIVE: ContextVar[DecodeGraphSession | None] = ContextVar("ek_decode_graph_session", default=None)
@@ -40,6 +43,51 @@ def graph_config_from_environment() -> AscendGraphConfig | None:
 def active_graph_session() -> DecodeGraphSession | None:
     """Return the whole-step session active during native graph capture."""
     return _ACTIVE.get()
+
+
+def _native_graph_quantization(vllm_config: Any) -> AscendGraphQuantization | None:
+    """Resolve the qualified expert recipe from the actual native configuration."""
+    model = vllm_config.model_config
+    native = getattr(vllm_config, "quant_config", None)
+    is_v4 = model.hf_text_config.model_type == "deepseek_v4"
+    if model.quantization is None and native is None and not is_v4:
+        return None
+    if (
+        model.hf_text_config.model_type not in ("qwen3_moe", "deepseek_v4")
+        or model.quantization != "ascend"
+    ):
+        raise ValueError("Ascend graph native quantization recipe is not qualified")
+
+    from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
+
+    if type(native) is not AscendModelSlimConfig:
+        raise ValueError("Ascend graph requires the native ModelSlim configuration")
+    description = native.quant_description
+    for layer_id in range(model.hf_text_config.num_hidden_layers):
+        prefix = f"model.layers.{layer_id}.mlp"
+        if description.get(f"{prefix}.gate.weight") != "FLOAT":
+            raise ValueError("Ascend graph requires unquantized native router gates")
+        if is_v4:
+            routing_parameter = "tid2eid" if layer_id < 3 else "bias"
+            if description.get(f"{prefix}.gate.{routing_parameter}") != "FLOAT":
+                raise ValueError("Ascend graph requires native V4 routing metadata descriptors")
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                name = f"{prefix}.shared_experts.{projection}.weight"
+                if description.get(name) != "W8A8_DYNAMIC":
+                    raise ValueError("Ascend graph requires native V4 ModelSlim shared experts")
+        expert_count = (
+            model.hf_text_config.n_routed_experts if is_v4 else model.hf_text_config.num_experts
+        )
+        for expert_id in range(expert_count):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                name = f"{prefix}.experts.{expert_id}.{projection}.weight"
+                if description.get(name) != "W8A8_DYNAMIC":
+                    raise ValueError(
+                        "Ascend graph requires every expert to use ModelSlim W8A8 dynamic"
+                    )
+    return AscendGraphQuantization(
+        type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True
+    )
 
 
 def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
@@ -88,10 +136,32 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
             raise ValueError("Qwen3 graph shared experts do not match the qualified model")
         experts_per_layer = hf.num_experts
         routed_layers = tuple(range(hf.num_hidden_layers))
+    elif hf.model_type == "deepseek_v4":
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        expected = {
+            "num_hidden_layers": 43,
+            "hidden_size": 4096,
+            "moe_intermediate_size": 2048,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "num_hash_layers": 3,
+            "scoring_func": "sqrtsoftplus",
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 1.5,
+            "swiglu_limit": 10.0,
+            "hidden_act": "silu",
+            "vocab_size": 129280,
+        }
+        if getattr(hf, "vision_n_layers", 0) != 0 or get_ascend_config().mix_placement:
+            raise ValueError("Ascend Decode graph V4 requires the text-only fixed placement")
+        experts_per_layer = hf.n_routed_experts
+        routed_layers = tuple(range(hf.num_hidden_layers))
     else:
         raise ValueError("Ascend Decode graph model is not qualified")
     if any(getattr(hf, name, None) != value for name, value in expected.items()):
-        raise ValueError("Ascend Decode graph model does not match qualified BF16 semantics")
+        raise ValueError("Ascend Decode graph model does not match qualified semantics")
     native_model = AscendGraphModel(
         num_layers=hf.num_hidden_layers,
         experts_per_layer=experts_per_layer,
@@ -101,9 +171,9 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
         activation_dtype="bf16",
         weight_dtype="bf16",
         activation=hf.hidden_act,
-        expert_compute="swiglu",
-        swiglu_limit=0.0,
-        quantization=None,
+        expert_compute="deepseek_v4" if hf.model_type == "deepseek_v4" else "swiglu",
+        swiglu_limit=10.0 if hf.model_type == "deepseek_v4" else 0.0,
+        quantization=_native_graph_quantization(vllm_config),
     )
     if config.model != native_model:
         raise ValueError("Ascend graph model declaration does not match the native Frontend model")
@@ -118,7 +188,6 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
         or parallel.enable_expert_parallel
         or model.enforce_eager
         or model.dtype != torch.bfloat16
-        or model.quantization is not None
         or vllm_config.speculative_config is not None
         or vllm_config.lora_config is not None
         or vllm_config.scheduler_config.async_scheduling

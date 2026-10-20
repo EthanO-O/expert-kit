@@ -149,3 +149,56 @@ def test_pyproject_pins_vllm_and_registers_the_plugin() -> None:
     entry_points = pyproject["project"]["entry-points"]["vllm.general_plugins"]
     assert entry_points == {"register_expertkit": "expertkit_vllm.plugin:register"}
     assert pyproject["build-system"]["build-backend"] == "hatchling.build"
+
+
+def test_register_updates_preimported_native_ascend_model_factory(monkeypatch):
+    modules, platform = install_fake_vllm_modules(monkeypatch, device_type="npu")
+    platform.pre_register_and_update()
+    model = types.ModuleType("vllm_ascend.models.deepseek_v4.model")
+    original = modules["vllm.model_executor.layers.fused_moe.layer"].FusedMoE
+    model.FusedMoE = original
+    monkeypatch.setitem(sys.modules, model.__name__, model)
+    monkeypatch.setattr(platform, "pre_register_and_update", lambda: None)
+    monkeypatch.setenv("EK_ENABLE", "1")
+    plugin.register()
+    assert model.FusedMoE is modules["vllm.model_executor.layers.fused_moe.layer"].FusedMoE
+    assert model.FusedMoE is not original
+
+
+def test_register_updates_native_model_imported_before_platform_registration(monkeypatch):
+    modules, _ = install_fake_vllm_modules(monkeypatch, device_type="npu")
+    model = types.ModuleType("vllm_ascend.models.deepseek_v4.model")
+    original = modules["vllm.model_executor.layers.fused_moe.layer"].FusedMoE
+    model.FusedMoE = original
+    monkeypatch.setitem(sys.modules, model.__name__, model)
+    custom = types.ModuleType("vllm_ascend.models.custom_model")
+    custom.FusedMoE = object()
+    original_custom = custom.FusedMoE
+    monkeypatch.setitem(sys.modules, custom.__name__, custom)
+    monkeypatch.setenv("EK_ENABLE", "1")
+    plugin.register()
+    assert model.FusedMoE is modules["vllm.model_executor.layers.fused_moe.layer"].FusedMoE
+    assert model.FusedMoE is not original
+    assert custom.FusedMoE is original_custom
+
+
+def test_register_updates_native_alias_after_external_platform_registration(monkeypatch):
+    modules, platform = install_fake_vllm_modules(monkeypatch, device_type="npu")
+    original = modules["vllm.model_executor.layers.fused_moe.layer"].FusedMoE
+    model = types.ModuleType("vllm_ascend.models.deepseek_v4.model")
+    model.FusedMoE = original
+    patch = types.ModuleType("vllm_ascend.patch.platform.patch_fused_moe")
+    patch._original_FusedMoE = original
+    custom = types.ModuleType("vllm_ascend.models.custom_model")
+    custom.FusedMoE = object()
+    original_custom = custom.FusedMoE
+    for module in (model, patch, custom):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    platform.pre_register_and_update()
+    assert model.FusedMoE is original
+    assert modules["vllm.model_executor.layers.fused_moe"].FusedMoE is not original
+    monkeypatch.setenv("EK_ENABLE", "1")
+    plugin.register()
+    assert model.FusedMoE is modules["vllm.model_executor.layers.fused_moe.layer"].FusedMoE
+    assert model.FusedMoE is not original
+    assert custom.FusedMoE is original_custom

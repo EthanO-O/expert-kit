@@ -365,6 +365,268 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
             graph.validate_graph_model(runtime, conflicting)
 
 
+@pytest.fixture
+def modelslim_graph_deployment(monkeypatch):
+    monkeypatch.setattr(
+        graph,
+        "version",
+        lambda name: {
+            "vllm": "0.30.0",
+            "torch-npu": "2.10.0.post4",
+            "vllm-ascend": "0.1.dev1+g8d4409d62.d20261013",
+        }[name],
+    )
+    monkeypatch.setattr(torch, "__version__", "2.10.0")
+    monkeypatch.setenv("EK_INSTANCE_ID", "7")
+    geometry = dict(
+        model_type="qwen3_moe",
+        num_hidden_layers=48,
+        hidden_size=2048,
+        moe_intermediate_size=768,
+        num_experts=128,
+        num_experts_per_tok=8,
+        decoder_sparse_step=1,
+        norm_topk_prob=True,
+        mlp_only_layers=[],
+        hidden_act="silu",
+    )
+    description = {
+        f"model.layers.{layer}.mlp.experts.{expert}.{projection}.weight": "W8A8_DYNAMIC"
+        for layer in range(48)
+        for expert in range(128)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    description.update({f"model.layers.{layer}.mlp.gate.weight": "FLOAT" for layer in range(48)})
+
+    class NativeModelSlimConfig:
+        def __init__(self):
+            self.quant_description = description
+
+    module_name = "vllm_ascend.quantization.configs.modelslim_config"
+    module = ModuleType(module_name)
+    module.AscendModelSlimConfig = NativeModelSlimConfig
+    monkeypatch.setitem(sys.modules, module_name, module)
+    config = AscendGraphConfig(
+        session_id="modelslim-native-v1",
+        instance_id=7,
+        worker_id="worker-0",
+        weight_version="official",
+        control_endpoint="127.0.0.1:18079",
+        rendezvous_host="127.0.0.1",
+        rendezvous_port=18080,
+        layer_ids=tuple(range(48)),
+        capture_sizes=(1, 32, 64),
+        model=dict(
+            num_layers=48,
+            experts_per_layer=128,
+            hidden_dim=2048,
+            expert_intermediate_dim=768,
+            top_k=8,
+            activation_dtype="bf16",
+            weight_dtype="bf16",
+            activation="silu",
+            expert_compute="swiglu",
+            swiglu_limit=0.0,
+            quantization=dict(
+                type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True
+            ),
+        ),
+    )
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(**geometry),
+            enforce_eager=False,
+            dtype=torch.bfloat16,
+            quantization="ascend",
+        ),
+        quant_config=NativeModelSlimConfig(),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
+            enable_eplb=False,
+            enable_expert_parallel=False,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=64),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            cudagraph_capture_sizes=[1, 32, 64],
+        ),
+        speculative_config=None,
+        lora_config=None,
+    )
+    return runtime, config
+
+
+def test_modelslim_native_recipe_matches_complete_shared_declaration(modelslim_graph_deployment):
+    runtime, config = modelslim_graph_deployment
+    graph.validate_graph_model(runtime, config)
+    conflicting = AscendGraphConfig.model_validate(
+        {
+            **config.model_dump(),
+            "model": {**config.model.model_dump(), "quantization": None},
+        }
+    )
+    with pytest.raises(ValueError, match="declaration does not match"):
+        graph.validate_graph_model(runtime, conflicting)
+    runtime.parallel_config.tensor_parallel_size = 2
+    with pytest.raises(ValueError, match="single-rank"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("model.layers.47.mlp.gate.weight", "W8A8_DYNAMIC"),
+        ("model.layers.47.mlp.experts.127.down_proj.weight", "W8A8"),
+        ("model.layers.0.mlp.experts.0.up_proj.weight", None),
+    ],
+)
+def test_modelslim_requires_every_exact_native_descriptor(modelslim_graph_deployment, name, value):
+    runtime, config = modelslim_graph_deployment
+    if value is None:
+        del runtime.quant_config.quant_description[name]
+    else:
+        runtime.quant_config.quant_description[name] = value
+    with pytest.raises(ValueError, match="requires"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.mark.parametrize(
+    "change", ["native_type", "missing_native", "bf16_with_native", "other_quant"]
+)
+def test_modelslim_rejects_inconsistent_native_configuration(modelslim_graph_deployment, change):
+    runtime, config = modelslim_graph_deployment
+    if change == "native_type":
+        runtime.quant_config = SimpleNamespace(
+            quant_description=runtime.quant_config.quant_description
+        )
+    elif change == "missing_native":
+        runtime.quant_config = None
+    else:
+        runtime.model_config.quantization = None if change == "bf16_with_native" else "gptq"
+    with pytest.raises(ValueError, match="native"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.fixture
+def v4_graph_deployment(modelslim_graph_deployment, monkeypatch):
+    runtime, previous = modelslim_graph_deployment
+    runtime.model_config.hf_text_config = SimpleNamespace(
+        model_type="deepseek_v4",
+        num_hidden_layers=43,
+        hidden_size=4096,
+        moe_intermediate_size=2048,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        num_experts_per_tok=6,
+        num_hash_layers=3,
+        scoring_func="sqrtsoftplus",
+        norm_topk_prob=True,
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+        hidden_act="silu",
+        vocab_size=129280,
+    )
+    description = {
+        f"model.layers.{layer}.mlp.experts.{expert}.{projection}.weight": "W8A8_DYNAMIC"
+        for layer in range(43)
+        for expert in range(256)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    for layer in range(43):
+        prefix = f"model.layers.{layer}.mlp"
+        description[f"{prefix}.gate.weight"] = "FLOAT"
+        description[f"{prefix}.gate.{'tid2eid' if layer < 3 else 'bias'}"] = "FLOAT"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            description[f"{prefix}.shared_experts.{projection}.weight"] = "W8A8_DYNAMIC"
+    runtime.quant_config.quant_description = description
+    ascend = ModuleType("vllm_ascend.ascend_config")
+    ascend.get_ascend_config = lambda: SimpleNamespace(mix_placement=False)
+    monkeypatch.setitem(sys.modules, ascend.__name__, ascend)
+    declaration = {
+        **previous.model.model_dump(),
+        "num_layers": 43,
+        "experts_per_layer": 256,
+        "hidden_dim": 4096,
+        "expert_intermediate_dim": 2048,
+        "top_k": 6,
+        "expert_compute": "deepseek_v4",
+        "swiglu_limit": 10.0,
+    }
+    config = AscendGraphConfig.model_validate(
+        {
+            **previous.model_dump(exclude={"worker_id", "control_endpoint"}),
+            "model": declaration,
+            "layer_ids": tuple(range(43)),
+            "workers": tuple(
+                dict(
+                    worker_id=f"worker-{rank}",
+                    control_endpoint=f"127.0.0.1:{18100 + rank}",
+                    expert_start=32 * rank,
+                    expert_end=32 * (rank + 1),
+                )
+                for rank in range(8)
+            ),
+        }
+    )
+    return runtime, config
+
+
+def test_v4_graph_requires_complete_native_declaration_and_layer_order(v4_graph_deployment):
+    runtime, config = v4_graph_deployment
+    graph.validate_graph_model(runtime, config)
+    declaration = config.model.model_dump()
+    declaration["expert_compute"], declaration["swiglu_limit"] = "swiglu", 0.0
+    conflicting = config.model_copy(update={"model": type(config.model)(**declaration)})
+    with pytest.raises(ValueError, match="declaration does not match"):
+        graph.validate_graph_model(runtime, conflicting)
+    with pytest.raises(ValueError, match="every routed model layer"):
+        graph.validate_graph_model(runtime, config.model_copy(update={"layer_ids": (0,)}))
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("model.layers.42.mlp.gate.weight", "W8A8_DYNAMIC"),
+        ("model.layers.42.mlp.experts.255.down_proj.weight", "W8A8"),
+        ("model.layers.42.mlp.shared_experts.up_proj.weight", None),
+        ("model.layers.2.mlp.gate.tid2eid", None),
+        ("model.layers.42.mlp.gate.bias", "W8A8_DYNAMIC"),
+    ],
+)
+def test_v4_graph_requires_every_exact_native_descriptor(v4_graph_deployment, name, value):
+    runtime, config = v4_graph_deployment
+    if value is None:
+        del runtime.quant_config.quant_description[name]
+    else:
+        runtime.quant_config.quant_description[name] = value
+    with pytest.raises(ValueError, match="requires"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.mark.parametrize("change", ["unquantized", "wrong_native", "vision", "mix", "router"])
+def test_v4_graph_rejects_unqualified_native_semantics(v4_graph_deployment, change):
+    runtime, config = v4_graph_deployment
+    if change == "unquantized":
+        runtime.model_config.quantization = runtime.quant_config = None
+    elif change == "wrong_native":
+        runtime.quant_config = SimpleNamespace(
+            quant_description=runtime.quant_config.quant_description
+        )
+    elif change == "vision":
+        runtime.model_config.hf_text_config.vision_n_layers = 1
+    elif change == "mix":
+        sys.modules["vllm_ascend.ascend_config"].get_ascend_config = lambda: SimpleNamespace(
+            mix_placement=True
+        )
+    else:
+        runtime.model_config.hf_text_config.routed_scaling_factor = 1.0
+    with pytest.raises(ValueError):
+        graph.validate_graph_model(runtime, config)
+
+
 def test_exchange_uses_shared_hidden_and_top_k_without_device_reads():
     config = AscendGraphConfig(
         session_id="frontend-buffer-0061",

@@ -1,4 +1,4 @@
-"""Address-stable HCCL buffers used inside a fixed one/two-Worker device graph."""
+"""Address-stable HCCL buffers used inside a fixed Worker partition's device graph."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class HcclGraphSession:
                 torch.zeros(capacity, self._top_k, dtype=torch.float32, device=self.device),
                 torch.empty(capacity, self._hidden_dim, dtype=torch.bfloat16, device=self.device),
                 torch.empty(capacity, self._hidden_dim, dtype=torch.float32, device=self.device)
-                if len(self.config.participants) == 2
+                if len(self.config.participants) > 1
                 else None,
             )
         return self._buffers[capacity]
@@ -127,7 +127,7 @@ class HcclGraphSession:
         retain_until_process_exit(self)
 
     def close(self) -> None:
-        """Release the isolated group only after both peers prove completion.
+        """Release the isolated group only after every peer proves completion.
 
         Owners must destroy every graph referencing these buffers first. A peer
         failure instead quarantines the session and terminates its process.

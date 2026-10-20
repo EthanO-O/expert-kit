@@ -17,11 +17,20 @@ def register() -> None:
 
     from vllm.platforms import current_platform
 
+    loaded_package = sys.modules.get("vllm.model_executor.layers.fused_moe")
+    previous_factory = (
+        getattr(loaded_package, "FusedMoEFactory", getattr(loaded_package, "FusedMoE", None))
+        if loaded_package is not None
+        else None
+    )
+    original_ascend_factory = None
     if current_platform.device_type == "npu":
         # General-plugin ordering is not a platform contract. Force the public
         # Ascend pre-registration hook to install its FusedMoE wrapper before
         # Expert Kit captures the active factory.
         current_platform.pre_register_and_update()
+        loaded_patch = sys.modules.get("vllm_ascend.patch.platform.patch_fused_moe")
+        original_ascend_factory = getattr(loaded_patch, "_original_FusedMoE", None)
 
     from expertkit_vllm.tracing import install_forward_tracing
 
@@ -45,9 +54,21 @@ def register() -> None:
         fused_moe_package.__dict__[factory_name] = remote_factory
         for name, module in tuple(sys.modules.items()):
             if (
-                name.startswith(("vllm.model_executor.models.", "vllm.models."))
+                name.startswith(
+                    ("vllm.model_executor.models.", "vllm.models.", "vllm_ascend.models.")
+                )
                 and module is not None
-                and module.__dict__.get(factory_name) is platform_factory
+                and (
+                    module.__dict__.get(factory_name) is platform_factory
+                    or (
+                        previous_factory is not None
+                        and module.__dict__.get(factory_name) is previous_factory
+                    )
+                    or (
+                        original_ascend_factory is not None
+                        and module.__dict__.get(factory_name) is original_ascend_factory
+                    )
+                )
             ):
                 module.__dict__[factory_name] = remote_factory
         logger.info(

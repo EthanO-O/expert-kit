@@ -86,6 +86,7 @@ def test_default_selector_delegates_to_the_vllm_router() -> None:
 
 def test_ascend_selector_loads_lazily_and_forwards_routing_options(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
+    imports = []
     weights = torch.tensor([[0.6, 0.4]])
     ids = torch.tensor([[2, 5]], dtype=torch.int32)
 
@@ -93,13 +94,14 @@ def test_ascend_selector_loads_lazily_and_forwards_routing_options(monkeypatch) 
         calls.append(kwargs)
         return weights, ids
 
-    monkeypatch.setattr(
-        selector,
-        "import_module",
-        lambda name: SimpleNamespace(select_experts=ascend_select_experts),
-    )
+    def load_module(name):
+        imports.append(name)
+        return SimpleNamespace(select_experts=ascend_select_experts)
+
+    monkeypatch.setattr(selector, "import_module", load_module)
     tid2eid = torch.arange(8)
     adapter = selector.AscendExpertSelector(_options(), tid2eid=tid2eid)
+    assert imports == []
     hidden_states = torch.zeros(1, 4)
     router_logits = torch.zeros(1, 8)
     input_ids = torch.tensor([13])
@@ -134,6 +136,12 @@ def test_ascend_selector_loads_lazily_and_forwards_routing_options(monkeypatch) 
     assert call["num_experts"] == 8
     assert call["input_ids"] is input_ids
     assert call["tid2eid"] is tid2eid
+    assert adapter.select_experts(hidden_states, router_logits, input_ids=input_ids) == (
+        weights,
+        ids,
+    )
+    assert len(calls) == 2
+    assert imports == ["vllm_ascend.ops.fused_moe.experts_selector"]
 
 
 def test_factory_uses_ascend_only_for_the_npu_platform(monkeypatch) -> None:

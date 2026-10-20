@@ -91,7 +91,7 @@ class AscendGraphWorker(BaseModel):
 
 
 class AscendGraphConfig(BaseModel):
-    """Declare the identity, graph capacities and fixed one/two-Worker group.
+    """Declare identity, capacities and the model's fixed Worker partition.
 
     All participants consume the same document. Changing any field requires a new
     session and process restart; graph mode does not perform online migration.
@@ -132,8 +132,20 @@ class AscendGraphConfig(BaseModel):
             raise ValueError("provide workers or both legacy Worker fields")
         participants = self.participants
         boundaries = [0, *(worker.expert_end for worker in participants)]
+        v4 = (
+            self.model.num_layers,
+            self.model.experts_per_layer,
+            self.model.hidden_dim,
+            self.model.expert_intermediate_dim,
+            self.model.top_k,
+            self.model.expert_compute,
+            self.model.swiglu_limit,
+        ) == (43, 256, 4096, 2048, 6, "deepseek_v4", 10.0) and self.model.quantization is not None
         if (
-            len(participants) not in (1, 2)
+            (len(participants) != 8 if v4 else len(participants) not in (1, 2))
+            or (
+                v4 and any(worker.expert_end - worker.expert_start != 32 for worker in participants)
+            )
             or boundaries[-1] != self.model.experts_per_layer
             or any(
                 worker.expert_start != start
@@ -141,7 +153,8 @@ class AscendGraphConfig(BaseModel):
             )
         ):
             raise ValueError(
-                "graph Workers must partition all model experts into one or two fixed intervals"
+                "graph Workers must partition all model experts into one or two fixed intervals, "
+                "or eight 32-expert intervals for the exact ModelSlim V4 declaration"
             )
         if self.layer_ids[-1] >= self.model.num_layers:
             raise ValueError("graph layer IDs exceed model.num_layers")

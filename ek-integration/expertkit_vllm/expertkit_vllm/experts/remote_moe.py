@@ -71,14 +71,14 @@ def _remote_moe_impl(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None,
     layer_name: _LayerNameType,
-) -> torch.Tensor:
+) -> None:
+    """Mutate the declared input without returning an undeclared output alias."""
     context = get_forward_context()
     layer = context.no_compile_layers[_resolve_layer_name(layer_name)]
     if not isinstance(layer, RemoteMoERunner):
         raise RuntimeError("the vLLM forward context contains the wrong Expert Kit layer")
     result = layer._forward_impl(hidden_states, router_logits, input_ids)
     hidden_states.copy_(result)
-    return hidden_states
 
 
 def _remote_moe_fake(
@@ -86,8 +86,8 @@ def _remote_moe_fake(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None,
     layer_name: _LayerNameType,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+) -> None:
+    return None
 
 
 direct_register_custom_op(
@@ -210,7 +210,36 @@ class RemoteMoERunner(MoERunnerInterface):
         self._layer_id = _layer_id(layer_name)
         self.router = router
         self.routed_experts = routed_experts
+        self._is_deepseek_v4 = getattr(routed_experts, "is_deepseek_v4", False)
         self.gate = gate
+        if gate is not None and not hasattr(gate, "weight_fp32"):
+            # The native Ascend linear loader creates this persistent parameter.
+            gate.precast_fp32_weight = True
+        gate_method = type(getattr(gate, "quant_method", None))
+        self._requires_fp32_gate = (
+            gate_method.__module__ == "vllm_ascend.ops.linear"
+            and gate_method.__name__ == "AscendUnquantizedLinearMethod"
+        )
+        if self._is_deepseek_v4:
+            if (
+                not self._requires_fp32_gate
+                or shared_experts is None
+                or routed_scaling_factor != 1.0
+            ):
+                raise ValueError(
+                    "V4 requires its native FP32 gate, local shared expert and router-only scaling"
+                )
+            table = routed_experts.tid2eid
+            if tid2eid is not None and tid2eid is not table:
+                raise ValueError("V4 runner and native gate hash table references conflict")
+            tid2eid = table
+            if self._layer_id < 3:
+                if table is None or table.shape != (129280, 6) or table.dtype != torch.int32:
+                    raise ValueError("V4 hash layers require the native checkpoint table")
+                if routed_experts.e_score_correction_bias is not None:
+                    raise ValueError("V4 hash layers must not use a correction bias")
+            elif table is not None or routed_experts.e_score_correction_bias is None:
+                raise ValueError("V4 nonhash layers require their native correction bias")
         self._shared_experts_module = shared_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.expert_selector: ExpertSelector = create_expert_selector(
@@ -324,17 +353,21 @@ class RemoteMoERunner(MoERunnerInterface):
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run this layer as an eager split between compiled vLLM segments."""
+        """Write this layer's output into hidden_states and return that tensor.
+
+        The output preserves the input's shape, dtype, device and storage.
+        """
 
         if shared_experts_input is not None:
             raise ValueError("Expert Kit does not support separate shared-expert inputs")
 
-        return torch.ops.vllm.expertkit_remote_moe(
+        torch.ops.vllm.expertkit_remote_moe(
             hidden_states,
             router_logits,
             input_ids,
             _encode_layer_name(self.layer_name),
         )
+        return hidden_states
 
     @traced("frontend.moe")
     def _forward_impl(
@@ -346,6 +379,14 @@ class RemoteMoERunner(MoERunnerInterface):
         trace_attributes(
             {"expertkit.layer_id": self.layer_id, "expertkit.token_count": hidden_states.shape[0]}
         )
+        if (
+            (self.graph_config is not None or getattr(self, "_is_deepseek_v4", False))
+            and self._requires_fp32_gate
+            and not hasattr(self.gate, "weight_fp32")
+        ):
+            raise RuntimeError(
+                "Ascend internal gate requires post-load FP32 weights before capture"
+            )
         graph_session = active_graph_session()
         if (is_dummy_forward() or is_graph_profile()) and graph_session is None:
             # Idle DP tokens need local output buffers, but no remote computation.
@@ -353,10 +394,22 @@ class RemoteMoERunner(MoERunnerInterface):
         else:
             with trace_span("frontend.route"):
                 if self.gate is not None:
-                    if self.graph_config is None and hasattr(self.gate, "weight_fp32"):
+                    if hasattr(self.gate, "weight_fp32"):
                         # Ascend preserves FP32 gate weights for stable expert selection.
+                        if getattr(self, "_is_deepseek_v4", False):
+                            if (
+                                router_logits.dtype != torch.float32
+                                or router_logits.shape != hidden_states.shape
+                                or router_logits.device != hidden_states.device
+                            ):
+                                raise ValueError(
+                                    "V4 internal gate requires the original FP32 normalized input"
+                                )
+                            gate_input = router_logits
+                        else:
+                            gate_input = hidden_states.float()
                         router_logits = torch.nn.functional.linear(
-                            hidden_states.float(), self.gate.weight_fp32
+                            gate_input, self.gate.weight_fp32
                         )
                     else:
                         router_logits = _unwrap_tensor(self.gate(hidden_states))

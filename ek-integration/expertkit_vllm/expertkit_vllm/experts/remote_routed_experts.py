@@ -68,8 +68,61 @@ class RemoteRoutedExperts(nn.Module):
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
+        # The native gate owns registration and checkpoint loading of this table.
+        object.__setattr__(self, "tid2eid", tid2eid)
 
         vllm_config = get_current_vllm_config()
+        hf = vllm_config.model_config.hf_text_config
+        self.is_deepseek_v4 = getattr(hf, "model_type", None) == "deepseek_v4"
+        if self.is_deepseek_v4:
+            from vllm_ascend.ascend_config import get_ascend_config
+            from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
+
+            expected = {
+                "num_hidden_layers": 43,
+                "hidden_size": 4096,
+                "moe_intermediate_size": 2048,
+                "n_routed_experts": 256,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 6,
+                "num_hash_layers": 3,
+                "scoring_func": "sqrtsoftplus",
+                "norm_topk_prob": True,
+                "routed_scaling_factor": 1.5,
+                "swiglu_limit": 10.0,
+                "hidden_act": "silu",
+                "vocab_size": 129280,
+            }
+            if (
+                any(getattr(hf, name, None) != value for name, value in expected.items())
+                or getattr(hf, "vision_n_layers", 0) != 0
+                or vllm_config.model_config.quantization != "ascend"
+                or type(quant_config) is not AscendModelSlimConfig
+                or vllm_config.quant_config is not quant_config
+                or params_dtype != torch.bfloat16
+                or (
+                    moe_config.num_experts,
+                    moe_config.num_logical_experts,
+                    moe_config.hidden_dim,
+                    moe_config.intermediate_size,
+                    self.top_k,
+                )
+                != (256, 256, 4096, 2048, 6)
+                or vllm_config.parallel_config.data_parallel_size != 1
+                or vllm_config.parallel_config.pipeline_parallel_size != 1
+                or get_ascend_config().mix_placement
+                or not renormalize
+                or scoring_func != "sqrtsoftplus"
+                or routed_scaling_factor != 1.5
+                or use_grouped_topk
+                or num_expert_group not in (None, 1)
+                or topk_group not in (None, 1)
+                or custom_routing_function is not None
+                or swiglu_limit != 10.0
+            ):
+                raise ValueError(
+                    "Expert Kit remote V4 requires the exact ModelSlim checkpoint recipe"
+                )
 
         # ModelSlim quantizes local attention and checkpoint experts. Remote
         # experts are discarded and recomputed by EK, so this quantization
@@ -80,7 +133,7 @@ class RemoteRoutedExperts(nn.Module):
 
         unsupported = {
             "transposed_fused_checkpoint": is_fused_checkpoint_transposed,
-            "hash_routing": tid2eid is not None,
+            "hash_routing": tid2eid is not None and not self.is_deepseek_v4,
             "quantization": quant_config is not None and not modelslim_quantization,
             "prefill_context_parallel": moe_config.pcp_size != 1,
             "sequence_parallel": moe_config.is_sequence_parallel,
@@ -93,9 +146,8 @@ class RemoteRoutedExperts(nn.Module):
             "eplb": vllm_config.parallel_config.enable_eplb,
             "expert_bias": moe_config.has_bias,
             "fused_shared_experts": expert_map_manager.num_fused_shared_experts != 0,
-            "custom_swiglu": any(
-                value is not None for value in (swiglu_limit, swiglu_alpha, swiglu_beta)
-            ),
+            "custom_swiglu": (swiglu_limit is not None and not self.is_deepseek_v4)
+            or any(value is not None for value in (swiglu_alpha, swiglu_beta)),
             "router_weight_on_input": apply_router_weight_on_input,
             "activation": moe_config.activation is not MoEActivation.SILU,
         }
