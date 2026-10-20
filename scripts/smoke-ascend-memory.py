@@ -56,7 +56,9 @@ async def receive(reader: asyncio.StreamReader) -> dict:
 
 def pattern(size: int, seed: int) -> torch.Tensor:
     """Create a deterministic byte pattern on the host."""
-    return (torch.arange(size, dtype=torch.int32) + seed).remainder_(251).to(torch.uint8)
+    return (
+        (torch.arange(size, dtype=torch.int32) + seed).remainder_(251).to(torch.uint8)
+    )
 
 
 async def fill(driver: TransferEngineRuntime, tensor: torch.Tensor, seed: int) -> None:
@@ -78,7 +80,9 @@ async def run(args: argparse.Namespace) -> None:
     slab = owner.narrow(0, (-owner.data_ptr()) % ALIGNMENT, MAX_BYTES)
     torch.npu.synchronize(device)
     region = MemoryRegion(slab.data_ptr(), MAX_BYTES, str(device), owner)
-    driver = TransferEngineRuntime(TransferEngineRuntimeConfig(args.segment_host, device))
+    driver = TransferEngineRuntime(
+        TransferEngineRuntimeConfig(args.segment_host, device)
+    )
     reader = writer = server = None
     try:
         await driver.register_region(region)
@@ -109,7 +113,9 @@ async def run(args: argparse.Namespace) -> None:
                 for iteration in range(args.iterations + 1):
                     seed = (iteration + size // 8192) % 251
                     await fill(driver, slab[:size], seed)
-                    await send(writer, {"size": size, "iteration": iteration, "seed": seed})
+                    await send(
+                        writer, {"size": size, "iteration": iteration, "seed": seed}
+                    )
                     ack = await receive(reader)
                     if ack != {"size": size, "iteration": iteration, "written": True}:
                         raise ValueError("write completion mismatch")
@@ -122,7 +128,9 @@ async def run(args: argparse.Namespace) -> None:
                 raise ValueError("peer did not disconnect before memory retirement")
         else:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(args.control_host, args.control_port, limit=CONTROL_LIMIT),
+                asyncio.open_connection(
+                    args.control_host, args.control_port, limit=CONTROL_LIMIT
+                ),
                 30,
             )
             await send(writer, {"run": args.run_id, "operation": "read_write"})
@@ -162,7 +170,9 @@ async def run(args: argparse.Namespace) -> None:
                         monotonic_deadline=time.monotonic() + 120,
                     )
                     write_ms = (time.perf_counter() - started) * 1000
-                    await send(writer, {"size": size, "iteration": iteration, "written": True})
+                    await send(
+                        writer, {"size": size, "iteration": iteration, "written": True}
+                    )
                     if await receive(reader) != {"verified": True}:
                         raise ValueError("peer failed to verify WRITE")
                     if iteration:

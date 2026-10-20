@@ -69,7 +69,9 @@ def main() -> None:
     if not version_path.is_file():
         parser.error("CANN toolkit version information is missing")
     cann_info = dict(
-        line.split("=", 1) for line in version_path.read_text().splitlines() if "=" in line
+        line.split("=", 1)
+        for line in version_path.read_text().splitlines()
+        if "=" in line
     )
     if cann_info.get("version") != manifest["artifact"]["cann"]:
         parser.error("CANN version does not match the Ascend manifest")
@@ -79,7 +81,9 @@ def main() -> None:
     repository = ROOT.parent.parent
     for target in (work, artifacts):
         if target == repository or repository in target.parents:
-            parser.error("work and artifact directories must be outside the EK repository")
+            parser.error(
+                "work and artifact directories must be outside the EK repository"
+            )
     specifications = [manifest["upstream"], *manifest["submodules"]]
     for spec in specifications:
         archive = inputs / spec["archive"]
@@ -95,7 +99,9 @@ def main() -> None:
     build_root.mkdir(parents=True, exist_ok=True)
     if not marker.exists():
         if source.exists():
-            parser.error(f"incomplete source workspace exists: {source}; use a new work directory")
+            parser.error(
+                f"incomplete source workspace exists: {source}; use a new work directory"
+            )
         unpack(inputs / manifest["upstream"]["archive"], source)
         for spec in manifest["submodules"]:
             unpack(inputs / spec["archive"], source / "extern" / spec["name"])
@@ -228,8 +234,12 @@ def main() -> None:
         "sha256": digest(wheels[0]),
         "manifest_sha256": digest(manifest_path),
     }
-    wheels[0].with_suffix(".whl.receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    print(json.dumps({"wheel": str(wheels[0]), "sha256": receipt["sha256"]}), flush=True)
+    wheels[0].with_suffix(".whl.receipt.json").write_text(
+        json.dumps(receipt, indent=2) + "\n"
+    )
+    print(
+        json.dumps({"wheel": str(wheels[0]), "sha256": receipt["sha256"]}), flush=True
+    )
 
 
 if __name__ == "__main__":
