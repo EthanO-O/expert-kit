@@ -378,6 +378,8 @@ async def build_worker_application(
                     acquire_many=manager.acquire_many,
                     ready_revision=lambda: manager.ready_revision,
                     expert_range=(participant.expert_start, participant.expert_end),
+                    expert_compute=config.model.expert_compute,
+                    swiglu_limit=config.model.swiglu_limit,
                 ),
             )
             graph_control = GraphControlServer(

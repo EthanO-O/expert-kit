@@ -310,3 +310,62 @@ def test_ascend_transport_requires_npu_and_bounded_registered_capacity(
     else:
         with pytest.raises(ValidationError, match=r"capacity|indexed NPU"):
             WorkerConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [(None, None), ("quantization", None), ("swiglu_limit", 0.0), ("hidden_dim", 2048)],
+)
+def test_graph_worker_requires_exact_v4_computation(tmp_path, field, value):
+    raw = _config(tmp_path, backend="torch", device="npu:0")
+    raw["model"].update(
+        num_layers=43,
+        experts_per_layer=256,
+        hidden_dim=4096,
+        expert_intermediate_dim=2048,
+        top_k=6,
+        activation_dtype="bf16",
+        weight_dtype="bf16",
+        activation="silu",
+        expert_compute="deepseek_v4",
+        swiglu_limit=10.0,
+        quantization={
+            "type": "modelslim-w8a8-dynamic",
+            "bits": 8,
+            "group_size": None,
+            "symmetric": True,
+        },
+    )
+    shared_model = {
+        key: value
+        for key, value in raw["model"].items()
+        if key not in {"instance_id", "name", "weight_version"}
+    }
+    raw["worker"].update(
+        max_active_batches_per_device=1,
+        ascend_decode_graph={
+            "session_id": "worker-graph-v4-model",
+            "instance_id": 1,
+            "weight_version": "v1",
+            "workers": [
+                {
+                    "worker_id": f"worker-{rank}",
+                    "control_endpoint": f"127.0.0.1:{18100 + rank}",
+                    "expert_start": rank * 32,
+                    "expert_end": (rank + 1) * 32,
+                }
+                for rank in range(8)
+            ],
+            "rendezvous_host": "127.0.0.1",
+            "rendezvous_port": 18080,
+            "layer_ids": [0],
+            "capture_sizes": [1],
+            "model": shared_model,
+        },
+    )
+    if field is None:
+        assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph is not None
+    else:
+        raw["model"][field] = value
+        with pytest.raises(ValidationError, match="exact V4"):
+            WorkerConfig.model_validate(raw)

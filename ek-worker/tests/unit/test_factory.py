@@ -113,14 +113,20 @@ def test_factory_builds_and_closes_ggml_worker(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("recipe", "fail_after_graph"),
-    [(None, False), ("modelslim-w8a8-dynamic", False), ("modelslim-w8a8-dynamic", True)],
-    ids=["bf16", "modelslim", "graph-close-failure"],
+    ("recipe", "expert_compute", "fail_after_graph"),
+    [
+        (None, "swiglu", False),
+        ("modelslim-w8a8-dynamic", "swiglu", False),
+        ("modelslim-w8a8-dynamic", "swiglu", True),
+        ("modelslim-w8a8-dynamic", "deepseek_v4", False),
+    ],
+    ids=["bf16", "modelslim", "graph-close-failure", "v4"],
 )
 def test_factory_selects_graph_resident_from_validated_recipe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     recipe: str | None,
+    expert_compute: str,
     fail_after_graph: bool,
 ) -> None:
     import expertkit_transport.transports.ascend_graph.control as graph_control
@@ -140,6 +146,17 @@ def test_factory_selects_graph_resident_from_validated_recipe(
             "group_size": None,
             "symmetric": True,
         }
+    is_v4 = expert_compute == "deepseek_v4"
+    if is_v4:
+        raw["model"].update(
+            num_layers=43,
+            experts_per_layer=256,
+            hidden_dim=4096,
+            expert_intermediate_dim=2048,
+            top_k=6,
+            expert_compute=expert_compute,
+            swiglu_limit=10.0,
+        )
     shared_model = {
         key: value
         for key, value in raw["model"].items()
@@ -172,6 +189,16 @@ def test_factory_selects_graph_resident_from_validated_recipe(
             "model": shared_model,
         },
     )
+    if is_v4:
+        raw["worker"]["ascend_decode_graph"]["workers"] = [
+            {
+                "worker_id": "worker-0" if rank == 1 else f"other-{rank}",
+                "control_endpoint": f"127.0.0.1:{18100 + rank}",
+                "expert_start": rank * 32,
+                "expert_end": (rank + 1) * 32,
+            }
+            for rank in range(8)
+        ]
     config = WorkerConfig.model_validate(raw)
     runtime = Mock(device=torch.device("cpu"))
     runtime.memory_info.return_value = (2 << 30, 2 << 30)
@@ -226,7 +253,7 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     assert application._execution._graph is graph_factory.return_value
     assert application._execution._control is control_factory.return_value
     control_factory.assert_called_once_with(
-        "127.0.0.1:18079",
+        "127.0.0.1:18101" if is_v4 else "127.0.0.1:18079",
         begin=graph_factory.return_value.begin,
         finish=graph_factory.return_value.finish,
     )
@@ -247,7 +274,9 @@ def test_factory_selects_graph_resident_from_validated_recipe(
         "top_k": config.model.top_k,
         "acquire_many": manager.acquire_many,
         "ready_revision": prepared["ready_revision"],
-        "expert_range": (2, 4),
+        "expert_range": (32, 64) if is_v4 else (2, 4),
+        "expert_compute": expert_compute,
+        "swiglu_limit": 10.0 if is_v4 else 0.0,
     }
     assert prepared["ready_revision"]() == 17
     manager.ready_revision = 18

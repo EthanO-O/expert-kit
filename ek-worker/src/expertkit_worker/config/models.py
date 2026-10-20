@@ -443,10 +443,25 @@ class WorkerConfig(_StrictModel):
                     self.model.quantization is not None
                     and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
                 )
-                or self.model.expert_compute != "swiglu"
             ):
                 raise ValueError("Ascend Decode graphs require one active NPU Torch BF16 slot")
-            graph.worker_rank(self.worker.id)
+            rank = graph.worker_rank(self.worker.id)
+            if self.model.expert_compute == "deepseek_v4":
+                participant = graph.participants[rank - 1]
+                if (
+                    self.model.num_layers != 43
+                    or self.model.experts_per_layer != 256
+                    or self.model.hidden_dim != 4096
+                    or self.model.expert_intermediate_dim != 2048
+                    or self.model.top_k != 6
+                    or self.model.swiglu_limit != 10.0
+                    or self.model.quantization is None
+                    or participant.expert_end - participant.expert_start != 32
+                ):
+                    raise ValueError(
+                        "Ascend graphs require the exact V4 ModelSlim computation "
+                        "and 32 local experts"
+                    )
             if graph.weight_version != self.model.weight_version:
                 raise ValueError("Ascend graph deployment identity does not match the Worker")
             if self.model.instance_id is not None and graph.instance_id != self.model.instance_id:
