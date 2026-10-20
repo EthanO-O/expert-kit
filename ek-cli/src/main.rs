@@ -374,3 +374,73 @@ mod worker_launcher_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod graph_schedule_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_controller_and_graph_configs_independently() {
+        for arguments in [
+            vec![
+                "ek-cli",
+                "--config",
+                "controller.yaml",
+                "schedule",
+                "graph",
+                "--graph-config",
+                "ascend-decode-graph.json",
+                "--wait-ready-seconds",
+                "1800",
+            ],
+            vec![
+                "ek-cli",
+                "schedule",
+                "graph",
+                "--graph-config",
+                "ascend-decode-graph.json",
+                "--wait-ready-seconds",
+                "1800",
+                "--config",
+                "controller.yaml",
+            ],
+        ] {
+            let cli = RootCli::try_parse_from(arguments).unwrap();
+            assert_eq!(cli.config.as_deref(), Some("controller.yaml"));
+            let Command::Schedule {
+                command:
+                    schedule::ScheduleCommand::Graph {
+                        graph_config,
+                        wait_ready_seconds,
+                    },
+            } = cli.command
+            else {
+                panic!("expected graph scheduling command")
+            };
+            assert_eq!(graph_config, PathBuf::from("ascend-decode-graph.json"));
+            assert_eq!(wait_ready_seconds, 1800);
+        }
+    }
+
+    #[test]
+    fn requires_graph_config_and_defaults_to_no_wait() {
+        assert!(RootCli::try_parse_from(["ek-cli", "schedule", "graph"]).is_err());
+        let cli = RootCli::try_parse_from([
+            "ek-cli",
+            "schedule",
+            "graph",
+            "--graph-config",
+            "graph.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Schedule {
+                command: schedule::ScheduleCommand::Graph {
+                    wait_ready_seconds: 0,
+                    ..
+                }
+            }
+        ));
+    }
+}

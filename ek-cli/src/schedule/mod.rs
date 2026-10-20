@@ -23,8 +23,24 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 use tonic::transport::Endpoint;
 
+mod graph;
+
 #[derive(Subcommand, Debug)]
 pub enum ScheduleCommand {
+    /// Install exact graph placement for a cold start without concurrent scheduling.
+    Graph {
+        #[arg(
+            long,
+            help = "Ascend decode graph JSON containing workers and expert ranges"
+        )]
+        graph_config: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Wait this many seconds for all target experts to load (0 skips waiting)"
+        )]
+        wait_ready_seconds: u64,
+    },
     Static {
         #[arg(long, short, help = "file that contains worker nodes information")]
         inventory: PathBuf,
@@ -48,6 +64,10 @@ pub enum ScheduleCommand {
 
 pub async fn execute_schedule(cmd: ScheduleCommand) -> EKResult<()> {
     match cmd {
+        ScheduleCommand::Graph {
+            graph_config,
+            wait_ready_seconds,
+        } => graph::execute_graph_schedule(graph_config, wait_ready_seconds).await,
         ScheduleCommand::Static { inventory } => {
             execute_static_schedule(inventory).await?;
             Ok(())
