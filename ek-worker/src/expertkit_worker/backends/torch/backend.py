@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from importlib import import_module
 
+import structlog
 import torch
 import torch.nn.functional as functional
 from expertkit_transport.batches import ACTIVATION_DTYPES
@@ -186,6 +187,35 @@ class TorchBackend(ComputeBackend):
                 self._grouped_matmul = getattr(torch_npu, "npu_grouped_matmul", None)
                 if self._grouped_matmul is not None:
                     self._moe_init_routing = getattr(torch_npu, "npu_moe_init_routing_v2", None)
+        self._modelslim_prefill = None
+        if (
+            linear_compute == "modelslim_w8a8_dynamic"
+            and expert_compute == "swiglu"
+            and runtime.device.type == "npu"
+            and dtype == torch.bfloat16
+            and (hidden_dim, intermediate_dim, top_k) == (2048, 768, 8)
+        ):
+            native = import_module("torch_npu")
+            if native.npu.get_device_name(runtime.device) == "Ascend910_9362" and all(
+                callable(getattr(native, name, None))
+                for name in ("npu_moe_init_routing_v2", "npu_dynamic_quant", "npu_grouped_matmul")
+            ):
+                try:
+                    prefill = import_module("expertkit_worker.backends.torch.modelslim_prefill")
+                except ModuleNotFoundError as error:
+                    if error.name != "triton":
+                        raise
+                    structlog.get_logger(__name__).warning(
+                        "modelslim_prefill_unavailable",
+                        device=str(runtime.device),
+                        reason="triton_not_installed",
+                    )
+                else:
+                    initialized = prefill.warmup(runtime)
+                    self._modelslim_prefill = prefill
+                    structlog.get_logger(__name__).info(
+                        "modelslim_prefill_initialized", device=str(runtime.device), **initialized
+                    )
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
@@ -213,6 +243,12 @@ class TorchBackend(ComputeBackend):
             or max_batch_tokens <= 0
         ):
             raise ValueError("max_batch_tokens must be a positive integer")
+        if self._modelslim_prefill is not None:
+            return BackendResourceEstimate(
+                temporary_bytes_per_active_batch=self._modelslim_prefill.temporary_bytes(
+                    max_batch_tokens, self._hidden_dim, self._intermediate_dim, self._top_k
+                )
+            )
         assignments = max_batch_tokens * self._top_k
         element_bytes = torch.empty((), dtype=self._dtype).element_size()
         index_bytes = assignments * 2 * 8
@@ -384,6 +420,14 @@ class TorchBackend(ComputeBackend):
     ) -> None:
         if not lease.objects:
             prepared_output.zero_()
+            return
+
+        if (
+            self._modelslim_prefill is not None
+            and batch.token_count > 1
+            and lease.expert_ids[-1] < 128
+        ):
+            self._modelslim_prefill.compute(batch, prepared_output, lease.objects)
             return
 
         columns = (

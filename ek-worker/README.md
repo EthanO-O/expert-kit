@@ -210,6 +210,21 @@ filesystem and are marked separately.
 
 ## Quantized routed experts
 
+### Ascend ModelSlim grouped Prefill
+
+The Torch backend groups ordinary multi-token Qwen3 ModelSlim W8A8 batches on
+`Ascend910_9362` with BF16 activations, hidden size 2048, intermediate size 768,
+and top-8 routing. It packs routes once and executes separate gate, up, and down
+INT32 grouped projections using the existing ready weights. Rescaling and ordered
+routing accumulation use FP32, with BF16 projection and output boundaries.
+Native per-expert projections can use a different FP32 multiplication order, so
+generated tokens need not match bitwise between these implementations.
+
+This path uses the shared Ascend image's Triton-Ascend installation and warms its
+helpers before Worker registration. If Triton is absent, ordinary execution stays
+available; other initialization errors propagate. Single-token execution and
+other model profiles retain their existing computation paths.
+
 ### Ascend ModelSlim resident Decode graphs
 
 Both `worker.backend: torch` and `worker.backend: ascend_fused` implement the
@@ -247,8 +262,8 @@ triton-ascend 3.2.2 (Triton module version 3.5.0).
 
 Missing Triton or its Ascend backend causes an explicit startup error for this
 path. Kernel compilation and warmup happen before graph capture; failures retain
-the resident weights in quarantine until process exit. Ordinary ModelSlim
-execution, BF16 resident graphs, and CPU/CUDA imports do not load these kernels.
+the resident weights in quarantine until process exit. Other ordinary ModelSlim
+profiles, BF16 resident graphs, and CPU/CUDA imports do not load these kernels.
 
 The Torch Qwen graph computation supports 128 experts, hidden size 2048, expert
 intermediate size 768, top-8 routing, SwiGLU, and BF16 activations. Each

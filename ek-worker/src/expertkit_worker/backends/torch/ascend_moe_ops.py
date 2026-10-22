@@ -61,8 +61,10 @@ def ordered_combine(
 ) -> None:
     """Write the expert-ordered local sum into a caller-owned fixed destination.
 
-    The caller supplies expert IDs in [0, 128), a complete assignment inverse,
-    and valid local offset/count values. Validation reads only Tensor metadata.
+    The caller supplies nonnegative expert IDs in [0, 128], a complete assignment
+    inverse, and valid local offset/count values. IDs outside the local half-open
+    expert range are ignored; 128 is an excluded sentinel for the full range.
+    Negative IDs must be normalized before this call. Validation reads only Tensor metadata.
 
     Args:
         down_bf16: Contiguous BF16 packed rows, shaped [capacity * 8, hidden].
