@@ -15,6 +15,8 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.mixtral.configuration_mixtral import MixtralConfig
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
+from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
@@ -23,6 +25,7 @@ from expertkit_torch.models.deepseek_v2 import create_routed_moe_class as deepse
 from expertkit_torch.models.deepseek_v3 import create_routed_moe_class as deepseek_v3_class
 from expertkit_torch.models.loader import _deepseek_layer_ids, _qwen_layer_ids
 from expertkit_torch.models.mixtral import create_routed_moe_class as mixtral_class
+from expertkit_torch.models.qwen2_moe import create_routed_moe_class as qwen2_class
 from expertkit_torch.models.qwen3_moe import create_routed_moe_class as qwen3_class
 
 
@@ -67,6 +70,23 @@ class AdapterCase:
 
 
 CASES = (
+    AdapterCase(
+        "qwen2_moe",
+        Qwen2MoeConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            moe_intermediate_size=6,
+            shared_expert_intermediate_size=6,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+        ),
+        Qwen2MoeSparseMoeBlock,
+        qwen2_class,
+    ),
     AdapterCase(
         "qwen3_moe",
         Qwen3MoeConfig(
@@ -180,18 +200,9 @@ def test_routed_adapter_matches_native_moe_and_sends_final_routing(
     assert call["expert_ids"].shape == (6, case.config.num_experts_per_tok)
     assert call["routing_weights"].dtype is torch.float32
     flattened = hidden_states.reshape(-1, case.config.hidden_size)
-    if case.name in ("qwen3_moe", "mixtral"):
-        _, expected_weights, expected_ids = native.gate(flattened)
-    elif case.name == "deepseek_v2":
-        router_logits = F.linear(
-            hidden_states.float(),
-            native.gate.weight.float(),
-        )
-        expected_ids, expected_weights = native.route_tokens_to_experts(router_logits)
-    else:
-        expected_ids, expected_weights = native.route_tokens_to_experts(native.gate(hidden_states))
+    _, expected_weights, expected_ids = native.gate(flattened)
     torch.testing.assert_close(call["expert_ids"], expected_ids)
-    torch.testing.assert_close(call["routing_weights"], expected_weights)
+    torch.testing.assert_close(call["routing_weights"], expected_weights.float())
 
 
 def test_layer_id_mapping_preserves_sparse_and_dense_model_layers() -> None:

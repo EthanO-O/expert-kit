@@ -11,16 +11,17 @@ requires-python = ">=3.12"
 dependencies = [
     "expertkit-transport==0.1.0",
     "pyyaml>=6,<7",
-    "torch==2.11.0",
+    "torch>=2.10,<2.12",
     "pydantic>=2.12,<3",
     "tqdm>=4.67,<5",
     "typer>=0.21,<1",
-    "transformers==5.5.3",
+    "transformers==5.14.1",
 ]
 
 [project.optional-dependencies]
 npu = [
-    "torch-npu==2.11.0rc1",
+    "torch==2.10.0",
+    "torch-npu==2.10.0.post4",
 ]
 
 [project.scripts]

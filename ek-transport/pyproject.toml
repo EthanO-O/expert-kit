@@ -9,9 +9,9 @@ description = "Expert Kit Routed-MoE Transport middleware"
 requires-python = ">=3.12"
 dependencies = [
     "expertkit-proto==0.1.0",
-    "grpcio==1.71.0",
+    "grpcio>=1.71,<2",
     "numpy>=1.26,<3",
-    "protobuf==5.29.6",
+    "protobuf>=5.29.6,<8",
     "torch>=2.10,<2.12",
 ]
 

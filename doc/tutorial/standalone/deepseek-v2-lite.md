@@ -3,7 +3,7 @@
 ## Overview
 
 This guide deploys `deepseek-ai/DeepSeek-V2-Lite-Chat` with the Python Worker
-and either the Transformers 5.5.3 or vLLM 0.25.1 Frontend:
+and either the Transformers 5.14.1 or vLLM 0.25.1 Frontend:
 
 ```text
 Transformers wrapper --\
@@ -66,7 +66,7 @@ regional mirror only in developer-local uv configuration; do not change the
 committed `pyproject.toml` or lockfile for a mirror.
 
 The default profile installs Proto, Transport, Worker, and the Transformers
-5.5.3 Frontend. Root optional profiles are:
+5.14.1 Frontend. Root optional profiles are:
 
 ```bash
 uv sync --locked --extra fused
@@ -282,7 +282,7 @@ rejected here. Add enough Worker capacity, wait for registration, and rerun the
 same command. Rerunning with an unchanged active Worker set is safe and produces
 the same assignment.
 
-## Test with the Transformers 5.5.3 Frontend
+## Test with the Transformers 5.14.1 Frontend
 
 In terminal 5, run a short benchmark:
 

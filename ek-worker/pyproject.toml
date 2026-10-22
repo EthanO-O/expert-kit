@@ -11,7 +11,7 @@ dependencies = [
     "aiohttp>=3.11,<4",
     "expertkit-proto==0.1.0",
     "expertkit-transport==0.1.0",
-    "grpcio==1.71.0",
+    "grpcio>=1.71,<2",
     "pydantic>=2.12,<3",
     "PyYAML>=6,<7",
     "structlog>=25.4,<26",
@@ -35,8 +35,8 @@ observability = [
     "prometheus-client==0.25.0",
 ]
 npu = [
-  "torch==2.11.0",
-  "torch-npu==2.11.0rc1",
+  "torch==2.10.0",
+  "torch-npu==2.10.0.post4",
 ]
 
 [tool.uv.sources]

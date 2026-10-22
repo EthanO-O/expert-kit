@@ -53,9 +53,11 @@ uv sync --locked --extra npu
 ```
 
 The root `npu` extra enables the Worker and Host-native `expertkit_torch`
-frontend with Torch 2.11 and torch-npu 2.11.0rc1. The separately pinned
-vLLM-Ascend attention image keeps its own accelerator stack; see the
-[Ascend tutorials](./doc/tutorial/ascend/README.md).
+frontend with Torch 2.10.0 and torch-npu 2.10.0.post4. The Ascend image defaults
+target CANN 9.1.0 and vLLM-Ascend `v0.26.0rc2-a3`; see the
+[Ascend tutorials](./doc/tutorial/ascend/README.md). The `vllm` extra installs
+the PyPI CUDA engine and is mutually exclusive with `npu`. The default Torch
+integration uses Transformers 5.14.1.
 
 Run package checks through the shared environment, for example:
 

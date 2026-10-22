@@ -1,6 +1,6 @@
 # Run Qwen3-30B-A3B with the Python Worker
 
-This guide exercises the Expert Kit Transformers 5.5.3 path with the BF16
+This guide exercises the Expert Kit Transformers 5.14.1 path with the BF16
 `Qwen/Qwen3-30B-A3B` checkpoint. The model configuration has 48 routed layers,
 128 experts per layer, hidden size 2048, expert intermediate size 768, and top-k
 8. Those values come from the model's

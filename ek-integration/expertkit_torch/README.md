@@ -6,7 +6,7 @@ process. Each routed MoE layer sends its final expert assignments and FP32
 routing weights through `expertkit-transport`, then receives the weighted result
 aggregated across Workers.
 
-The integration targets Transformers 5.5.3 and supports:
+The integration targets Transformers 5.14.1 and supports:
 
 - Qwen3-MoE
 - DeepSeek-V2
@@ -175,7 +175,7 @@ uv run --package expertkit-torch pytest \
 
 ## Current limits
 
-- The adapters match the model classes shipped in Transformers 5.5.3.
+- The adapters match the model classes shipped in Transformers 5.14.1.
 - DeepSeek-V3 works only with weight dtypes supported by the current Worker:
   FP16, BF16, or FP32. FP8 and W8A8 DeepSeek-R1 checkpoints are not supported.
 - Full Mixtral and DeepSeek-V3 deployment tests require more device memory than

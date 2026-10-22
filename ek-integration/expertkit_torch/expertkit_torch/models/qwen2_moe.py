@@ -32,7 +32,7 @@ def create_routed_moe_class(client: RoutedMoEClient, layer_ids: RoutedLayerIds) 
                 layer_id=self.layer_id,
                 hidden_states=flattened,
                 expert_ids=expert_ids,
-                routing_weights=weights,
+                routing_weights=weights.float(),
             )
             shared = torch.sigmoid(self.shared_expert_gate(flattened)) * shared
             return (routed + shared).reshape(batch_size, sequence_length, hidden_dim)

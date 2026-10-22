@@ -14,8 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The PyPI engine is the CUDA profile; Ascend uses the prebuilt NPU image.
 engine = ["vllm==0.25.1"]
-# The Ascend recipe installs its source-built engine and exact NPU stack first.
+# The graph recipe supplies its separately qualified engine and NPU stack.
 ascend-graph = ["expertkit-transport[ascend-graph]==0.1.0"]
 
 [project.entry-points."vllm.general_plugins"]

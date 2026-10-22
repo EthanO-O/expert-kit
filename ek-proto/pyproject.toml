@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Generated Python bindings for Expert Kit protocols"
 requires-python = ">=3.12"
 dependencies = [
-    "grpcio==1.71.0",
-    "protobuf==5.29.6",
+    "grpcio>=1.71,<2",
+    "protobuf>=5.29.6,<8",
 ]
 
 [tool.ruff]

@@ -53,7 +53,7 @@ def create_routed_moe_class(
                 layer_id=self.layer_id,
                 hidden_states=flattened,
                 expert_ids=expert_ids,
-                routing_weights=routing_weights,
+                routing_weights=routing_weights.float(),
             )
             return routed.reshape(batch_size, sequence_length, hidden_dim)
 

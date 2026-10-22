@@ -36,6 +36,14 @@ ops = [
     "ansible-lint>=25.4,<26",
 ]
 
+[tool.uv]
+# PyPI vLLM uses CUDA/Torch 2.11; Ascend supplies its own Torch 2.10 engine.
+conflicts = [
+    [{ extra = "npu" }, { extra = "vllm" }],
+    [{ package = "expertkit-worker", extra = "npu" }, { package = "expertkit-vllm", extra = "engine" }],
+    [{ package = "expertkit-torch", extra = "npu" }, { package = "expertkit-vllm", extra = "engine" }],
+]
+
 [tool.uv.sources]
 expertkit-proto = { workspace = true }
 expertkit-torch = { workspace = true }
