@@ -7,10 +7,11 @@ qualification status differ.
 
 | Model | Status | Guide |
 | --- | --- | --- |
-| Qwen3-30B-A3B | Qualified with the current BF16 Worker and vLLM-Ascend path | [Deploy Qwen3-30B-A3B](qwen3-30b-a3b.md) |
+| Qwen3-30B-A3B | BF16 deployment; ModelSlim W8A8 Decode graph configuration with server qualification pending on the prebuilt 0.26 runtime | [BF16](qwen3-30b-a3b.md), [W8A8 graphs](decode-graphs.md) |
+| DeepSeek-V4-Flash | ModelSlim W8A8 Decode graph configuration; server qualification pending on the prebuilt 0.26 runtime | [W8A8 graphs](decode-graphs.md) |
 | DeepSeek-V3 | BF16 qualification path; vLLM integration still needs an end-to-end hardware run | [Qualify DeepSeek-V3](deepseek-v3.md) |
 
-Both guides keep authored configuration, generated YAML, and caches inside the
+These guides keep authored configuration, generated YAML, and caches inside the
 EK checkout. Model, dataset, and result paths are explicit Host-local inputs
 and may point to shared mounts or other storage outside the checkout.
 Container paths such as `/etc/expert-kit` remain container-local mount targets.
@@ -101,6 +102,19 @@ output on every Host, or generate it once and distribute the complete
 `dev/ascend/generated/` directory.
 
 ### 2. Generate and validate
+
+Check the hardware on every inference host before selecting an image:
+
+```bash
+npu-smi info
+npu-smi info -t board -i 0
+```
+
+Retain the NPU and board identity and driver version with your results. See
+[SoC identification and runtime checks](../../../container/ascend/README.md)
+for the `SOC_VERSION` example and Triton-Ascend diagnostics. `SOC_VERSION` is
+needed when compiling native extensions for a specific target; the current
+prebuilt EK image workflow does not require it or rebuild the engine.
 
 Generate from the repository root:
 
@@ -238,8 +252,9 @@ blobs, and Worker logs show expert loading and computation.
 
 ### 6. Run the benchmark
 
-Run the one-shot vLLM benchmark container with the Host UID/GID so result
-files remain writable outside Docker:
+Ensure the host results directory has permissions that allow the container to
+write results and the host user to read them. Adjust its ownership with
+`chown` as needed, then run the one-shot vLLM benchmark container:
 
 ```bash
 dev/ascend/run-compose.sh attention run --rm benchmark
