@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 import yaml
+from expertkit_worker.config import BackendName
 from pydantic import Field, computed_field, model_validator
 
 from .config import ConfigModel
@@ -144,6 +145,7 @@ class FaultDetectionConfig(ConfigModel):
 class ExpertConfig(ConfigModel):
     """Expert worker runtime configuration."""
 
+    backend: BackendName = BackendName.TORCH
     runtime: ExpertRuntimeConfig
 
 

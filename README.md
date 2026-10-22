@@ -31,6 +31,7 @@ Here are some tutorials to help you quickly start with Expert Kit.
 2. [DeepSeek-V2-Lite](./doc/tutorial/standalone/deepseek-v2-lite.md): A complete Python Worker and Torch Frontend deployment using the official DeepSeek-V2-Lite checkpoint.
 3. [Qwen3-30B-A3B on Ascend 910C](./doc/tutorial/ascend/qwen3-30b-a3b.md): Deploy the Controller, vLLM attention frontend, and two expert pools, then run online and offline benchmarks.
 4. [DeepSeek-V3 on Ascend 910C](./doc/tutorial/ascend/deepseek-v3.md): Configure and qualify the BF16 remote-expert path.
+5. [Qwen3 and V4 W8A8 Decode graphs](./doc/tutorial/ascend/decode-graphs.md): Build the shared prebuilt-runtime image and deploy fixed expert Workers.
 
 ## Python Workspace
 

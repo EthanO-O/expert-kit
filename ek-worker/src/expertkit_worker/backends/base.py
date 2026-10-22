@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol
 
 import torch
 from expertkit_transport.batches import ACTIVATION_DTYPES
@@ -289,3 +290,25 @@ class ComputeBackend(ABC):
                 Worker.
             BackendFatalError: Backend or device state is unsafe to continue using.
         """
+
+
+class ResidentGraphWeights(Protocol):
+    """Backend computation and lifetime needed by the shared graph executor."""
+
+    @property
+    def revision(self) -> int: ...
+
+    def require_current(self) -> None: ...
+
+    def compute(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+        prepared_output: torch.Tensor,
+    ) -> None: ...
+
+    def close(self, *, wait_for_completion: Callable[[], None]) -> None: ...
+
+    def quarantine(self) -> None: ...

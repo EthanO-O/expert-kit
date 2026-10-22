@@ -23,7 +23,7 @@ from expertkit_transport.transports.ascend_graph.contracts import (
 from expertkit_transport.transports.ascend_graph.session import HcclGraphSession
 from pydantic import ValidationError
 
-from expertkit_worker.backends.torch.decode_graph import ResidentExpertGraphWeights
+from expertkit_worker.backends.base import ResidentGraphWeights
 from expertkit_worker.execution.admission import DeviceAdmission
 
 if TYPE_CHECKING:
@@ -49,7 +49,7 @@ class AscendDecodeGraphExecution:
         hidden_dim: int,
         top_k: int,
         admission: DeviceAdmission,
-        prepare_weights: Callable[[], ResidentExpertGraphWeights],
+        prepare_weights: Callable[[], ResidentGraphWeights],
         terminate: Callable[[int], object] = os._exit,
         worker_id: str | None = None,
     ) -> None:
@@ -62,7 +62,7 @@ class AscendDecodeGraphExecution:
         self._admission = admission
         self._prepare_weights = prepare_weights
         self._terminate = terminate
-        self._weights: ResidentExpertGraphWeights | None = None
+        self._weights: ResidentGraphWeights | None = None
         self._session: HcclGraphSession | None = None
         self._stream: Any = None
         self._graphs: dict[int, Any] = {}

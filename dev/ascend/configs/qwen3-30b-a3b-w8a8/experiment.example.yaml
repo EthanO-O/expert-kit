@@ -1,0 +1,55 @@
+model:
+  name: Qwen3-30B-A3B-w8a8
+  path_ref: qwen3-30b-a3b-w8a8
+  weight_version: main
+  num_layers: 48
+  experts_per_layer: 128
+  hidden_dim: 2048
+  intermediate_dim: 768
+  topk: 8
+  weight_dtype: bf16
+  activation_dtype: bf16
+  expert_compute: swiglu
+  swiglu_limit: 0.0
+  quantization:
+    type: modelslim-w8a8-dynamic
+    bits: 8
+    group_size: null
+    symmetric: true
+dataset:
+  type: random
+  name: Random
+serve:
+  gpu_memory_utilization: 0.8
+  max_model_len: 4096
+run:
+  num_prompts: 4
+  max_concurrency: 1
+  input_len: 128
+  output_len: 32
+  num_warmups: 1
+  ignore_eos: false
+  temperature: 0
+  save_result: true
+ascend_decode_graph:
+  # Use a new session ID whenever all graph participants restart.
+  session_id: qwen3-30b-a3b-w8a8-decode-v1
+  # The default assumes a fresh deployment database; use the actual instance ID.
+  instance_id: 1
+  weight_version: main
+  rendezvous_host: 192.0.2.10
+  rendezvous_port: 18090
+  layer_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+  # Token capacities for each captured decode step; smaller batches use padding.
+  capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+  timeout_seconds: 600.0
+  # All local experts remain resident; IDs and intervals must match the cluster pool.
+  workers:
+    - worker_id: worker-pool1-worker-00
+      control_endpoint: 192.0.2.10:18079
+      expert_start: 0
+      expert_end: 64
+    - worker_id: worker-pool1-worker-01
+      control_endpoint: 192.0.2.10:18080
+      expert_start: 64
+      expert_end: 128

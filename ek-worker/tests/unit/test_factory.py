@@ -112,6 +112,7 @@ def test_factory_builds_and_closes_ggml_worker(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("backend_name", ["torch", "ascend_fused"])
 @pytest.mark.parametrize(
     ("recipe", "expert_compute", "fail_after_graph"),
     [
@@ -128,6 +129,7 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     recipe: str | None,
     expert_compute: str,
     fail_after_graph: bool,
+    backend_name: str,
 ) -> None:
     import expertkit_transport.transports.ascend_graph.control as graph_control
 
@@ -137,7 +139,11 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     import expertkit_worker.factory as factory
     from expertkit_worker.backends import BackendResourceEstimate
 
+    if backend_name == "ascend_fused":
+        import expertkit_worker.backends.ascend_fused.decode_graph as packed_graph
+
     raw = _config(tmp_path).model_dump(mode="json")
+    raw["worker"]["backend"] = backend_name
     raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
     if recipe is not None:
         raw["model"]["quantization"] = {
@@ -236,6 +242,11 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     )
     monkeypatch.setattr(bf16_graph, "ResidentExpertGraphWeights", resident_types[0])
     monkeypatch.setattr(modelslim_graph, "ResidentModelSlimExpertGraphWeights", resident_types[1])
+    if backend_name == "ascend_fused":
+        monkeypatch.setattr(packed_graph, "ResidentAscendFusedGraphWeights", resident_types[0])
+        monkeypatch.setattr(
+            packed_graph, "create_modelslim_graph_weights", resident_types[1]
+        )
     monkeypatch.setattr(graph_execution, "AscendDecodeGraphExecution", graph_factory)
 
     if fail_after_graph:
@@ -403,7 +414,8 @@ class _FakeAsyncRuntime:
         return object()
 
     def create_event(self, *, enable_timing: bool = False) -> object:
-        raise AssertionError(f"timing event unexpectedly requested: {enable_timing}")
+        assert not enable_timing
+        return object()
 
     def set_current_device(self) -> None:
         self.current_device_set = True

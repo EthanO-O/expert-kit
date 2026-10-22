@@ -15,6 +15,10 @@ import torch
 import torch.nn.functional as functional
 from expertkit_transport.quarantine import retain_until_process_exit
 
+from expertkit_worker.backends.graph_common import (
+    ResidentGraphProfile,
+    ResidentWeightOwner,
+)
 from expertkit_worker.backends.torch.weights import TorchExpertWeights
 from expertkit_worker.weights import ReadyWeightLease
 
@@ -58,76 +62,51 @@ class ResidentExpertGraphWeights:
         expert_compute: str = "swiglu",
         swiglu_limit: float = 0.0,
     ) -> None:
-        for name, value in (
-            ("experts_per_layer", experts_per_layer),
-            ("hidden_dim", hidden_dim),
-            ("intermediate_dim", intermediate_dim),
-            ("top_k", top_k),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if not (
-            (expert_compute == "swiglu" and swiglu_limit == 0)
-            or (expert_compute == "deepseek_v4" and swiglu_limit == 10)
-        ):
-            raise ValueError("resident graph requires swiglu limit0 or deepseek_v4 limit10")
-        max_experts = 256 if expert_compute == "deepseek_v4" else 128
-        if experts_per_layer > max_experts or top_k > experts_per_layer:
-            raise ValueError(f"resident graph requires top_k <= experts_per_layer <= {max_experts}")
-        layers = tuple(layer_ids)
-        if (
-            not layers
-            or any(isinstance(i, bool) or not isinstance(i, int) or i < 0 for i in layers)
-            or tuple(sorted(set(layers))) != layers
-        ):
-            raise ValueError("layer_ids must be nonempty, sorted, unique and nonnegative")
-        start, end = expert_range if expert_range is not None else (0, experts_per_layer)
-        if not 0 <= start < end <= experts_per_layer:
-            raise ValueError("resident expert interval must be within the model")
-        if end - start > 128:
-            raise ValueError("resident GMM requires at most 128 local experts")
-        if expert_compute == "deepseek_v4" and end - start < 2:
-            raise ValueError("resident V4 INT32 GMM requires at least two local experts")
+        self._profile = ResidentGraphProfile(
+            layer_ids,
+            experts_per_layer,
+            hidden_dim,
+            intermediate_dim,
+            top_k,
+            expert_range,
+            expert_compute,
+            swiglu_limit,
+        )
+        start, end = self._profile.interval
         self._expert_compute = expert_compute
         self._swiglu_limit = swiglu_limit
         self._expert_start = start
         self._expert_end = end
         self._operators = operators
-        self._ready_revision = ready_revision
-        self._revision = ready_revision()
+        self._owner = ResidentWeightOwner[TorchExpertWeights](ready_revision)
         self._hidden_dim = hidden_dim
         self._intermediate_dim = intermediate_dim
         self._top_k = top_k
         self._experts_per_layer = experts_per_layer
-        self._layers: dict[int, ReadyWeightLease[TorchExpertWeights]] = {}
+        self._layers = self._owner.layers
         self._device: torch.device | None = None
-        self._closed = False
-        self._quarantined = False
-        expert_ids = tuple(range(start, end))
         try:
-            for layer_id in layers:
-                lease = acquire_many(layer_id, expert_ids)
-                try:
-                    self._validate_weights(lease)
-                except BaseException:
-                    lease.close()
-                    raise
-                self._layers[layer_id] = lease
-            self.require_current()
+            self._owner.acquire(self._profile, acquire_many, self._validate_weights)
             if operators is None:
                 if self._device is None or self._device.type != "npu":
                     raise ValueError("resident Ascend graph weights require an NPU device")
                 self._operators = import_module("torch_npu")
         except BaseException:
-            for lease in self._layers.values():
-                lease.close()
-            self._layers.clear()
+            self._owner.close(wait_for_completion=lambda: None)
             raise
+
+    @property
+    def _closed(self) -> bool:
+        return self._owner.closed
+
+    @property
+    def _quarantined(self) -> bool:
+        return self._owner.quarantined
 
     @property
     def revision(self) -> int:
         """Return the ready-storage revision frozen during preparation."""
-        return self._revision
+        return self._owner.revision
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
@@ -136,10 +115,7 @@ class ResidentExpertGraphWeights:
 
     def require_current(self) -> None:
         """Reject work after closure, quarantine or ready-storage invalidation."""
-        if self._closed or self._quarantined:
-            raise RuntimeError("resident graph weights are closed or quarantined")
-        if self._ready_revision() != self._revision:
-            raise RuntimeError("resident graph weights were invalidated by a ready-storage change")
+        self._owner.require_current()
 
     def compute(
         self,
@@ -259,25 +235,17 @@ class ResidentExpertGraphWeights:
         until process exit. Callers must destroy device graphs before this method
         returns successfully so no replay can reference released weights.
         """
-        if self._closed or self._quarantined:
-            return
         try:
-            wait_for_completion()
+            self._owner.close(wait_for_completion=wait_for_completion)
         except BaseException:
             self.quarantine()
             raise
-        for lease in self._layers.values():
-            lease.close()
-        self._layers.clear()
-        self._closed = True
 
     def quarantine(self) -> None:
-        """Retain graph storage when failed device work may still read it."""
+        """Retain the full provider and prepared storage after unproven device completion."""
         if self._closed or self._quarantined:
             return
-        self._quarantined = True
-        for lease in self._layers.values():
-            lease.quarantine()
+        self._owner.quarantine()
         retain_until_process_exit(self)
 
     def _project(
@@ -321,26 +289,6 @@ class ResidentExpertGraphWeights:
         routing_weights: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        if (
-            hidden_states.ndim != 2
-            or hidden_states.shape[0] <= 0
-            or hidden_states.shape[1] != self._hidden_dim
-            or output.shape != hidden_states.shape
-        ):
-            raise ValueError("resident graph requires nonempty hidden/output matrices")
-        if expert_ids.shape != (hidden_states.shape[0], self._top_k):
-            raise ValueError("resident graph expert IDs have the wrong shape")
-        if routing_weights.shape != expert_ids.shape:
-            raise ValueError("resident graph routing weights have the wrong shape")
-        if (
-            hidden_states.dtype != torch.bfloat16
-            or output.dtype not in (torch.bfloat16, torch.float32)
-            or expert_ids.dtype != torch.int32
-            or routing_weights.dtype != torch.float32
-        ):
-            raise ValueError("resident graph requires BF16 activations, int32 IDs and FP32 routing")
-        if any(
-            tensor.device != self._device or not tensor.is_contiguous()
-            for tensor in (hidden_states, expert_ids, routing_weights, output)
-        ):
-            raise ValueError("resident graph inputs must be contiguous on the weights' device")
+        self._profile.validate_inputs(
+            self._device, hidden_states, expert_ids, routing_weights, output
+        )

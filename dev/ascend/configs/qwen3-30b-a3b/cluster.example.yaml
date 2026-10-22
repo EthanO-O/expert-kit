@@ -38,6 +38,8 @@ control:
 
 # Runtime limits are shared by every expert pool and Worker.
 expert:
+  # Shared compute backend for all Worker pools; use torch for the alternative path.
+  backend: ascend_fused
   runtime:
     max_batch_tokens: 4096
     max_active_batches_per_device: 8

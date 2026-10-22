@@ -15,6 +15,8 @@ memory, and qualification requirements.
 | File | Owns | Lifecycle |
 | --- | --- | --- |
 | `configs/qwen3-30b-a3b/*.example.yaml` | Qwen3 cluster and experiment pair | Checked in |
+| `configs/qwen3-30b-a3b-w8a8/*.example.yaml` | Single-host Qwen3 W8A8 graph pair | Checked in |
+| `configs/deepseek-v4-flash-w8a8/*.example.yaml` | Single-host V4 W8A8 graph pair | Checked in |
 | `configs/deepseek-v3/*.example.yaml` | DeepSeek-V3 BF16 cluster and experiment pair | Checked in |
 | `configs/cluster.yaml` | Host addresses, placement, devices, ports, images, and paths | Host-local and ignored |
 | `configs/experiment.yaml` | Model, dataset adapter, serving, and benchmark settings | Host-local and ignored |
@@ -108,8 +110,10 @@ overhead comparison.
 `experiment.ascend_decode_graph` optionally accepts the shared graph deployment
 fields: session/instance/Worker/weight identity, control and rendezvous endpoints,
 routed layer IDs, capture sizes and timeout. It defaults to absent. The
-[DeepSeek-V2-Lite graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
-describes the shared prebuilt runtime image and startup readiness gate.
+[Qwen3/V4 graph guide](../../doc/tutorial/ascend/decode-graphs.md) describes
+the example pairs, shared prebuilt runtime image and startup commands. The
+[V2-Lite notes](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
+record its different model geometry and historical qualification.
 
 The generator validates one host, one Frontend and one expert pool on distinct
 devices, matching identity, unused graph ports and one active Worker batch.
@@ -146,14 +150,16 @@ Ascend quantization setting. Controller placement must make all 11,008 experts
 READY in those declared shards before the Frontend starts. The V2-Lite recipe's
 expert counts and placement do not apply to V4.
 
-The pinned single- and two-Worker V2-Lite deployments have passed trained-weight
-GMM, full-model replay, natural-EOS and batch/padding checks, healthy graph close,
-and the legacy single-Worker JSON regression. Fault tests kill each role after
-all Begin acknowledgements and before Frontend native replay; all survivors
-self-terminate within the bounded deadline before external cleanup. Repeated
-matched generation measurements with a native Transformers reference show an
-end-to-end benefit. The recipe records fixed-capacity padding cost, placement,
-and the observed Chinese greedy-token difference.
+After Workers register, `ek-cli schedule graph --graph-config <generated-json>
+--wait-ready-seconds 1800` installs the declared expert placement and waits for
+readiness. Run it with the generated Controller configuration, automatic
+assignment disabled and the Frontend stopped. Do not run another scheduling
+operation concurrently. Qwen3 requires 6,144 routed experts READY; V4 requires
+11,008. See the graph guide for the complete Compose command.
+
+The V2-Lite qualification results belong to the historical runtime recorded
+in its notes. They do not qualify the new prebuilt 0.26 image or Qwen3/V4 on
+that image. Full serving and graph replay require target-server validation.
 
 ## File tree
 
@@ -170,6 +176,8 @@ dev/ascend/
 │   ├── qwen3-30b-a3b/
 │   │   ├── cluster.example.yaml
 │   │   └── experiment.example.yaml
+│   ├── qwen3-30b-a3b-w8a8/          # single-host graph example pair
+│   ├── deepseek-v4-flash-w8a8/       # single-host graph example pair
 │   ├── deepseek-v3/
 │   │   ├── cluster.example.yaml
 │   │   └── experiment.example.yaml

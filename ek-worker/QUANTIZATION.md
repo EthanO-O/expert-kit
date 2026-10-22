@@ -70,6 +70,8 @@ implementation; it does not use native FP4 or FP8 GEMM instructions.
 
 ## Computation and cross-model reuse
 
+The following diagram describes the Torch backend's V4 reference recipes.
+
 ```mermaid
 flowchart LR
     X[Expert input] --> Gate[Gate linear]
@@ -87,7 +89,17 @@ floating GEMM, FP8 activation emulation plus floating GEMM, or W8A8. V4 clips th
 gate from above and the up projection on both sides according to `swiglu_limit`,
 then multiplies routing weights before the down projection. The ordinary SwiGLU
 path weights the output after the down projection. These FFN semantics are
-selected independently from the linear arithmetic.
+selected independently from the linear arithmetic in the Torch backend.
+
+Ascend fused ModelSlim W8A8 follows the native vLLM-Ascend operator pipeline:
+gate/up projection, clipped SwiGLU in the activation dtype, dynamic activation
+quantization, down projection, then routing-weighted native token unpermute.
+Both eager and graph `ascend_fused` use this pipeline. The original Torch V4
+pipeline retains FP32 activation arithmetic and routing before down projection;
+its ModelSlim graph also retains ordered FP32 accumulation and a BF16 output
+boundary. The fused graph promotes its native BF16 partial result when transport
+requests FP32. These numerical policies need not produce bitwise-identical
+outputs; validate both against the same reference and accuracy thresholds.
 
 Models with the same numerical quantization recipe can reuse the same linear
 operator even if their checkpoint parameter names differ. New names belong in

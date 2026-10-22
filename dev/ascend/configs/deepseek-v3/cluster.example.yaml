@@ -38,6 +38,8 @@ control:
 
 # DeepSeek-V3 BF16 needs a larger per-Worker admission budget than Qwen3.
 expert:
+  # Shared compute backend for all Worker pools; use torch for the alternative path.
+  backend: ascend_fused
   runtime:
     max_batch_tokens: 4096
     max_active_batches_per_device: 8

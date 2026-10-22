@@ -7,10 +7,11 @@ qualification status differ.
 
 | Model | Status | Guide |
 | --- | --- | --- |
-| Qwen3-30B-A3B | Qualified with the current BF16 Worker and vLLM-Ascend path | [Deploy Qwen3-30B-A3B](qwen3-30b-a3b.md) |
+| Qwen3-30B-A3B | BF16 deployment; ModelSlim W8A8 Decode graph configuration with server qualification pending on the prebuilt 0.26 runtime | [BF16](qwen3-30b-a3b.md), [W8A8 graphs](decode-graphs.md) |
+| DeepSeek-V4-Flash | ModelSlim W8A8 Decode graph configuration; server qualification pending on the prebuilt 0.26 runtime | [W8A8 graphs](decode-graphs.md) |
 | DeepSeek-V3 | BF16 qualification path; vLLM integration still needs an end-to-end hardware run | [Qualify DeepSeek-V3](deepseek-v3.md) |
 
-Both guides keep authored configuration, generated YAML, and caches inside the
+These guides keep authored configuration, generated YAML, and caches inside the
 EK checkout. Model, dataset, and result paths are explicit Host-local inputs
 and may point to shared mounts or other storage outside the checkout.
 Container paths such as `/etc/expert-kit` remain container-local mount targets.
@@ -53,6 +54,21 @@ because vLLM mounts it from the attention bundle and the Weight Server mounts
 it from the control bundle. Expert Hosts receive assigned expert blobs from
 the Weight Server.
 
+### Ascend fused Worker backend
+
+The Ascend examples select `backend: ascend_fused` independently for each
+expert pool. Generated Workers then execute routing, grouped matmuls, SwiGLU,
+and token restoration with `torch_npu` fused operators on the configured
+`npu:<id>` device. The backend accepts BF16 or FP16 activations and supports
+unquantized expert weights plus ModelSlim dynamic W8A8 weights. GPTQ, static
+W8A8, FP4, CPU, and CUDA configurations must use another backend.
+
+Frontend and Worker share the prebuilt 0.26 runtime selected by
+`images.vllm_ascend`. Keep both roles on the same image and rebuild the EK
+wheels before rebuilding that image. `worker.backend.submit` ends after Host-side enqueue; use the Worker
+device-stage metrics or an NPU profiler when measuring fused execution rather
+than treating that span as device latency.
+
 If a Host requires a Python mirror, prefix commands that resolve packages:
 
 ```bash
@@ -86,6 +102,19 @@ output on every Host, or generate it once and distribute the complete
 `dev/ascend/generated/` directory.
 
 ### 2. Generate and validate
+
+Check the hardware on every inference host before selecting an image:
+
+```bash
+npu-smi info
+npu-smi info -t board -i 0
+```
+
+Retain the NPU and board identity and driver version with your results. See
+[SoC identification and runtime checks](../../../container/ascend/README.md)
+for the `SOC_VERSION` example and Triton-Ascend diagnostics. `SOC_VERSION` is
+needed when compiling native extensions for a specific target; the current
+prebuilt EK image workflow does not require it or rebuild the engine.
 
 Generate from the repository root:
 
@@ -223,13 +252,12 @@ blobs, and Worker logs show expert loading and computation.
 
 ### 6. Run the benchmark
 
-Run the one-shot vLLM benchmark container with the Host UID/GID so result
-files remain writable outside Docker:
+Ensure the host results directory has permissions that allow the container to
+write results and the host user to read them. Adjust its ownership with
+`chown` as needed, then run the one-shot vLLM benchmark container:
 
 ```bash
-dev/ascend/run-compose.sh attention run --rm \
-  --user "$(id -u):$(id -g)" \
-  benchmark
+dev/ascend/run-compose.sh attention run --rm benchmark
 ```
 
 Inspect logs without changing the deployment:
@@ -256,6 +284,56 @@ uv run --no-sync --package expertkit-torch \
 
 The vLLM benchmark measures online HTTP serving. The Torch benchmark uses
 fixed offline batches; report the two execution modes separately.
+
+### Replay captured routing in the backend microbenchmark
+
+The backend microbenchmark accepts a normalized routing file without requiring
+production trace spans. A schema-v1 file contains the original global expert
+IDs and the matching sorted lease IDs for each case:
+
+```json
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "expert_ids": [[42, 7], [19, -1]],
+      "lease_expert_ids": [7, 19, 42]
+    }
+  ]
+}
+```
+
+Every case must have the same `[tokens, top_k]` shape. Put five same-shaped
+layer samples in `cases` to cycle through those layers; choose a repeat count
+that is a multiple of five to make `latency_ms.mean` an equally weighted
+per-layer average. Run the Ascend fused path with dimensions matching the
+captured model:
+
+```bash
+uv run --no-sync python ek-worker/benchmarks/bench_backend.py \
+  --backend ascend_fused \
+  --device npu:0 \
+  --dtype bf16 \
+  --tokens <TOKENS> \
+  --hidden-dim <HIDDEN_DIM> \
+  --intermediate-dim <EXPERT_INTERMEDIATE_DIM> \
+  --top-k <TOP_K> \
+  --experts <EXPERTS_PER_LAYER> \
+  --routing-replay <ROUTING_REPLAY_JSON> \
+  --warmup 10 \
+  --repeats 50 \
+  --output <RESULTS_DIR>/ascend-fused-routing-replay.json
+```
+
+Replay preserves routing IDs and lease order. Hidden states and routing weights
+remain deterministic synthetic inputs, so this isolates backend routing and
+expert execution rather than reproducing the complete vLLM request.
+
+This command uses the default eager benchmark mode. For graph replay, use the
+[resident graph benchmark](../../../ek-worker/README.md#compare-resident-graph-computation)
+with valid global expert IDs (no `-1` entries), BF16, concurrency one and an
+explicit resident expert interval. Use the same mode, geometry, quantization,
+shard and routing cases when comparing `torch` with `ascend_fused`.
 
 ### 7. Stop the deployment
 

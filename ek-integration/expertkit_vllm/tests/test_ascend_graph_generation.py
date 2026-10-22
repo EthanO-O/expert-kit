@@ -115,6 +115,41 @@ def _v4_inputs(tmp_path):
     return cluster, experiment
 
 
+@pytest.mark.parametrize(
+    ("profile", "worker_count", "expert_count"),
+    [("qwen3-30b-a3b-w8a8", 2, 6144), ("deepseek-v4-flash-w8a8", 8, 11008)],
+)
+def test_checked_in_modelslim_graph_examples_generate_complete_deployments(
+    tmp_path, profile, worker_count, expert_count
+):
+    from expertkit_worker.config import WorkerConfig
+
+    examples = ASCEND / "configs" / profile
+    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
+    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "generated"
+    graph = json.loads((output / "ascend-decode-graph.json").read_text())
+    worker_paths = sorted((output / "worker-pool1/workers").glob("*.yaml"))
+    assert len(worker_paths) == worker_count == len(graph["workers"])
+    assert len(graph["layer_ids"]) * graph["model"]["experts_per_layer"] == expert_count
+    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
+    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+    assert "enforce-eager" not in serve
+    attention = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
+        "attention"
+    ]
+    assert "TORCHINDUCTOR_AUTOGRAD_CACHE" not in attention["environment"]
+    assert "VLLM_USE_AOT_COMPILE" not in attention["environment"]
+    for worker_path, participant in zip(worker_paths, graph["workers"], strict=True):
+        worker = WorkerConfig.model_validate(yaml.safe_load(worker_path.read_text()))
+        assert worker.worker.id == participant["worker_id"]
+        assert worker.worker.backend.value == "ascend_fused"
+        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == graph
+        assert worker.model.quantization.model_dump(mode="json") == graph["model"]["quantization"]
+
+
 def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path):
     from expertkit_worker.config import WorkerConfig
 

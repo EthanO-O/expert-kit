@@ -34,15 +34,23 @@ mutually exclusive.
 The Frontend and Worker share an EK image derived from that fixed prebuilt
 image. Its four EK Python wheels install with the image's exact dependency
 constraints; the `ascend-graph` extra supplies configuration dependencies and
-leaves the engine choice to the image. Follow the [Ascend graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
-for the shared image, configuration and startup order. The ordinary root
+leaves the engine choice to the image. Follow the [Ascend graph guide](../../doc/tutorial/ascend/decode-graphs.md)
+for Qwen3/V4 examples, the shared image, configuration and startup order. The ordinary root
 workspace environment remains separate.
 
-Lightweight checks do not need to install vLLM:
+Tests importing vLLM interfaces require the corresponding engine environment.
+Run Ascend integration tests inside the prebuilt Ascend image with this
+checkout available and pytest installed. The default workspace does not
+install vLLM, so the complete suite cannot run there:
 
 ```bash
 PYTHONPATH=ek-integration/expertkit_vllm \
-  uv run pytest ek-integration/expertkit_vllm/tests
+  python3 -m pytest ek-integration/expertkit_vllm/tests
+```
+
+Building the plugin wheel from the host checkout does not require vLLM:
+
+```bash
 uv build --package expertkit-vllm --wheel
 ```
 
@@ -73,16 +81,18 @@ variable. Shared memory requires vLLM and the Worker to use the same Host,
 
 ## Current limits
 
-- Routed experts must use the unquantized SiLU FFN path.
+- Routed experts support the unquantized SiLU FFN and declared ModelSlim dynamic W8A8 paths.
 - Tensor, expert, sequence, prefill-context parallelism and EPLB are rejected.
 - Pipeline and ordinary data-parallel model processes are allowed.
 - On the ordinary path, full graph capture is changed to piecewise capture
   because remote MoE calls perform network I/O between graph segments.
-- The optional fixed 1A1F Ascend path preserves native `FULL_DECODE_ONLY`, keeps
-  all routed experts resident, and coordinates one control exchange around each
-  complete Decode step. Prefill and mixed batches use the ordinary path. It
-  requires the exact DeepSeek-V2-Lite BF16 shape, a single rank per role, and
-  fixed placement; see the recipe for configuration and qualification status.
+- The optional Ascend path preserves native `FULL_DECODE_ONLY`, keeps all routed
+  experts resident, and coordinates one control exchange around each complete
+  Decode step. Prefill and mixed batches use the ordinary path. Qwen3 uses one
+  Frontend and two expert Workers; V4 uses one Frontend and eight Workers. Each
+  role requires a distinct device and fixed placement. The V2-Lite profile is
+  also accepted; its historical qualification does not qualify the new image.
+  See the graph guide for model declarations and target-server validation.
 - The integration depends on vLLM internal interfaces and therefore stays
   pinned until a later version is reviewed and adapted.
 

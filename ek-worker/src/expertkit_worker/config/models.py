@@ -30,6 +30,7 @@ class BackendName(StrEnum):
     TORCH = "torch"
     GGML = "ggml"
     FUSED = "fused"
+    ASCEND_FUSED = "ascend_fused"
 
 
 class ActivationDType(StrEnum):
@@ -41,7 +42,7 @@ class ActivationDType(StrEnum):
 
 
 class QuantizationType(StrEnum):
-    """Weight quantization recipes implemented by the Torch Backend."""
+    """Weight quantization recipes implemented by Worker backends."""
 
     GPTQ = "gptq"
     W8A8 = "w8a8"
@@ -76,7 +77,7 @@ class QuantizationConfig(_StrictModel):
         if self.type is QuantizationType.FP4 and self.group_size != 32:
             raise ValueError("FP4 requires group_size 32")
         if not self.symmetric:
-            raise ValueError("the Torch quantized Backend requires symmetric weights")
+            raise ValueError("quantized backends require symmetric weights")
         return self
 
 
@@ -212,6 +213,8 @@ class WorkerProcessConfig(_StrictModel):
         # NOTE: Currently only CUDA is supported in fused backend
         if self.backend is BackendName.FUSED and not is_cuda:
             raise ValueError(f"the MVP {self.backend.value} backend requires cuda:<id>")
+        if self.backend is BackendName.ASCEND_FUSED and not is_npu:
+            raise ValueError(f"the MVP {self.backend.value} backend requires npu:<id>")
 
         if self.backend is BackendName.GGML and self.ggml is None:
             raise ValueError("worker.ggml configuration is required when worker.backend is ggml")
@@ -418,23 +421,32 @@ class WorkerConfig(_StrictModel):
         ):
             raise ValueError("ModelSlim W8A8_DYNAMIC requires an indexed NPU device")
 
-        if self.worker.backend is not BackendName.TORCH and (
+        if self.worker.backend in {BackendName.GGML, BackendName.FUSED} and (
             self.model.quantization is not None or self.model.expert_compute != "swiglu"
         ):
-            raise ValueError("quantization and V4 expert computation require the Torch backend")
-        if self.worker.backend is BackendName.FUSED:
+            raise ValueError(
+                "quantization and V4 expert computation require the Torch or Ascend fused backend"
+            )
+        if (
+            self.worker.backend is BackendName.ASCEND_FUSED
+            and self.model.quantization is not None
+            and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
+        ):
+            raise ValueError("the Ascend fused backend supports only ModelSlim W8A8_DYNAMIC")
+        if self.worker.backend in {BackendName.FUSED, BackendName.ASCEND_FUSED}:
             supported = {ActivationDType.FP16, ActivationDType.BF16}
             if (
                 self.model.activation_dtype not in supported
                 or self.model.weight_dtype not in supported
             ):
                 raise ValueError(
-                    "the fused backend supports only FP16 or BF16 activations and weights"
+                    f"the {self.worker.backend.value} backend supports only FP16 or BF16 "
+                    "activations and weights"
                 )
         graph = self.worker.ascend_decode_graph
         if graph is not None:
             if (
-                self.worker.backend is not BackendName.TORCH
+                self.worker.backend not in {BackendName.TORCH, BackendName.ASCEND_FUSED}
                 or not self.worker.device.startswith("npu:")
                 or self.worker.max_active_batches_per_device != 1
                 or self.model.activation_dtype is not ActivationDType.BF16
@@ -444,7 +456,9 @@ class WorkerConfig(_StrictModel):
                     and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
                 )
             ):
-                raise ValueError("Ascend Decode graphs require one active NPU Torch BF16 slot")
+                raise ValueError(
+                    "Ascend Decode graphs require one active NPU Torch or Ascend fused BF16 slot"
+                )
             rank = graph.worker_rank(self.worker.id)
             if self.model.expert_compute == "deepseek_v4":
                 participant = graph.participants[rank - 1]

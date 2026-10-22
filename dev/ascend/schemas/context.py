@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic import BaseModel, computed_field, model_serializer, model_validator
-
 from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_worker.config import BackendName
+from pydantic import BaseModel, computed_field, model_serializer, model_validator
 
 from .cluster import (
     AscendTransportConfig,
@@ -28,6 +29,11 @@ from .experiment import (
     ServeConfig,
     TracingConfig,
 )
+
+
+class BackendExecutionMode(StrEnum):
+    EAGER = "eager"
+    GRAPH = "graph"
 
 
 class DuplicateDeviceError(ValueError):
@@ -72,6 +78,7 @@ class TemplateContext(BaseModel):
             pools=cluster.pools,
             nodes=nodes,
             runtime=cluster.expert.runtime,
+            backend=cluster.expert.backend,
         )
         paths = cluster.paths
 
@@ -255,6 +262,13 @@ class TemplateContext(BaseModel):
     @computed_field
     @property
     def label(self) -> str:
+        backend = self.expert.backend
+        backend_execution_mode = (
+            BackendExecutionMode.EAGER
+            if self.ascend_decode_graph is None
+            else BackendExecutionMode.GRAPH
+        )
+
         num_attention = len(self.attention.config.devices)
         num_workers = self.expert.total_workers
         placement = f"{num_attention}A{num_workers}E"
@@ -262,7 +276,11 @@ class TemplateContext(BaseModel):
 
         max_concurrency = self.run.max_concurrency
         output_len = self.run.output_len
-        label = f"{placement}-c{max_concurrency}-{dataset_name}-o{output_len}"
+        label = (
+            f"{backend}-{backend_execution_mode}"
+            f"-{placement}-c{max_concurrency}"
+            f"-{dataset_name}-o{output_len}"
+        )
 
         return label
 
@@ -272,6 +290,7 @@ class ExpertContext(BaseModel):
 
     pools: list[NodeBindingContext[PoolConfig]]
     runtime: ExpertRuntimeConfig
+    backend: BackendName
 
     @property
     def total_workers(self) -> int:
@@ -283,6 +302,7 @@ class ExpertContext(BaseModel):
         pools: list[PoolConfig],
         nodes: dict[str, NodeConfig],
         runtime: ExpertRuntimeConfig,
+        backend: BackendName,
     ) -> Self:
         resolved_pools = [
             NodeBindingContext[PoolConfig].resolve(
@@ -292,7 +312,11 @@ class ExpertContext(BaseModel):
             for pool in pools
         ]
 
-        return cls(pools=resolved_pools, runtime=runtime)
+        return cls(
+            pools=resolved_pools,
+            runtime=runtime,
+            backend=backend,
+        )
 
     def get_pool_by_node(self, node: str) -> PoolConfig | None:
         for pool in self.pools:
