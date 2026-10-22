@@ -229,9 +229,13 @@ class RemoteMoERunner(MoERunnerInterface):
                 raise ValueError(
                     "V4 requires its native FP32 gate, local shared expert and router-only scaling"
                 )
-            table = routed_experts.tid2eid
-            if tid2eid is not None and tid2eid is not table:
+            table = getattr(gate, "tid2eid", None)
+            if (tid2eid is not None and tid2eid is not table) or (
+                routed_experts.tid2eid is not None and routed_experts.tid2eid is not table
+            ):
                 raise ValueError("V4 runner and native gate hash table references conflict")
+            # Ascend passes the table only to the runner; the gate owns loading.
+            object.__setattr__(routed_experts, "tid2eid", table)
             tid2eid = table
             if self._layer_id < 3:
                 if table is None or table.shape != (129280, 6) or table.dtype != torch.int32:
@@ -398,14 +402,14 @@ class RemoteMoERunner(MoERunnerInterface):
                         # Ascend preserves FP32 gate weights for stable expert selection.
                         if getattr(self, "_is_deepseek_v4", False):
                             if (
-                                router_logits.dtype != torch.float32
+                                router_logits.dtype != torch.bfloat16
                                 or router_logits.shape != hidden_states.shape
                                 or router_logits.device != hidden_states.device
                             ):
                                 raise ValueError(
-                                    "V4 internal gate requires the original FP32 normalized input"
+                                    "V4 internal gate requires the native BF16 normalized input"
                                 )
-                            gate_input = router_logits
+                            gate_input = router_logits.float()
                         else:
                             gate_input = hidden_states.float()
                         router_logits = torch.nn.functional.linear(

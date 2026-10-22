@@ -102,6 +102,9 @@ services:
     profiles: ["tools"]
     volumes:
       - ./controller.yaml:/etc/expert-kit/config.yaml:ro
+{% if ascend_decode_graph %}
+      - ./ascend-decode-graph.json:/etc/expert-kit/ascend-decode-graph.json:ro
+{% endif %}
       - weight-cache:/var/cache/expert-kit/weight-cache
     networks:
       - expert-kit-network

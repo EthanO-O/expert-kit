@@ -242,6 +242,41 @@ def test_unqualified_step_uses_ordinary_path_without_control(graph_runtime, opti
     assert context.cudagraph_runtime_mode == CUDAGraphMode.FULL
 
 
+def test_prefill_and_mixed_steps_leave_captured_decode_reusable(graph_runtime):
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    events.clear()
+    context.batch_descriptor = descriptor(uniform=False, num_reqs=1, num_tokens=4)
+    assert runner._model_forward() == "eager"
+    assert wrapper.concrete_aclgraph_entries == {}
+    assert events == [("eager", False), "native-attention-update"]
+
+    context.batch_descriptor = descriptor()
+    assert runner._model_forward() == "result"
+    entry = wrapper.concrete_aclgraph_entries[context.batch_descriptor]
+    assert events.count("native-capture") == 1
+    events.clear()
+    assert runner._model_forward() == "result"
+    assert "native-replay" in events and "layer-exchange" not in events
+
+    events.clear()
+    context.batch_descriptor = descriptor(uniform=False, num_reqs=2, num_tokens=4)
+    assert runner._model_forward() == "eager"
+    assert events == [("eager", False), "native-attention-update"]
+
+    events.clear()
+    context.batch_descriptor = descriptor()
+    assert runner._model_forward() == "result"
+    assert wrapper.concrete_aclgraph_entries[context.batch_descriptor] is entry
+    assert events == [
+        ("begin", "replay", 1),
+        "native-replay",
+        "native-attention-update",
+        "synchronize",
+        "finish",
+    ]
+
+
 def test_partial_native_submission_poisoned_without_fallback(graph_runtime):
     events, context, runner, wrapper = graph_runtime
     context.batch_descriptor = descriptor()
@@ -263,12 +298,12 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
         graph,
         "version",
         lambda name: {
-            "vllm": "0.30.0",
+            "vllm": "0.26.0+empty",
             "torch-npu": "2.10.0.post4",
-            "vllm-ascend": "0.1.dev1+g8d4409d62.d20261013",
+            "vllm-ascend": "0.1.dev4525+g155f68974",
         }[name],
     )
-    monkeypatch.setattr(torch, "__version__", "2.10.0")
+    monkeypatch.setattr(torch, "__version__", "2.10.0+cpu")
     monkeypatch.setenv("EK_INSTANCE_ID", "7")
     config = AscendGraphConfig(
         session_id="qualified-session-v1",
@@ -332,6 +367,7 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
             enable_expert_parallel=False,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=max_sequences),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY, cudagraph_capture_sizes=[1, 32, 64]
         ),
@@ -371,12 +407,12 @@ def modelslim_graph_deployment(monkeypatch):
         graph,
         "version",
         lambda name: {
-            "vllm": "0.30.0",
+            "vllm": "0.26.0+empty",
             "torch-npu": "2.10.0.post4",
-            "vllm-ascend": "0.1.dev1+g8d4409d62.d20261013",
+            "vllm-ascend": "0.1.dev4525+g155f68974",
         }[name],
     )
-    monkeypatch.setattr(torch, "__version__", "2.10.0")
+    monkeypatch.setattr(torch, "__version__", "2.10.0+cpu")
     monkeypatch.setenv("EK_INSTANCE_ID", "7")
     geometry = dict(
         model_type="qwen3_moe",
@@ -402,7 +438,7 @@ def modelslim_graph_deployment(monkeypatch):
         def __init__(self):
             self.quant_description = description
 
-    module_name = "vllm_ascend.quantization.configs.modelslim_config"
+    module_name = "vllm_ascend.quantization.modelslim_config"
     module = ModuleType(module_name)
     module.AscendModelSlimConfig = NativeModelSlimConfig
     monkeypatch.setitem(sys.modules, module_name, module)
@@ -449,6 +485,7 @@ def modelslim_graph_deployment(monkeypatch):
             enable_expert_parallel=False,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=64),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
             cudagraph_capture_sizes=[1, 32, 64],
@@ -472,6 +509,48 @@ def test_modelslim_native_recipe_matches_complete_shared_declaration(modelslim_g
         graph.validate_graph_model(runtime, conflicting)
     runtime.parallel_config.tensor_parallel_size = 2
     with pytest.raises(ValueError, match="single-rank"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.mark.parametrize(
+    "package,other_version",
+    [
+        ("vllm", "0.25.1"),
+        ("vllm", "0.30.0"),
+        ("vllm-ascend", "0.26.0rc1"),
+        ("vllm-ascend", "0.1.dev4525+g155f68975"),
+        ("vllm-ascend", "0.1.dev1+g8d4409d62.d20261013"),
+        ("torch-npu", "2.10.0.post3"),
+        ("torch", "2.11.0"),
+    ],
+)
+def test_graph_rejects_other_runtime_revisions(
+    modelslim_graph_deployment, monkeypatch, package, other_version
+):
+    runtime, config = modelslim_graph_deployment
+    if package == "torch":
+        monkeypatch.setattr(torch, "__version__", other_version)
+    else:
+        runtime_version = graph.version
+        monkeypatch.setattr(
+            graph,
+            "version",
+            lambda name: other_version if name == package else runtime_version(name),
+        )
+    with pytest.raises(ValueError, match="Ascend Decode graphs require"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.mark.parametrize("change", ["prefix_cache", "tracing"])
+def test_graph_rejects_unqualified_runtime_features(
+    modelslim_graph_deployment, monkeypatch, change
+):
+    runtime, config = modelslim_graph_deployment
+    if change == "prefix_cache":
+        runtime.cache_config.enable_prefix_caching = True
+    else:
+        monkeypatch.setenv("EK_TRACE_ENDPOINT", "http://127.0.0.1:4318/v1/traces")
+    with pytest.raises(ValueError, match="prefix caching and tracing disabled"):
         graph.validate_graph_model(runtime, config)
 
 

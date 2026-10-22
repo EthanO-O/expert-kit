@@ -67,7 +67,6 @@ class RemoteRoutedExperts(nn.Module):
         self.custom_routing_function = custom_routing_function
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
-        self.e_score_correction_bias = e_score_correction_bias
         # The native gate owns registration and checkpoint loading of this table.
         object.__setattr__(self, "tid2eid", tid2eid)
 
@@ -75,8 +74,12 @@ class RemoteRoutedExperts(nn.Module):
         hf = vllm_config.model_config.hf_text_config
         self.is_deepseek_v4 = getattr(hf, "model_type", None) == "deepseek_v4"
         if self.is_deepseek_v4:
+            object.__setattr__(self, "e_score_correction_bias", e_score_correction_bias)
+        else:
+            self.e_score_correction_bias = e_score_correction_bias
+        if self.is_deepseek_v4:
             from vllm_ascend.ascend_config import get_ascend_config
-            from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
+            from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
 
             expected = {
                 "num_hidden_layers": 43,
@@ -114,7 +117,7 @@ class RemoteRoutedExperts(nn.Module):
                 or not renormalize
                 or scoring_func != "sqrtsoftplus"
                 or routed_scaling_factor != 1.5
-                or use_grouped_topk
+                or not use_grouped_topk
                 or num_expert_group not in (None, 1)
                 or topk_group not in (None, 1)
                 or custom_routing_function is not None

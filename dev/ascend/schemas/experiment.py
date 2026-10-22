@@ -189,3 +189,7 @@ class RunConfig(ConfigModel):
     ignore_eos: bool
     temperature: float
     save_result: bool
+    save_detailed: bool | None = None
+    percentile_metrics: str | None = None
+    metric_percentiles: str | None = None
+    ready_check_timeout_sec: int | None = Field(default=None, ge=0)

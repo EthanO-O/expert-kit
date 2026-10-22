@@ -46,7 +46,7 @@ services:
       - --config
       - /configs/vllm-serve.yaml
 {% if ascend_decode_graph %}
-{# vLLM 0.30 root CLI drops false YAML values before the serve parser sees them. #}
+{# Explicit flags preserve disabled scheduling and prefix caching in the serve CLI. #}
       - --no-async-scheduling
       - --no-enable-prefix-caching
 {% endif %}

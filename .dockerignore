@@ -4,5 +4,8 @@ docker
 container/*
 !container/cargo-config.cn.toml
 .vscode
-dev
+dev/*
+!dev/ascend/
+dev/ascend/*
+!dev/ascend/graph-runtime-constraints.txt
 doc

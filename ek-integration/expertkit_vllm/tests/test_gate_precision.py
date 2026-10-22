@@ -117,7 +117,7 @@ def test_ascend_unquantized_gate_requires_post_load_parameter_before_graph(monke
     assert router.logits == []
 
 
-def test_v4_internal_gate_preserves_original_fp32_normalized_input(monkeypatch):
+def test_v4_internal_gate_promotes_native_bf16_input_before_projection(monkeypatch):
     gate = _gate()
     gate.weight_fp32 = torch.nn.Parameter(gate.weight.float(), requires_grad=False)
     runner, router = _runner(monkeypatch, gate)
@@ -128,12 +128,14 @@ def test_v4_internal_gate_preserves_original_fp32_normalized_input(monkeypatch):
     assert not torch.equal(original, hidden.float())
     for graph in (False, True):
         runner.graph_config = object() if graph else None
-        runner._forward_impl(hidden, original, None)
-        torch.testing.assert_close(router.logits[-1], original @ gate.weight_fp32.T, rtol=0, atol=0)
-    for invalid in (hidden, original[:, :3], torch.empty(1, 3)):
-        with pytest.raises(ValueError, match="original FP32"):
+        runner._forward_impl(hidden, hidden, None)
+        torch.testing.assert_close(
+            router.logits[-1], hidden.float() @ gate.weight_fp32.T, rtol=0, atol=0
+        )
+    for invalid in (original, original[:, :3], torch.empty(1, 3)):
+        with pytest.raises(ValueError, match="native BF16"):
             runner._forward_impl(hidden, invalid, None)
     del gate.weight_fp32
     runner.graph_config = None
     with pytest.raises(RuntimeError, match="post-load FP32"):
-        runner._forward_impl(hidden, original, None)
+        runner._forward_impl(hidden, hidden, None)

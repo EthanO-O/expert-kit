@@ -109,7 +109,7 @@ overhead comparison.
 fields: session/instance/Worker/weight identity, control and rendezvous endpoints,
 routed layer IDs, capture sizes and timeout. It defaults to absent. The
 [DeepSeek-V2-Lite graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
-describes the exact separate engine installation and startup readiness gate.
+describes the shared prebuilt runtime image and startup readiness gate.
 
 The generator validates one host, one Frontend and one expert pool on distinct
 devices, matching identity, unused graph ports and one active Worker batch.
@@ -124,6 +124,8 @@ not create these Controller assignments. Start the Frontend only after actual
 READY routes prove all 1,664 experts have the declared owner and process start ID.
 
 DeepSeek-V4-Flash W8A8 requires a vLLM-Ascend build with native V4 support.
+V4 generation selects the native `mp` executor to keep the TP=1 native executor's
+KV-cache configuration separate from scheduler-derived block sizes.
 Declare 43 layers, 256 experts, hidden size 4096, intermediate size 2048 and
 top-k 6, with these additional model fields:
 

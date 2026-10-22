@@ -15,18 +15,15 @@ services:
     build:
       context: ../../..
       dockerfile: container/Dockerfile.npu
-      target: ek-worker-ascend-runtime
+      target: ek-ascend-runtime
       args:
-        UV_IMAGE: {{ images.uv }}
-        UV_DEFAULT_INDEX: https://mirror.nju.edu.cn/pypi/web/simple
+        VLLM_ASCEND_IMAGE: {{ images.vllm_ascend }}
 
   attention-image:
     image: {{ images.attention }}
     build:
       context: ../../..
       dockerfile: container/Dockerfile.npu
-      target: ek-vllm-ascend-runtime
+      target: ek-ascend-runtime
       args:
-        # NJU mirror of the selected nightly-main-a3 digest.
         VLLM_ASCEND_IMAGE: {{ images.vllm_ascend }}
-        UV_DEFAULT_INDEX: https://mirror.nju.edu.cn/pypi/web/simple

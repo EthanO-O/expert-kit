@@ -4,17 +4,7 @@ services:
 {% for worker in pool.workers %}
   {{ worker.id }}:
     image: {{ images.expert }}
-{% if ascend_decode_graph %}
     entrypoint: ["ek-worker"]
-{% else %}
-    entrypoint:
-      - uv
-      - run
-      - --no-sync
-      - --package
-      - expertkit-worker
-      - ek-worker
-{% endif %}
     command: ["--config", "/etc/expert-kit/worker.yaml"]
     privileged: true
     ipc: host

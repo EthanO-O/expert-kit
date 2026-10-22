@@ -133,11 +133,6 @@ class AscendExpertSelector:
             bias = options.e_score_correction_bias
             if bias is not None and bias.dtype != router_logits.dtype:
                 bias = bias.to(router_logits.dtype)
-            text_options = (
-                {"bias_vl": None, "image_sentinel_lo": 129257, "image_sentinel_count": 5}
-                if getattr(options, "is_deepseek_v4", False)
-                else {}
-            )
             weights, ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
                 x=router_logits,
                 k=options.top_k,
@@ -152,7 +147,6 @@ class AscendExpertSelector:
                 renorm=0,
                 norm_type=2,
                 out_flag=False,
-                **text_options,
             )
             return weights.to(torch.float32), ids.to(torch.int32)
         if self._select is None:

@@ -1,10 +1,21 @@
-# Exact dependency lane used by the fixed DeepSeek Ascend graph deployment.
-torch==2.10.0
+# Installed runtime in quay.io/ascend/vllm-ascend:v0.26.0rc2-a3.
+# Structlog is the additional EK dependency, frozen for reproducible installation.
+vllm==0.26.0+empty
+vllm-ascend==0.1.dev4525+g155f68974
+torch==2.10.0+cpu
 torch-npu==2.10.0.post4
+triton==3.5.0
+triton-ascend==3.2.2
+transformers==5.14.1
 numpy==1.26.4
-grpcio==1.71.0
-protobuf==5.29.6
-googleapis-common-protos==1.75.0
+grpcio==1.84.0
+protobuf==7.36.1
+googleapis-common-protos==1.75.3
+pydantic==2.13.5
+safetensors==0.8.0
+aiohttp==3.14.3
+PyYAML==6.0.3
+opencv-python-headless==5.0.0.93
+fastapi==0.123.10
+starlette==0.50.0
 structlog==25.4.0
-opencv-python-headless==4.11.0.86
-fastapi>=0.133.0,<0.137.0

@@ -14,7 +14,7 @@ from expertkit_vllm.experts.remote_routed_experts import RemoteRoutedExperts
 @pytest.fixture
 def v4_placeholder(monkeypatch):
     """Use fake native configuration at the external Ascend dependency boundary."""
-    module_name = "vllm_ascend.quantization.configs.modelslim_config"
+    module_name = "vllm_ascend.quantization.modelslim_config"
     module = ModuleType(module_name)
     native_type = type("AscendModelSlimConfig", (), {"__module__": module_name})
     module.AscendModelSlimConfig = native_type
@@ -66,6 +66,7 @@ def v4_placeholder(monkeypatch):
     table = torch.zeros((129280, 6), dtype=torch.int32)
     kwargs = dict(
         renormalize=True,
+        use_grouped_topk=True,
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
         swiglu_limit=10.0,
@@ -133,6 +134,7 @@ def test_v4_placeholder_rejects_unqualified_configuration(v4_placeholder, target
         {"renormalize": False},
         {"scoring_func": "softmax"},
         {"routed_scaling_factor": 1.0},
+        {"use_grouped_topk": False},
     ],
 )
 def test_v4_placeholder_rejects_wrong_expression(v4_placeholder, updates):
@@ -151,8 +153,23 @@ def test_qualified_v4_uses_native_hash_operator_on_local_rows(monkeypatch, hashe
     expected_weights = torch.ones(2, 6, dtype=torch.float32)
     expected_ids = torch.zeros(2, 6, dtype=torch.int32)
 
-    def select(**kwargs):
-        calls.append(kwargs)
+    def select(
+        *,
+        x,
+        k,
+        bias,
+        input_ids,
+        tid2eid,
+        k_group,
+        group_count,
+        routed_scaling_factor,
+        eps,
+        group_select_mode,
+        renorm,
+        norm_type,
+        out_flag,
+    ):
+        calls.append(locals())
         return expected_weights, expected_ids, None
 
     monkeypatch.setattr(torch.ops._C_ascend, "moe_gating_top_k_hash", select, raising=False)
@@ -200,7 +217,7 @@ def _native_runner(monkeypatch, v4_placeholder, *, layer=0, table=None, bias=Non
     construct, config, moe, source_table = v4_placeholder
     table = source_table if layer < 3 and table is None else table
     bias = torch.zeros(256) if layer >= 3 and bias is None else bias
-    experts = construct(tid2eid=table, e_score_correction_bias=bias)
+    experts = construct(tid2eid=None, e_score_correction_bias=bias)
     config.model_config.enforce_eager = True
     config.compilation_config = SimpleNamespace(
         static_forward_context={},
@@ -228,7 +245,7 @@ def _native_runner(monkeypatch, v4_placeholder, *, layer=0, table=None, bias=Non
         moe,
         router,
         experts,
-        **{"gate": gate, "shared_experts": torch.nn.Identity(), **overrides},
+        **{"gate": gate, "tid2eid": table, "shared_experts": torch.nn.Identity(), **overrides},
     )
     return runner, gate
 
@@ -266,3 +283,126 @@ def test_native_runner_nonhash_requires_loaded_bias_and_no_hash_table(monkeypatc
     assert runner.routed_experts.e_score_correction_bias is not None
     with pytest.raises(ValueError, match="nonhash"):
         _native_runner(monkeypatch, v4_placeholder, layer=3, table=v4_placeholder[3])
+
+
+@pytest.mark.parametrize("hashed", [True, False])
+def test_v4_factory_routes_gate_owned_table_and_scales_before_shared_add(
+    monkeypatch, v4_placeholder, hashed
+):
+    from vllm.config import CUDAGraphMode
+    from vllm.model_executor.layers.fused_moe import layer as fused_moe_layer
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from expertkit_vllm.experts import remote_moe
+
+    _, config, _, table = v4_placeholder
+    config.model_config.dtype = torch.bfloat16
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32)
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.expert_placement_strategy = "linear"
+    config.parallel_config.enable_dbo = False
+    config.parallel_config.all2all_backend = "allgather_reducescatter"
+    config.kernel_config = SimpleNamespace(moe_backend="auto")
+    config.lora_config = None
+    config.device_config = SimpleNamespace(device=torch.device("cpu"))
+    config.compilation_config = SimpleNamespace(
+        static_forward_context={},
+        static_all_moe_layers=[],
+        splitting_ops=[],
+        cudagraph_mode=CUDAGraphMode.NONE,
+        max_cudagraph_capture_size=64,
+    )
+    monkeypatch.setattr(fused_moe_layer, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(remote_moe, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(selector, "current_platform", SimpleNamespace(device_type="npu"))
+    monkeypatch.setenv("EK_ADDR", "127.0.0.1:50050")
+    monkeypatch.delenv("EK_ASCEND_DECODE_GRAPH_CONFIG", raising=False)
+    monkeypatch.delenv("EK_TRACE_ENDPOINT", raising=False)
+    gate = torch.nn.Linear(4096, 256, bias=False, dtype=torch.bfloat16)
+    gate.weight_fp32 = torch.nn.Parameter(gate.weight.float(), requires_grad=False)
+    method = type("AscendUnquantizedLinearMethod", (), {"__module__": "vllm_ascend.ops.linear"})
+    gate.quant_method = method()
+    gate.tid2eid = torch.nn.Parameter(table, requires_grad=False) if hashed else None
+    gate.e_score_correction_bias = (
+        None if hashed else torch.nn.Parameter(torch.linspace(0, 0.2, 256))
+    )
+    calls = []
+
+    def router_factory(**kwargs):
+        assert kwargs["use_grouped_topk"] and kwargs["routed_scaling_factor"] == 1.5
+        return SimpleNamespace(routing_method_type=RoutingMethodType.Default)
+
+    monkeypatch.setattr(fused_moe_layer, "create_fused_moe_router", router_factory)
+
+    def platform_factory(*args, runner_cls=None, runner_args=None, **kwargs):
+        # Ascend 0.26 forwards its table only to runner_args.
+        kwargs.pop("hash", None)
+        table_arg = kwargs.pop("tid2eid", None)
+        if table_arg is not None:
+            runner_args = {**(runner_args or {}), "tid2eid": table_arg}
+        assert kwargs.get("routed_experts_args") is None
+        return fused_moe_layer.FusedMoE(
+            *args, runner_cls=runner_cls, runner_args=runner_args, **kwargs
+        )
+
+    runner = remote_moe.wrap_fused_moe_factory(platform_factory)(
+        num_experts=256,
+        top_k=6,
+        hidden_size=4096,
+        intermediate_size=2048,
+        params_dtype=torch.bfloat16,
+        prefix=f"model.layers.{0 if hashed else 3}.mlp.experts",
+        quant_config=config.quant_config,
+        gate=gate,
+        shared_experts=torch.nn.Identity(),
+        renormalize=True,
+        use_grouped_topk=True,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+        e_score_correction_bias=gate.e_score_correction_bias,
+        hash=hashed,
+        tid2eid=gate.tid2eid,
+    )
+    assert runner.routed_experts.tid2eid is gate.tid2eid
+    assert runner.expert_selector._tid2eid is gate.tid2eid
+    assert "tid2eid" not in runner.routed_experts._parameters
+    assert all(parameter.numel() == 0 for parameter in runner.routed_experts.parameters())
+    assert runner.routed_scaling_factor == 1.0
+    assert runner.routed_experts.routed_scaling_factor == 1.5
+    parameter = gate.tid2eid if hashed else gate.e_score_correction_bias
+    pointer = parameter.data_ptr()
+    loaded = torch.arange(parameter.numel(), dtype=parameter.dtype).reshape(parameter.shape)
+    if hashed:
+        loaded %= 256
+    default_weight_loader(parameter, loaded)
+    assert parameter.data_ptr() == pointer
+    assert runner.routed_experts.e_score_correction_bias is gate.e_score_correction_bias
+    assert runner.routed_experts.tid2eid is gate.tid2eid
+    hidden = torch.stack((torch.ones(4096), torch.full((4096,), 2.0))).bfloat16()
+    expected_logits = hidden.float() @ gate.weight_fp32.T
+
+    def native_hash(*, x, k, bias, input_ids, tid2eid, routed_scaling_factor, **kwargs):
+        torch.testing.assert_close(x, expected_logits, rtol=0, atol=0)
+        assert tid2eid is gate.tid2eid and routed_scaling_factor == 1.5
+        scores = torch.nn.functional.softplus(x).sqrt()
+        ids = tid2eid[input_ids].long() if hashed else (scores + bias).topk(k).indices
+        weights = scores.gather(1, ids)
+        return weights / weights.sum(-1, keepdim=True) * routed_scaling_factor, ids, None
+
+    monkeypatch.setattr(torch.ops._C_ascend, "moe_gating_top_k_hash", native_hash, raising=False)
+
+    def exchange(layer, inputs, ids, weights):
+        calls.append((layer, ids, weights))
+        torch.testing.assert_close(weights.sum(-1), torch.full((2,), 1.5))
+        return (weights.sum(-1, keepdim=True) * 2).expand_as(inputs).to(inputs.dtype)
+
+    monkeypatch.setattr(
+        remote_moe, "active_graph_session", lambda: SimpleNamespace(exchange=exchange)
+    )
+    output = runner._forward_impl(hidden, hidden, torch.tensor([0, 1]) if hashed else None)
+    torch.testing.assert_close(output, hidden + 3, rtol=0, atol=0)
+    assert len(calls) == 1

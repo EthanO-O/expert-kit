@@ -14,6 +14,7 @@ quantization: ascend
 {% if model.expert_compute == "deepseek_v4" %}
 load-format: safetensors
 safetensors-load-strategy: lazy
+distributed-executor-backend: mp
 {% endif %}
 {% if ascend_decode_graph %}
 async-scheduling: false

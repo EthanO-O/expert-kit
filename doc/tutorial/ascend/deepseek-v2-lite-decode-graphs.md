@@ -41,73 +41,35 @@ probabilities; these measurements do not identify Decode graph replay or its
 reduction order as the cause. They establish the tested output and numerical
 scope, without a general quality-equivalence claim.
 
-## Install an isolated runtime
+## Build the shared runtime image
 
-Use Python 3.12, CANN 9.1.0 and HDK 25.5.1. The graph engine sources are pinned:
+Use the [common deployment workflow](README.md#3-build-the-images) to build the
+four EK Python wheels and the shared `ek-ascend-runtime` image. Both
+`images.attention` and `images.expert` select this same image. The example
+configuration selects the official `v0.26.0rc2-a3` tag. The Dockerfile default
+also freezes the inspected base by digest:
 
-| Component | Source revision |
-| --- | --- |
-| vLLM 0.30.0, built for EMPTY/NPU | `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
-| vLLM-Ascend | `8d4409d6256d8a6729140ddcc0d1889e3f96cdd6` |
-| Official `deepseek-ai/DeepSeek-V2-Lite-Chat` checkpoint | `85864749cd611b4353ce1decdb286193298f64c7` |
-
-The tested preparation starts from an independent copy of a source-built runtime
-at these exact revisions. Keep its source trees, venv and compiled modules
-together at their recorded paths, outside the generator's `generated/` output.
-The generator replaces that output directory. Verify source HEADs, tracked diffs,
-package metadata and Torch/Torch-NPU compiled-module import paths before use.
-Never mutate the original frozen runtime.
-
-The engine build uses `VLLM_TARGET_DEVICE=empty`; a PyPI CPU vLLM wheel has a
-different Torch dependency and is unsuitable. The recorded source metadata pins
-`opencv-python-headless==4.11.0.86` in vLLM's `requirements/common.txt` and changes
-Ascend's FastAPI requirement to `>=0.133.0,<0.137.0`. Preserve these two source
-diffs and the exact commit IDs. A fresh engine-wheel deployment is an optional
-later packaging route and has not been qualified by the current preparation.
-
-Build the four EK leaf wheels from the repository:
-
-```bash
-uv build --package expertkit-proto --wheel
-uv build --package expertkit-transport --wheel
-uv build --package expertkit-worker --wheel
-uv build --package expertkit-vllm --wheel
+```text
+quay.io/ascend/vllm-ascend:v0.26.0rc2-a3@sha256:8cbb72814ec80978ab15c0164c43b4e60541cecd1d9f6f4b143ba6ecb4ff63f6
 ```
 
-Install all four EK wheels into that independently owned runtime with normal
-dependency resolution and
-[graph-runtime-constraints.txt](../../../dev/ascend/graph-runtime-constraints.txt).
-From the repository root, set `GRAPH_PYTHON` to that runtime's Python:
+This base already provides Python 3.12, CANN 9.1.0, Torch 2.10.0, Torch-NPU
+2.10.0.post4, Triton-Ascend 3.2.2 and the EMPTY/NPU vLLM 0.26.0 engine. Install
+EK with normal dependency resolution and the checked-in
+[image constraints](../../../dev/ascend/graph-runtime-constraints.txt). The
+Dockerfile uses binary packages and leaves the image's engine and device stack
+in place. There are no engine patches, source builds or separate native
+Mooncake build steps. EK Triton kernels compile on first use during warmup.
 
-```bash
-GRAPH_PYTHON=/absolute/path/to/owned/controlled/.venv/bin/python
-# Replace previously installed same-version EK leaves before resolving new wheels.
-"$GRAPH_PYTHON" -m pip uninstall -y \
-  expertkit-proto expertkit-transport expertkit-worker expertkit-vllm
-"$GRAPH_PYTHON" -m pip install \
-  --constraint dev/ascend/graph-runtime-constraints.txt \
-  numpy==1.26.4 grpcio==1.71.0 protobuf==5.29.6 \
-  structlog==25.4.0 googleapis-common-protos==1.75.0 \
-  dist/expertkit_proto-*.whl dist/expertkit_transport-*.whl \
-  dist/expertkit_worker-*.whl 'dist/expertkit_vllm-0.1.0-py3-none-any.whl[ascend-graph]'
-"$GRAPH_PYTHON" -m pip check
-```
+The `ascend-graph` extra supplies configuration dependencies; the CUDA `engine`
+extra is a separate installation profile. Keep the base image's `PATH`,
+`PYTHONPATH` and `LD_LIBRARY_PATH` so its CANN compiler and Python modules remain
+available. Frontend runs `vllm` and Worker runs the installed `ek-worker`
+entrypoint directly.
 
-Record the engine metadata before and after installation and verify it did not
-change. For offline preparation, provide the pinned dependency wheels through
-`--no-index --find-links`; keep dependency resolution enabled. The current
-experiment verifies installed EK Python and metadata bytes against each supplied
-wheel and audits the recursive engine/EK/compiler dependency closure. Its global
-`pip check` remains failed for three unrelated CANN tools (`affinity-sched`,
-`mindstudio-kpp`, `ms-service-profiler`), which are explicitly outside that
-closure; this exception does not excuse a core runtime conflict.
-
-The `ascend-graph` extra supplies optional configuration dependencies; it does
-not install an engine. Do not combine it with the `engine` extra, which selects
-vLLM 0.25.1. Keep the image's complete CANN/TBE compiler `PATH`, `PYTHONPATH` and
-`LD_LIBRARY_PATH`. NumPy 1.26.4 matches Triton-Ascend 3.2.2's requirement. Record
-any unrelated vendor profiling-tool conflicts separately; EK, engine, Torch,
-Torch-NPU and compiler dependencies must be consistent.
+The validation results earlier in this guide were recorded with the previous
+runtime. They do not establish qualification of this prebuilt image for
+DeepSeek-V2-Lite.
 
 ## Generate configuration
 
@@ -125,11 +87,8 @@ placement qualification above. Set
 `expert.runtime.max_active_batches_per_device: 1` and reserve at least the
 routed BF16 weights: 26.81 GiB on a single Worker or 13.41 GiB on each of
 two Workers, plus each role's measured graph/runtime memory. Use
-images containing the isolated runtime above; the default older image does not
-supply this graph stack. In both images, prepend that exact venv’s `bin/` to
-`PATH` and verify `vllm` and `ek-worker` resolve there. The graph Worker Compose
-uses the installed `ek-worker` entrypoint directly, so it does not select a
-workspace `uv run` environment.
+the same shared runtime image above for Frontend and Workers. Verify that
+`vllm` and `ek-worker` resolve in that image; no workspace environment is needed.
 
 Add this optional section to `experiment.yaml`, replacing the address, session,
 instance ID and weight version with the actual deployment values:

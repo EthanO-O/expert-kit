@@ -2,6 +2,7 @@
 
 import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -150,8 +151,13 @@ def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path
     assert serve["trust-remote-code"] is False
     assert serve["load-format"] == "safetensors"
     assert serve["safetensors-load-strategy"] == "lazy"
+    assert serve["distributed-executor-backend"] == "mp"
+    assert serve["max-model-len"] == experiment["serve"]["max_model_len"]
+    assert serve["max-num-seqs"] == 64
+    assert serve["max-num-batched-tokens"] == 2048
     assert serve["compilation-config"]["mode"] == "VLLM_COMPILE"
     assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+    assert serve["compilation-config"]["cudagraph_capture_sizes"] == [1, 32, 64]
     attention = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
         "attention"
     ]
@@ -184,10 +190,13 @@ def test_v4_ordinary_generation_keeps_native_modelslim_loader(tmp_path):
     assert serve["quantization"] == "ascend"
     assert serve["load-format"] == "safetensors"
     assert serve["safetensors-load-strategy"] == "lazy"
+    assert serve["distributed-executor-backend"] == "mp"
     assert "compilation-config" not in serve
     worker = yaml.safe_load((output / "worker-pool1/workers/worker-00.yaml").read_text())
     assert worker["model"]["quantization"] == experiment["model"]["quantization"]
     assert "ascend_decode_graph" not in worker["worker"]
+    compose = yaml.safe_load((output / "worker-pool1/compose.expert.yaml").read_text())
+    assert compose["services"]["worker-00"]["entrypoint"] == ["ek-worker"]
 
 
 def test_graph_generation_reports_missing_model_as_validation_error(tmp_path, monkeypatch):
@@ -231,10 +240,25 @@ def test_graph_generation_connects_native_full_and_worker(tmp_path):
     ]
     assert expert["network_mode"] == "host" and "networks" not in expert
     assert expert["entrypoint"] == ["ek-worker"]
+    assert expert["image"] == attention["image"]
+    builds = yaml.safe_load((output / "compose.build.yaml").read_text())["services"]
+    for service in ("worker-image", "attention-image"):
+        assert builds[service]["image"] == attention["image"]
+        assert builds[service]["build"]["target"] == "ek-ascend-runtime"
+        assert builds[service]["build"]["args"] == {
+            "VLLM_ASCEND_IMAGE": cluster["images"]["vllm_ascend"]
+        }
     benchmark = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
         "benchmark"
     ]
     assert benchmark["network_mode"] == "host" and "networks" not in benchmark
+    admin = yaml.safe_load((output / "compose.control.yaml").read_text())["services"]["admin"]
+    assert (
+        "./ascend-decode-graph.json:/etc/expert-kit/ascend-decode-graph.json:ro" in admin["volumes"]
+    )
+    bench = yaml.safe_load((output / "vllm-bench.yaml").read_text())
+    assert "save-detailed" not in bench
+    assert "metric-percentiles" not in bench
     serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
     assert serve["async-scheduling"] is False
     assert serve["max-num-seqs"] == 64
@@ -244,6 +268,27 @@ def test_graph_generation_connects_native_full_and_worker(tmp_path):
     assert yaml.safe_load((output / "compose.attention.dev.yaml").read_text())["services"][
         "attention"
     ] == {"network_mode": "host"}
+
+
+def test_graph_benchmark_options_reach_native_cli(tmp_path):
+    cluster, experiment = _inputs(tmp_path)
+    experiment["run"].update(
+        save_detailed=True,
+        percentile_metrics="ttft,tpot,itl,e2el",
+        metric_percentiles="50,99",
+        ready_check_timeout_sec=0,
+    )
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    to_cmd = runpy.run_path(str(ASCEND / "bench_launcher.py"))["to_cmd"]
+    command = to_cmd(tmp_path / "generated/vllm-bench.yaml")
+    assert "--save-detailed" in command
+    for flag, value in (
+        ("--percentile-metrics", "ttft,tpot,itl,e2el"),
+        ("--metric-percentiles", "50,99"),
+        ("--ready-check-timeout-sec", "0"),
+    ):
+        assert command[command.index(flag) + 1] == value
 
 
 @pytest.mark.parametrize(
@@ -367,6 +412,8 @@ def test_qwen_generation_derives_model_before_expert_interval_validation(tmp_pat
     assert result.returncode == 0, result.stderr
     shared = json.loads((tmp_path / "generated/ascend-decode-graph.json").read_text())
     assert shared["model"] == declaration
+    serve = yaml.safe_load((tmp_path / "generated/vllm-serve.yaml").read_text())
+    assert "distributed-executor-backend" not in serve
     for index in range(2):
         worker = yaml.safe_load(
             (tmp_path / f"generated/worker-pool1/workers/worker-{index:02d}.yaml").read_text()

@@ -22,5 +22,17 @@ max-concurrency: {{ run.max_concurrency }}
 ignore-eos: {{ run.ignore_eos | lower }}
 temperature: {{ run.temperature }}
 save-result: {{ run.save_result | lower }}
+{% if run.save_detailed is not none %}
+save-detailed: {{ run.save_detailed | lower }}
+{% endif %}
+{% if run.percentile_metrics is not none %}
+percentile-metrics: {{ run.percentile_metrics | tojson }}
+{% endif %}
+{% if run.metric_percentiles is not none %}
+metric-percentiles: {{ run.metric_percentiles | tojson }}
+{% endif %}
+{% if run.ready_check_timeout_sec is not none %}
+ready-check-timeout-sec: {{ run.ready_check_timeout_sec }}
+{% endif %}
 result-dir: /results
 label: {{ label }}

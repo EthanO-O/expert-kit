@@ -58,7 +58,7 @@ def _native_graph_quantization(vllm_config: Any) -> AscendGraphQuantization | No
     ):
         raise ValueError("Ascend graph native quantization recipe is not qualified")
 
-    from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
+    from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
 
     if type(native) is not AscendModelSlimConfig:
         raise ValueError("Ascend graph requires the native ModelSlim configuration")
@@ -98,13 +98,13 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
     parallel = vllm_config.parallel_config
     hf = model.hf_text_config
     if (
-        version("vllm") != "0.30.0"
+        version("vllm").split("+", 1)[0] != "0.26.0"
         or torch.__version__.split("+", 1)[0] != "2.10.0"
-        or not version("vllm-ascend").startswith("0.1.dev1+g8d4409d62.")
+        or version("vllm-ascend") != "0.1.dev4525+g155f68974"
         or version("torch-npu") != "2.10.0.post4"
     ):
         raise ValueError(
-            "Ascend Decode graphs require the qualified vLLM 0.30/Torch-NPU 2.10 stack"
+            "Ascend Decode graphs require vLLM 0.26.0, Ascend 155f68974 and Torch-NPU 2.10.0.post4"
         )
     if hf.model_type == "deepseek_v2":
         expected = {
@@ -179,6 +179,8 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
         raise ValueError("Ascend graph model declaration does not match the native Frontend model")
     if config.layer_ids != routed_layers:
         raise ValueError("Ascend graph requires every routed model layer in native order")
+    if vllm_config.cache_config.enable_prefix_caching or os.environ.get("EK_TRACE_ENDPOINT"):
+        raise ValueError("Ascend Decode graph requires prefix caching and tracing disabled")
     if (
         parallel.tensor_parallel_size != 1
         or parallel.data_parallel_size != 1

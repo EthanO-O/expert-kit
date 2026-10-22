@@ -119,8 +119,8 @@ dev/ascend/run-compose.sh expert worker-pool2 config -q
 
 ### 3. Build the images
 
-The attention image installs local EK wheels. Build them before building that
-image:
+Frontend and Worker use the same image, derived from the pinned official
+`v0.26.0rc2-a3` image. Build its four EK Python wheels first:
 
 ```bash
 mkdir -p dist/attention-wheels
@@ -129,12 +129,15 @@ uv build --wheel --package expertkit-proto \
   --out-dir dist/attention-wheels
 uv build --wheel --package expertkit-transport \
   --out-dir dist/attention-wheels
+uv build --wheel --package expertkit-worker \
+  --out-dir dist/attention-wheels
 uv build --wheel --package expertkit-vllm \
   --out-dir dist/attention-wheels
 ```
 
-Build only the targets required by the current Host. If attention and control
-share a Host, the first two commands may be combined:
+Build the control image on the control Host and the shared Ascend image on
+each inference Host. When Frontend and Worker share a Host, build the Ascend
+image once:
 
 ```bash
 # control node
@@ -143,7 +146,7 @@ dev/ascend/run-compose.sh image build control-image
 # attention node
 dev/ascend/run-compose.sh image build attention-image
 
-# node-b and node-c
+# Worker-only Hosts build the same image
 dev/ascend/run-compose.sh image build worker-image
 ```
 
@@ -276,9 +279,23 @@ dev/ascend/run-compose.sh control down
 
 | Role | Python | PyTorch | torch-npu | CANN | vLLM / vLLM-Ascend |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Worker image | `3.12` | `2.11.0` | `2.11.0rc1` | `9.0.1` base image | Not installed |
-| Torch ablation | `>=3.12` | `2.11.0` | `2.11.0rc1` | Host installation | Not installed |
-| Attention image | Image-owned | Image-owned Torch 2.10 profile | Image-owned | `9.0.1` profile | vLLM `0.25.1`; selected vLLM-Ascend `main-a3` snapshot |
+| Shared Frontend / Worker image | `3.12` | `2.10.0+cpu` | `2.10.0.post4` | `9.1.0` | vLLM `0.26.0+empty`; vLLM-Ascend `0.1.dev4525+g155f68974` |
+| Optional Torch frontend | `3.12` | `2.10.0` | `2.10.0.post4` | `9.1.0` | Not required |
 
-Do not synchronize the root uv environment over the attention image's
-accelerator stack.
+The example configurations select `v0.26.0rc2-a3`; the Dockerfile default
+records the inspected digest. The shared
+image installs only the four EK Python wheels and their constrained dependencies;
+it retains the prebuilt engine, Torch, Torch-NPU, Triton-Ascend and CANN. The
+`+cpu` Torch package suffix is the upstream image's version; Ascend execution
+uses its installed Torch-NPU backend. The optional Torch frontend requires its
+own Python package and is not included in these four wheels.
+
+The image does not build vLLM, vLLM-Ascend, Torch, Triton or Mooncake from source.
+EK Triton kernels still compile on first use as part of normal warmup. Decode
+graph transport uses HCCL and does not require the optional Mooncake native build.
+See the [graph recipe](deepseek-v2-lite-decode-graphs.md) for graph configuration
+and startup order.
+
+Do not install the PyPI CUDA `engine` extra or synchronize the default root uv
+environment over the attention image's accelerator stack. The root `npu` and
+`vllm` extras are mutually exclusive.

@@ -2,9 +2,9 @@
 
 This package replaces vLLM's routed MoE factory with an implementation that
 keeps vLLM's router and shared experts local while sending one complete routed
-layer to Expert Kit Transport. The ordinary engine extra targets vLLM `0.25.1`.
-The optional Ascend Decode graph lane uses a separate exact vLLM `0.30.0`
-source-built runtime described below.
+layer to Expert Kit Transport. The PyPI CUDA engine extra targets vLLM `0.25.1`.
+The Ascend Decode graph lane uses the official prebuilt vLLM `0.26.0` /
+vLLM-Ascend `v0.26.0rc2-a3` image described below.
 
 The ordinary vLLM 0.25.1 lane is runtime-qualified with the official
 DeepSeek-V2-Lite-Chat BF16 checkpoint. Ordinary CI keeps the full model run
@@ -25,12 +25,18 @@ This installs `expertkit-vllm`, its workspace Transport dependency, and vLLM
 For a standalone wheel installation, request `expertkit-vllm[engine]` to install
 vLLM `0.25.1`; the base package leaves the engine choice to the deployment.
 
-The optional Ascend lane requires the pinned source-built EMPTY/NPU engine runtime, Torch
-`2.10.0`, and Torch-NPU `2.10.0.post4` in an isolated environment. Its
-`ascend-graph` extra supplies graph configuration dependencies and does not
-install a PyPI vLLM engine. Follow the [complete Ascend graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
-for exact source commits, resolver constraints, shared configuration, and startup
-order. The ordinary root workspace environment remains separate.
+The ordinary Ascend deployment selects the prebuilt vLLM-Ascend
+`v0.26.0rc2-a3` image with vLLM `0.26.0`, Torch `2.10.0`, Torch-NPU
+`2.10.0.post4`, and CANN `9.1.0`. Install the base plugin in that image without
+the CUDA `engine` extra. The workspace marks CUDA engine and NPU extras as
+mutually exclusive.
+
+The Frontend and Worker share an EK image derived from that fixed prebuilt
+image. Its four EK Python wheels install with the image's exact dependency
+constraints; the `ascend-graph` extra supplies configuration dependencies and
+leaves the engine choice to the image. Follow the [Ascend graph recipe](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
+for the shared image, configuration and startup order. The ordinary root
+workspace environment remains separate.
 
 Lightweight checks do not need to install vLLM:
 

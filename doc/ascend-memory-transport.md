@@ -7,6 +7,8 @@ model configuration, image preparation, and Controller setup.
 
 ## Build and install
 
+Decode graphs use HCCL and do not require this optional Ascend Direct build.
+
 Use Linux ARM64, CPython 3.12, CANN 9.0.1, and a matching PyTorch/torch-npu
 environment on both Frontend and Worker hosts. Configure the NPU network and
 make `/etc/hccn.conf` available. The generated Ascend Direct services use host

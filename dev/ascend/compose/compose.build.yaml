@@ -11,22 +11,19 @@ services:
         UV_IMAGE: ghcr.nju.edu.cn/astral-sh/uv:0.11.30
 
   worker-image:
-    image: ek-worker-ascend-runtime:${TAG:-dev}
+    image: ek-ascend-runtime:${TAG:-dev}
     build:
       context: ../../..
       dockerfile: container/Dockerfile.npu
-      target: ek-worker-ascend-runtime
+      target: ek-ascend-runtime
       args:
-        UV_IMAGE: ghcr.nju.edu.cn/astral-sh/uv:0.11.30
-        UV_DEFAULT_INDEX: https://mirror.nju.edu.cn/pypi/web/simple
+        VLLM_ASCEND_IMAGE: quay.io/ascend/vllm-ascend:v0.26.0rc2-a3@sha256:8cbb72814ec80978ab15c0164c43b4e60541cecd1d9f6f4b143ba6ecb4ff63f6
 
   attention-image:
-    image: ek-vllm-ascend-runtime:${TAG:-dev}
+    image: ek-ascend-runtime:${TAG:-dev}
     build:
       context: ../../..
       dockerfile: container/Dockerfile.npu
-      target: ek-vllm-ascend-runtime
+      target: ek-ascend-runtime
       args:
-        # NJU mirror of the selected nightly-main-a3 digest.
-        VLLM_ASCEND_IMAGE: quay.nju.edu.cn/ascend/vllm-ascend@sha256:a04db9765d8888bbec94d60e69924dc85aaa54e0702a4b68030d265f88f863f5
-        UV_DEFAULT_INDEX: https://mirror.nju.edu.cn/pypi/web/simple
+        VLLM_ASCEND_IMAGE: quay.io/ascend/vllm-ascend:v0.26.0rc2-a3@sha256:8cbb72814ec80978ab15c0164c43b4e60541cecd1d9f6f4b143ba6ecb4ff63f6
