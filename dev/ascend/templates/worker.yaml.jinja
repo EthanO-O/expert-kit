@@ -24,7 +24,7 @@ worker:
 {% if ascend_decode_graph %}
   ascend_decode_graph: {{ ascend_decode_graph | tojson }}
 {% endif %}
-  backend: {{ pool.backend }}
+  backend: {{ expert.backend }}
   device: {{ "npu:0" if ascend_decode_graph else worker.device_name }}
   max_batch_tokens: {{ expert.runtime.max_batch_tokens }}
   max_active_batches_per_device: {{ expert.runtime.max_active_batches_per_device }}

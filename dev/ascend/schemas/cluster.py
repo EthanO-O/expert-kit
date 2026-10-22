@@ -145,6 +145,7 @@ class FaultDetectionConfig(ConfigModel):
 class ExpertConfig(ConfigModel):
     """Expert worker runtime configuration."""
 
+    backend: BackendName = BackendName.TORCH
     runtime: ExpertRuntimeConfig
 
 
@@ -169,7 +170,6 @@ class PoolConfig(ConfigModel):
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
     )
     node: str
-    backend: BackendName = BackendName.TORCH
     devices: list[int]
     start_worker_port: int
     start_peer_port: int

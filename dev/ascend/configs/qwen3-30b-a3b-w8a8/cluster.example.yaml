@@ -30,6 +30,8 @@ control:
     node_active_threshold_secs: 60
     poller_interval_secs: 5
 expert:
+  # Shared compute backend for all Worker pools; use torch for the alternative path.
+  backend: ascend_fused
   runtime:
     max_batch_tokens: 4096
     max_active_batches_per_device: 1
@@ -42,8 +44,6 @@ expert:
 pools:
   - id: worker-pool1
     node: node-a
-    # Native eager MoE pipeline captured for Decode; use torch for its separate graph path.
-    backend: ascend_fused
     # Each Worker retains 64 experts per layer; match the experiment's fixed intervals.
     devices: [1, 2]
     start_worker_port: 53234
