@@ -1,4 +1,4 @@
-"""Coordinate native Ascend FULL Decode capture and whole-step Worker replay."""
+"""Coordinate native Ascend FULL capture and whole-step Worker replay."""
 
 from __future__ import annotations
 
@@ -193,15 +193,20 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
         or vllm_config.speculative_config is not None
         or vllm_config.lora_config is not None
         or vllm_config.scheduler_config.async_scheduling
-        or vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+        or vllm_config.compilation_config.cudagraph_mode
+        != (CUDAGraphMode.FULL if config.mode == "full" else CUDAGraphMode.FULL_DECODE_ONLY)
     ):
         raise ValueError(
-            "Ascend Decode graph requires single-rank synchronous FULL_DECODE_ONLY BF16"
+            "Ascend graph requires single-rank synchronous BF16 "
+            "and its configured native graph mode"
         )
     if set(vllm_config.compilation_config.cudagraph_capture_sizes) != set(config.capture_sizes):
         raise ValueError("vLLM and Worker graph capture sizes must match")
-    if vllm_config.scheduler_config.max_num_seqs < max(config.capture_sizes):
-        raise ValueError("vLLM max_num_seqs must cover every graph capture size")
+    if config.mode == "decode":
+        if vllm_config.scheduler_config.max_num_seqs < max(config.capture_sizes):
+            raise ValueError("vLLM max_num_seqs must cover every graph capture size")
+    elif vllm_config.scheduler_config.max_num_batched_tokens < max(config.capture_sizes):
+        raise ValueError("vLLM max_num_batched_tokens must cover every graph capture size")
     if os.environ.get("EK_INSTANCE_ID") != str(config.instance_id):
         raise ValueError("EK_INSTANCE_ID must match the fixed graph deployment")
 
@@ -446,8 +451,10 @@ def install_decode_graph_wrapper(config: AscendGraphConfig) -> None:
         qualified = (
             not is_graph_profile()
             and descriptor is not None
-            and descriptor.uniform
-            and descriptor.num_reqs == descriptor.num_tokens
+            and (
+                config.mode == "full"
+                or (descriptor.uniform and descriptor.num_reqs == descriptor.num_tokens)
+            )
             and descriptor.num_tokens in config.capture_sizes
             and not descriptor.has_lora
         )

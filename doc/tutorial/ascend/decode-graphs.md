@@ -1,7 +1,9 @@
 # Ascend Decode graphs
 
-The graph path captures the complete model forward for Decode, including routed
-experts on separate Workers. Prefill and mixed batches use ordinary EK Transport.
+By default, the graph path captures the complete model forward for Decode,
+including routed experts on separate Workers. Prefill and mixed batches use
+ordinary EK Transport. Qwen3 W8A8 with the Torch backend can also enable full
+graphs for Prefill, mixed and Decode steps.
 Sampling stays outside the captured forward. Every role uses the same Docker
 runtime; models are mounted read-only.
 
@@ -17,6 +19,8 @@ runtime; models are mounted read-only.
 On ARM64, Torch-NPU adds NPU execution to the CPU Torch wheel.
 The shared image derives from the pinned prebuilt `v0.26.0rc2-a3` runtime.
 The Docker build installs EK wheels without rebuilding or patching the engine.
+Both graph modes reuse this image; normal runtime kernel JIT and graph warmup
+still run.
 The PyPI `expertkit-vllm[engine]` extra selects a different CUDA engine; use the
 Docker build below for Ascend.
 
@@ -73,6 +77,29 @@ example `instance_id: 1` assumes a fresh deployment database; an existing
 installation must use its actual configured instance ID. All roles must agree
 on `weight_version`, model geometry and the same graph document.
 
+### Enable Qwen3 Prefill graphs
+
+In the copied Qwen3 `cluster.yaml`, change the existing `expert.backend` from
+`ascend_fused` to `torch`. In the copied `experiment.yaml`, update the existing
+graph mapping while retaining its identity, endpoints, layers and Workers:
+
+```yaml
+ascend_decode_graph:
+  mode: full
+  capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+  # Retain the other fields from the Qwen3 example.
+```
+
+Keep all 48 routed layers and the two Worker intervals `[0, 64)` and `[64, 128)`.
+The generator selects synchronous native `FULL`, a 2,048-token step budget and
+`max-num-seqs: 64`. Capture sizes count tokens, including padding; they do not
+raise the concurrent request limit to 2,048. Small Decode buckets remain present.
+Full mode also selects native FULL attention for Decode, so a comparison with
+decode-only mode includes that attention-path change.
+
+Omitting `mode` keeps `decode` and `FULL_DECODE_ONLY`. Use decode mode for V4,
+V2-Lite and the `ascend_fused` backend. The checked-in examples are unchanged.
+
 Generate and check the Compose files:
 
 ```bash
@@ -122,11 +149,13 @@ dev/ascend/run-compose.sh attention up -d attention
 dev/ascend/run-compose.sh attention logs -f attention
 ```
 
-The generator selects synchronous `FULL_DECODE_ONLY`, disables prefix caching,
-and passes the same graph configuration to all participants. The examples
-capture batch sizes 1, 2, 4, 8, 16, 32 and 64; intermediate sizes use padding.
+In default decode mode, the generator selects synchronous `FULL_DECODE_ONLY`,
+disables prefix caching and passes the same graph configuration to all
+participants. The examples capture batch sizes 1, 2, 4, 8, 16, 32 and 64;
+intermediate sizes use padding.
 Keep `serve.enforce_eager` false and tracing disabled for this graph path.
-Prefill and mixed batches still use ordinary EK execution.
+Prefill and mixed batches use ordinary EK execution in decode mode. Full mode
+captures them as well.
 ## Verify and stop
 
 Use the selected `model.name` and host address:
@@ -139,7 +168,8 @@ curl -fsS http://<HOST_IP>:18000/v1/chat/completions \
 
 Retain both input and output. Confirm every declared Worker prepared its full
 layer range and participated in Decode replay. A successful HTTP response alone
-does not establish graph execution.
+does not establish graph execution. In full mode, also verify Prefill and mixed
+replay with changing prompt lengths and subsequent Decode steps.
 
 Stop the deployment while retaining containers and caches:
 

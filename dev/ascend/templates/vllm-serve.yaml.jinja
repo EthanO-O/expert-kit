@@ -26,11 +26,11 @@ trust-remote-code: false
 trust-remote-code: true
 {% endif %}
 max-num-batched-tokens: 2048
-max-num-seqs: {{ ascend_decode_graph.capture_sizes | max }}
+max-num-seqs: {{ 64 if ascend_decode_graph.mode == "full" else ascend_decode_graph.capture_sizes | max }}
 compilation-config:
 {% if model.expert_compute == "deepseek_v4" %}
   mode: VLLM_COMPILE
 {% endif %}
-  cudagraph_mode: FULL_DECODE_ONLY
+  cudagraph_mode: {{ "FULL" if ascend_decode_graph.mode == "full" else "FULL_DECODE_ONLY" }}
   cudagraph_capture_sizes: {{ ascend_decode_graph.capture_sizes | tojson }}
 {% endif %}

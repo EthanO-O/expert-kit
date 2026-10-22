@@ -13,7 +13,7 @@ from expertkit_vllm import decode_graph as graph
 
 
 @pytest.fixture
-def graph_runtime(monkeypatch):
+def graph_runtime(monkeypatch, request):
     events = []
     context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL, batch_descriptor=None)
 
@@ -101,9 +101,13 @@ def graph_runtime(monkeypatch):
                 for layer in config.layer_ids:
                     session.exchange(
                         layer,
-                        torch.zeros(1, 2048, dtype=torch.bfloat16),
-                        torch.zeros(1, 6, dtype=torch.int32),
-                        torch.full((1, 6), 0.1234567, dtype=torch.float32),
+                        torch.zeros(descriptor.num_tokens, 2048, dtype=torch.bfloat16),
+                        torch.zeros(descriptor.num_tokens, config.model.top_k, dtype=torch.int32),
+                        torch.full(
+                            (descriptor.num_tokens, config.model.top_k),
+                            0.1234567,
+                            dtype=torch.float32,
+                        ),
                     )
                 self.concrete_aclgraph_entries[descriptor] = SimpleNamespace(aclgraph=object())
             else:
@@ -148,6 +152,8 @@ def graph_runtime(monkeypatch):
         capture_sizes=(1, 4),
         timeout_seconds=2.0,
     )
+    if getattr(request, "param", "decode") == "full":
+        config = _full_qwen_config(config)
     graph.install_decode_graph_wrapper(config)
     wrapper = Wrapper()
     try:
@@ -166,6 +172,60 @@ def descriptor(*, uniform=True, num_reqs=1, num_tokens=1, has_lora=False):
     return BatchDescriptor(
         num_tokens=num_tokens, num_reqs=num_reqs, uniform=uniform, has_lora=has_lora
     )
+
+
+def _full_qwen_config(config):
+    return AscendGraphConfig.model_validate(
+        {
+            **config.model_dump(exclude={"worker_id", "control_endpoint"}),
+            "mode": "full",
+            "model": {
+                **config.model.model_dump(),
+                "num_layers": 48,
+                "experts_per_layer": 128,
+                "expert_intermediate_dim": 768,
+                "top_k": 8,
+                "quantization": {
+                    "type": "modelslim-w8a8-dynamic",
+                    "bits": 8,
+                    "group_size": None,
+                    "symmetric": True,
+                },
+            },
+            "layer_ids": list(range(48)),
+            "workers": [
+                dict(
+                    worker_id=f"worker-{i}",
+                    control_endpoint=f"127.0.0.1:{18100 + i}",
+                    expert_start=i * 64,
+                    expert_end=(i + 1) * 64,
+                )
+                for i in range(2)
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize("graph_runtime", ["full"], indirect=True)
+def test_full_graph_accepts_generic_prefill_descriptor_and_replays_same_capacity(graph_runtime):
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    events.clear()
+    # Native FULL normalizes request count and uniformity into one generic token key.
+    context.batch_descriptor = descriptor(uniform=False, num_reqs=4, num_tokens=4)
+    assert runner._model_forward() == "result"
+    assert events.count("layer-exchange") == 48
+    assert ("begin", "capture", 4) in events
+    events.clear()
+    assert runner._model_forward() == "result"
+    assert events == [
+        ("begin", "replay", 4),
+        "native-replay",
+        "native-attention-update",
+        "synchronize",
+        "finish",
+    ]
+    assert len(wrapper.concrete_aclgraph_entries) == 1
 
 
 def test_profile_allocates_before_probe_and_capture_replay_have_step_handshakes(graph_runtime):
@@ -510,6 +570,37 @@ def test_modelslim_native_recipe_matches_complete_shared_declaration(modelslim_g
     runtime.parallel_config.tensor_parallel_size = 2
     with pytest.raises(ValueError, match="single-rank"):
         graph.validate_graph_model(runtime, config)
+
+
+def test_full_graph_token_capacity_is_independent_of_sequence_limit(modelslim_graph_deployment):
+    runtime, config = modelslim_graph_deployment
+    config = _full_qwen_config(config).model_copy(update={"capture_sizes": (1, 64, 128, 256)})
+    runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    runtime.compilation_config.cudagraph_capture_sizes = list(config.capture_sizes)
+    runtime.scheduler_config.max_num_batched_tokens = 2048
+    graph.validate_graph_model(runtime, config)
+    runtime.scheduler_config.max_num_batched_tokens = 128
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        graph.validate_graph_model(runtime, config)
+    runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    with pytest.raises(ValueError, match="configured native graph mode"):
+        graph.validate_graph_model(runtime, config)
+
+
+@pytest.mark.parametrize("change", ["bf16", "one_worker", "layers", "capacity"])
+def test_full_graph_rejects_unqualified_model_or_profile(modelslim_graph_deployment, change):
+    _, previous = modelslim_graph_deployment
+    values = _full_qwen_config(previous).model_dump()
+    if change == "bf16":
+        values["model"]["quantization"] = None
+    elif change == "one_worker":
+        values["workers"] = [{**values["workers"][0], "expert_end": 128}]
+    elif change == "layers":
+        values["layer_ids"] = [0]
+    else:
+        values["capture_sizes"] = [1, 4096]
+    with pytest.raises(ValueError, match="full graph"):
+        AscendGraphConfig.model_validate(values)
 
 
 @pytest.mark.parametrize(

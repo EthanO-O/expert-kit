@@ -100,6 +100,7 @@ class AscendGraphConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     session_id: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    mode: Literal["decode", "full"] = "decode"
     instance_id: int = Field(gt=0)
     worker_id: str | None = Field(default=None, min_length=1, max_length=128)
     weight_version: str = Field(min_length=1, max_length=256)
@@ -158,6 +159,27 @@ class AscendGraphConfig(BaseModel):
             )
         if self.layer_ids[-1] >= self.model.num_layers:
             raise ValueError("graph layer IDs exceed model.num_layers")
+        if self.mode == "full":
+            geometry = (
+                self.model.num_layers,
+                self.model.experts_per_layer,
+                self.model.hidden_dim,
+                self.model.expert_intermediate_dim,
+                self.model.top_k,
+                self.model.expert_compute,
+            )
+            if (
+                geometry != (48, 128, 2048, 768, 8, "swiglu")
+                or self.model.quantization is None
+                or self.layer_ids != tuple(range(48))
+                or tuple((worker.expert_start, worker.expert_end) for worker in participants)
+                != ((0, 64), (64, 128))
+            ):
+                raise ValueError(
+                    "full graph mode requires the complete two-Worker Qwen3 W8A8 model"
+                )
+            if max(self.capture_sizes) > 2048:
+                raise ValueError("full graph token capacity cannot exceed 2048")
         if len({worker.worker_id for worker in participants}) != len(participants):
             raise ValueError("graph Worker IDs must be distinct")
         if len({worker.control_endpoint for worker in participants}) != len(participants):

@@ -404,3 +404,53 @@ def test_graph_worker_requires_exact_v4_computation(tmp_path, field, value):
         raw["model"][field] = value
         with pytest.raises(ValidationError, match="exact V4"):
             WorkerConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
+def test_full_graph_requires_torch_resident_backend(tmp_path, backend):
+    raw = _config(tmp_path, backend=backend, device="npu:0")
+    raw["model"].update(
+        num_layers=48,
+        experts_per_layer=128,
+        hidden_dim=2048,
+        expert_intermediate_dim=768,
+        top_k=8,
+        activation_dtype="bf16",
+        weight_dtype="bf16",
+        activation="silu",
+        expert_compute="swiglu",
+        swiglu_limit=0.0,
+        quantization=dict(type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True),
+    )
+    raw["worker"].update(
+        max_active_batches_per_device=1,
+        ascend_decode_graph=dict(
+            mode="full",
+            session_id="qwen-full-worker-test",
+            instance_id=1,
+            weight_version="v1",
+            rendezvous_host="127.0.0.1",
+            rendezvous_port=18080,
+            layer_ids=list(range(48)),
+            capture_sizes=[1, 64, 128, 256],
+            model={
+                k: v
+                for k, v in raw["model"].items()
+                if k not in {"instance_id", "name", "weight_version"}
+            },
+            workers=[
+                dict(
+                    worker_id=f"worker-{i}",
+                    control_endpoint=f"127.0.0.1:{18100 + i}",
+                    expert_start=64 * i,
+                    expert_end=64 * (i + 1),
+                )
+                for i in range(2)
+            ],
+        ),
+    )
+    if backend == "torch":
+        assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph.mode == "full"
+    else:
+        with pytest.raises(ValidationError, match="Torch resident backend"):
+            WorkerConfig.model_validate(raw)

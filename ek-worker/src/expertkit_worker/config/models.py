@@ -445,6 +445,8 @@ class WorkerConfig(_StrictModel):
                 )
         graph = self.worker.ascend_decode_graph
         if graph is not None:
+            if graph.mode == "full" and self.worker.backend is not BackendName.TORCH:
+                raise ValueError("Ascend full graph mode requires the Torch resident backend")
             if (
                 self.worker.backend not in {BackendName.TORCH, BackendName.ASCEND_FUSED}
                 or not self.worker.device.startswith("npu:")

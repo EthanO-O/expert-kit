@@ -150,6 +150,33 @@ def test_checked_in_modelslim_graph_examples_generate_complete_deployments(
         assert worker.model.quantization.model_dump(mode="json") == graph["model"]["quantization"]
 
 
+@pytest.mark.parametrize("capacity", [256, 2048])
+def test_qwen_full_generation_keeps_request_limit_separate_from_token_capacity(tmp_path, capacity):
+    from expertkit_worker.config import WorkerConfig
+
+    examples = ASCEND / "configs/qwen3-30b-a3b-w8a8"
+    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
+    cluster["expert"]["backend"] = "torch"
+    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
+    experiment["ascend_decode_graph"].update(
+        mode="full", capture_sizes=[1, 2, 4, 8, 16, 32, 64, 128, capacity]
+    )
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "generated"
+    shared = json.loads((output / "ascend-decode-graph.json").read_text())
+    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
+    assert shared["mode"] == "full"
+    assert serve["compilation-config"]["cudagraph_mode"] == "FULL"
+    assert serve["compilation-config"]["cudagraph_capture_sizes"] == shared["capture_sizes"]
+    assert serve["max-num-seqs"] == 64
+    assert serve["max-num-batched-tokens"] == 2048
+    for path in (output / "worker-pool1/workers").glob("*.yaml"):
+        worker = WorkerConfig.model_validate(yaml.safe_load(path.read_text()))
+        assert worker.worker.backend.value == "torch"
+        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
+
+
 def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path):
     from expertkit_worker.config import WorkerConfig
 

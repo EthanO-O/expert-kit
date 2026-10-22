@@ -105,7 +105,7 @@ for the short run and Jaeger UI procedure. `serve.enforce_eager` independently
 keeps eager execution on when tracing is disabled, which is useful for an
 overhead comparison.
 
-## Fixed Decode graphs
+## Fixed Ascend graphs
 
 `experiment.ascend_decode_graph` optionally accepts the shared graph deployment
 fields: session/instance/Worker/weight identity, control and rendezvous endpoints,
@@ -120,8 +120,20 @@ devices, matching identity, unused graph ports and one active Worker batch.
 It accepts the fixed V2-Lite and Qwen3 profiles, and eight ordered 32-expert
 shards for the exact ModelSlim V4 profile. It emits `ascend-decode-graph.json`,
 identical Worker settings, Frontend identity/mounts and native
-`FULL_DECODE_ONLY` flags. All participants use host networking even when
-ordinary Prefill Transport is gRPC. Default deployment behavior is unchanged.
+`FULL_DECODE_ONLY` flags by default (`mode: decode`). All participants use host
+networking even when ordinary Prefill Transport is gRPC.
+
+For Qwen3-30B-A3B W8A8, `mode: full` also captures Prefill and mixed steps.
+In a local copy of the Qwen3 example, set `cluster.expert.backend: torch` and
+`experiment.ascend_decode_graph.mode: full`, retaining all 48 layers and the two
+64-expert Worker intervals. Use capture sizes
+`[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]`. The generator selects native
+`FULL`, a 2,048-token step budget and `max-num-seqs: 64`; token capacity and request
+count are separate limits. Both modes reuse the shared prebuilt 0.26 runtime;
+enabling full mode requires no additional native build. V2-Lite, V4 and
+`ascend_fused` continue to use `mode: decode`. The checked-in examples keep their
+existing defaults.
+
 For V2-Lite, two Workers require explicit, disjoint desired placement of experts
 0..31 and 32..63 on every routed layer; the generator does
 not create these Controller assignments. Start the Frontend only after actual
