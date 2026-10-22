@@ -62,9 +62,9 @@ and token restoration with `torch_npu` fused operators on the configured
 unquantized expert weights plus ModelSlim dynamic W8A8 weights. GPTQ, static
 W8A8, FP4, CPU, and CUDA configurations must use another backend.
 
-Each cluster example also pins `images.cann`, which is the Worker image base.
-Keep that CANN image compatible with the locked PyTorch and `torch-npu`
-versions. `worker.backend.submit` ends after Host-side enqueue; use the Worker
+Frontend and Worker share the prebuilt 0.26 runtime selected by
+`images.vllm_ascend`. Keep both roles on the same image and rebuild the EK
+wheels before rebuilding that image. `worker.backend.submit` ends after Host-side enqueue; use the Worker
 device-stage metrics or an NPU profiler when measuring fused execution rather
 than treating that span as device latency.
 
@@ -313,6 +313,12 @@ uv run --no-sync python ek-worker/benchmarks/bench_backend.py \
 Replay preserves routing IDs and lease order. Hidden states and routing weights
 remain deterministic synthetic inputs, so this isolates backend routing and
 expert execution rather than reproducing the complete vLLM request.
+
+This command uses the default eager benchmark mode. For graph replay, use the
+[resident graph benchmark](../../../ek-worker/README.md#compare-resident-graph-computation)
+with valid global expert IDs (no `-1` entries), BF16, concurrency one and an
+explicit resident expert interval. Use the same mode, geometry, quantization,
+shard and routing cases when comparing `torch` with `ascend_fused`.
 
 ### 7. Stop the deployment
 

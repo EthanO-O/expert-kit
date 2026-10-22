@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from expertkit_worker.backends.base import ComputeBackend
+from expertkit_worker.backends.base import ComputeBackend, ResidentGraphWeights
 from expertkit_worker.config import ActivationDType, BackendName, QuantizationType, WorkerConfig
 from expertkit_worker.device import WorkerDeviceRuntime
 from expertkit_worker.weights.adapter import WeightAdapter
@@ -237,3 +237,23 @@ def create_compute_backend(
             compute_type=compute_type,
             swiglu_limit=config.model.swiglu_limit,
         )
+
+
+def graph_resident_type(config: WorkerConfig) -> Callable[..., ResidentGraphWeights]:
+    """Select resident computation for the validated backend and checkpoint recipe."""
+    quantized = config.model.quantization is not None
+    if config.worker.backend is BackendName.ASCEND_FUSED:
+        from expertkit_worker.backends.ascend_fused.decode_graph import (
+            ResidentAscendFusedGraphWeights,
+            create_modelslim_graph_weights,
+        )
+
+        return create_modelslim_graph_weights if quantized else ResidentAscendFusedGraphWeights
+    if config.worker.backend is BackendName.TORCH:
+        from expertkit_worker.backends.torch.decode_graph import ResidentExpertGraphWeights
+        from expertkit_worker.backends.torch.modelslim_decode_graph import (
+            ResidentModelSlimExpertGraphWeights,
+        )
+
+        return ResidentModelSlimExpertGraphWeights if quantized else ResidentExpertGraphWeights
+    raise ValueError("the selected backend does not support Ascend Decode graphs")

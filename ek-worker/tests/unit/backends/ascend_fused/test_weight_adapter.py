@@ -1,13 +1,8 @@
-# ruff: noqa: E402
-
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save
-
-sys.modules.setdefault("torch_npu", ModuleType("torch_npu"))
 
 from expertkit_worker.backends.ascend_fused.weights import (
     AscendFusedCpuWeights,
@@ -88,15 +83,15 @@ def test_modelslim_adapter_packs_gmm_weights_and_scales() -> None:
                 values["layers.0.ffn.experts.0.w1.weight_scale"].flatten(),
                 values["layers.0.ffn.experts.0.w3.weight_scale"].flatten(),
             )
-        ).to(torch.bfloat16),
+        ).to(torch.float32),
     )
     torch.testing.assert_close(
         ready.w2_scale,
-        values["layers.0.ffn.experts.0.w2.weight_scale"].flatten().to(torch.bfloat16),
+        values["layers.0.ffn.experts.0.w2.weight_scale"].flatten().to(torch.float32),
     )
     assert ready.dtype is torch.bfloat16
-    assert ready.w13_scale.dtype is torch.bfloat16
-    assert ready.w2_scale.dtype is torch.bfloat16
+    assert ready.w13_scale.dtype is torch.float32
+    assert ready.w2_scale.dtype is torch.float32
     assert ready.hidden_dim == 4
     assert ready.intermediate_dim == 8
     assert ready.storage_bytes == _adapter().ready_weight_bytes()
@@ -122,15 +117,13 @@ def test_modelslim_adapter_accounts_for_source_and_ready_bytes() -> None:
     assert bf16_adapter.cpu_extra_bytes() == 0
     assert bf16_adapter.conversion_temporary_bytes() == 0
     assert bf16_adapter.source_tensor_bytes() == 3 * 4 * 8 + 2 * (2 * 8 + 4) * 4
-    assert bf16_adapter.ready_weight_bytes() == 3 * 4 * 8 + (2 * 8 + 4) * 2
+    assert bf16_adapter.ready_weight_bytes() == 3 * 4 * 8 + (2 * 8 + 4) * 4
     assert fp16_adapter.ready_weight_bytes() == 3 * 4 * 8 + (2 * 8 + 4) * 4
 
 
 def test_modelslim_adapter_uses_fp32_scales_for_fp16_output() -> None:
     values = _values()
-    cpu = _adapter(torch.float16).make_cpu_weight(
-        parse_safetensors(bytearray(save(values)))
-    )
+    cpu = _adapter(torch.float16).make_cpu_weight(parse_safetensors(bytearray(save(values))))
 
     ready = cpu.copy(torch.device("cpu"), torch.float16)
 
@@ -212,8 +205,8 @@ def test_modelslim_ready_weight_rejects_scale_dtype_incompatible_with_output() -
         AscendFusedModelSlimW8A8ExpertWeights(
             w13=torch.ones((4, 16), dtype=torch.int8),
             w2=torch.ones((8, 4), dtype=torch.int8),
-            w13_scale=torch.ones(16),
-            w2_scale=torch.ones(4),
+            w13_scale=torch.ones(16, dtype=torch.bfloat16),
+            w2_scale=torch.ones(4, dtype=torch.bfloat16),
             dtype=torch.bfloat16,
         )
 
@@ -228,6 +221,7 @@ def test_factory_selects_modelslim_adapter_and_dynamic_compute() -> None:
             expert_intermediate_dim=8,
             top_k=2,
             swiglu_limit=5.0,
+            expert_compute="deepseek_v4",
             quantization=SimpleNamespace(type=QuantizationType.MODELSLIM_W8A8_DYNAMIC),
         ),
     )
@@ -250,3 +244,16 @@ def test_factory_selects_modelslim_adapter_and_dynamic_compute() -> None:
     assert backend.capabilities.supports_concurrent_batches is True
     assert backend._compute_type.value == "dynamic_w8a8"  # type: ignore[attr-defined]
     assert backend._swiglu_limit == 5.0  # type: ignore[attr-defined]
+
+
+def test_bf16_output_keeps_original_fp32_scales_losslessly():
+    values = _values()
+    for name in values:
+        if name.endswith("weight_scale"):
+            values[name] = torch.full_like(values[name], 0.1, dtype=torch.float32)
+        elif name.endswith("weight_offset"):
+            values[name] = torch.zeros_like(values[name], dtype=torch.float32)
+    cpu = _adapter().make_cpu_weight(parse_safetensors(bytearray(save(values))))
+    ready = cpu.copy(torch.device("cpu"), torch.bfloat16)
+    assert torch.equal(ready.w13_scale, torch.full_like(ready.w13_scale, 0.1))
+    assert not torch.equal(ready.w13_scale, ready.w13_scale.bfloat16().float())

@@ -26,11 +26,11 @@ from expertkit_worker.app import WorkerApplication
 from expertkit_worker.backends.factory import (
     create_compute_backend,
     create_weight_adapter,
+    graph_resident_type,
     torch_dtype,
 )
 from expertkit_worker.config import (
     GrpcTransportConfig,
-    QuantizationType,
     ShmTransportConfig,
     TransferEngineTransportConfig,
     WorkerConfig,
@@ -338,22 +338,12 @@ async def build_worker_application(
         if graph_config is not None:
             from expertkit_transport.transports.ascend_graph.control import GraphControlServer
 
-            from expertkit_worker.backends.torch.decode_graph import ResidentExpertGraphWeights
             from expertkit_worker.execution.decode_graph import (
                 AscendDecodeGraphExecution,
                 GraphWorkerExecution,
             )
 
-            resident_weights = ResidentExpertGraphWeights
-            if (
-                config.model.quantization is not None
-                and config.model.quantization.type is QuantizationType.MODELSLIM_W8A8_DYNAMIC
-            ):
-                from expertkit_worker.backends.torch.modelslim_decode_graph import (
-                    ResidentModelSlimExpertGraphWeights,
-                )
-
-                resident_weights = ResidentModelSlimExpertGraphWeights
+            resident_weights = graph_resident_type(config)
 
             if graph_config.instance_id != instance_id:
                 raise ValueError(

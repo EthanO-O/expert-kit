@@ -446,7 +446,7 @@ class WorkerConfig(_StrictModel):
         graph = self.worker.ascend_decode_graph
         if graph is not None:
             if (
-                self.worker.backend is not BackendName.TORCH
+                self.worker.backend not in {BackendName.TORCH, BackendName.ASCEND_FUSED}
                 or not self.worker.device.startswith("npu:")
                 or self.worker.max_active_batches_per_device != 1
                 or self.model.activation_dtype is not ActivationDType.BF16
@@ -456,7 +456,9 @@ class WorkerConfig(_StrictModel):
                     and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
                 )
             ):
-                raise ValueError("Ascend Decode graphs require one active NPU Torch BF16 slot")
+                raise ValueError(
+                    "Ascend Decode graphs require one active NPU Torch or Ascend fused BF16 slot"
+                )
             rank = graph.worker_rank(self.worker.id)
             if self.model.expert_compute == "deepseek_v4":
                 participant = graph.participants[rank - 1]

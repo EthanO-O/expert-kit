@@ -22,16 +22,6 @@ _SCALE_DTYPES = {
 _ROLES = (("gate_proj", "w1"), ("up_proj", "w3"), ("down_proj", "w2"))
 
 
-def _dynamic_gmm_scale_dtype(output_dtype: torch.dtype) -> torch.dtype:
-    """Return the weight-scale dtype required by per-token quantized GMM."""
-
-    if output_dtype is torch.bfloat16:
-        return torch.bfloat16
-    if output_dtype is torch.float16:
-        return torch.float32
-    raise ValueError("dynamic quantized GMM output must be FP16 or BF16")
-
-
 @dataclass(frozen=True, slots=True)
 class AscendFusedCpuWeights:
     gate_proj: torch.Tensor
@@ -156,7 +146,8 @@ class AscendFusedModelSlimW8A8CpuWeights:
         intermediate_dim, hidden_dim = self.matrices[0].shape
         gate, up, down = self.matrices
         gate_scale, up_scale, down_scale = self.scales
-        scale_dtype = _dynamic_gmm_scale_dtype(dtype)
+        # Keep checkpoint scales lossless for graph preparation and INT32 projections.
+        scale_dtype = torch.float32
 
         w13 = torch.empty((hidden_dim, 2 * intermediate_dim), device=device, dtype=torch.int8)
         w2 = torch.empty((intermediate_dim, hidden_dim), device=device, dtype=torch.int8)
@@ -207,9 +198,9 @@ class AscendFusedModelSlimW8A8ExpertWeights:
         tensors = (self.w13, self.w2, self.w13_scale, self.w2_scale)
         if self.w13.dtype != torch.int8 or self.w2.dtype != torch.int8:
             raise ValueError("ModelSlim Ascend fused matrices must use I8")
-        scale_dtype = _dynamic_gmm_scale_dtype(self.dtype)
+        scale_dtype = torch.float32
         if self.w13_scale.dtype != scale_dtype or self.w2_scale.dtype != scale_dtype:
-            raise ValueError("ModelSlim Ascend fused scale dtype must match GMM output policy")
+            raise ValueError("ModelSlim Ascend fused scale dtype must be FP32")
         if any(tensor.device != self.w13.device for tensor in tensors):
             raise ValueError("ModelSlim Ascend fused tensors must share a device")
         if any(not tensor.is_contiguous() for tensor in tensors):
@@ -448,7 +439,7 @@ class AscendFusedModelSlimW8A8WeightAdapter(
     def ready_weight_bytes(self) -> int:
         matrix_items = 3 * self._hidden_dim * self._intermediate_dim
         scale_items = 2 * self._intermediate_dim + self._hidden_dim
-        scale_dtype = _dynamic_gmm_scale_dtype(self._compute_dtype)
+        scale_dtype = torch.float32
         return matrix_items + scale_items * scale_dtype.itemsize
 
     def conversion_temporary_bytes(self) -> int:

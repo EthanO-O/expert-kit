@@ -212,7 +212,32 @@ filesystem and are marked separately.
 
 ### Ascend ModelSlim resident Decode graphs
 
-The ModelSlim Qwen resident path is enabled explicitly through
+Both `worker.backend: torch` and `worker.backend: ascend_fused` implement the
+same resident graph interface. Their computation implementations are independent.
+The Ascend fused provider retains packed W13/W2 weights, maps contiguous global
+expert intervals by subtraction and masking, and captures the same
+`run_ascend_fused_moe()` pipeline as eager execution. Nonlocal routes use the
+inactive expert sentinel and zero routing weight. ModelSlim scales are converted
+to the native scaled-GMM dtype once before capture; they need not round-trip
+losslessly through BF16. FP32 transport carries the BF16 native partial result.
+The fused provider does not use the Torch graph's INT32 rescaling or optional
+Triton reduction. Both providers share profile validation and safe lease ownership.
+Torch's original V4 computation is retained: it applies routing to the FP32
+activation before down projection. Ascend fused instead applies routing during
+native output combination. Compare numerical accuracy against the reference,
+not bitwise equality between the two pipelines.
+Graph execution requires one active BF16 NPU slot and fixed placement.
+CPU operator tests compare resident fused output with the eager fused pipeline.
+Native capture/replay and checkpoint output accuracy still require qualification
+on the target NPU runtime. To check one capture against eager execution with
+changing routes, duplicates and zero local assignments, run on an NPU host:
+
+```bash
+uv run --no-sync pytest -q ek-worker/tests/unit/backends/ascend_fused/test_decode_graph.py \
+  -k native_capture
+```
+
+The Torch ModelSlim Qwen resident path is enabled explicitly through
 `worker.ascend_decode_graph` with the `modelslim-w8a8-dynamic` recipe. Its fused
 ordered reduction requires the optional Triton-Ascend package with an Ascend
 backend. Install a build compatible with the existing torch-npu and CANN stack
@@ -225,7 +250,7 @@ path. Kernel compilation and warmup happen before graph capture; failures retain
 the resident weights in quarantine until process exit. Ordinary ModelSlim
 execution, BF16 resident graphs, and CPU/CUDA imports do not load these kernels.
 
-The fused Qwen NPU computation supports 128 experts, hidden size 2048, expert
+The Torch Qwen graph computation supports 128 experts, hidden size 2048, expert
 intermediate size 768, top-8 routing, SwiGLU, and BF16 activations. Each
 Worker owns one contiguous 64-expert shard, either `[0, 64)` or `[64, 128)`. Each gate, up, and
 down projection produces BF16 values. Routing weights multiply the
@@ -239,7 +264,7 @@ Transport graph-session integration. Enable the same session and capture
 capacities across the Frontend and both Workers; enabling the Worker option
 alone does not establish a full-model graph session.
 
-Resident ModelSlim weight scales must be finite and positive, and an FP32 to
+Torch resident ModelSlim weight scales must be finite and positive, and an FP32 to
 BF16 to FP32 round trip must preserve each scale exactly. Construction rejects
 scales that fail this requirement.
 
@@ -299,3 +324,71 @@ CUDA qualification must report two passed tests, not skips. The metadata and
 layout fixtures were taken from the [original V4 configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json)
 and [the selected W8A8 export](https://modelscope.cn/models/sgl-npu/DeepSeek-V4-Flash-W8A8).
 Expert arithmetic follows the [official inference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py).
+
+
+### Compare resident graph computation
+
+`benchmarks/bench_backend.py --execution-mode graph` compares `torch` and
+`ascend_fused` through their actual resident providers. It captures one graph
+for the selected token capacity and copies each routing case into fixed buffers
+before replay. `execution.operator_path` records the pipeline used by each backend.
+It measures one layer's local contribution, without HCCL, RPC or
+vLLM. Use the same seed, geometry and expert interval for both backends, in
+separate processes. All local experts are loaded and leased before capture.
+
+For the Qwen3 ModelSlim 64-expert shard, run from the repository root on the NPU:
+
+```bash
+for backend in torch ascend_fused; do
+  uv run --no-sync python ek-worker/benchmarks/bench_backend.py \
+    --backend "$backend" --execution-mode graph --device npu:0 --dtype bf16 \
+    --quantization modelslim-w8a8-dynamic \
+    --tokens 1 --hidden-dim 2048 --intermediate-dim 768 --top-k 8 --experts 128 \
+    --expert-start 0 --expert-end 64 --distribution uniform --routing-cases 8 \
+    --warmup 20 --repeats 200 --output "results/${backend}-graph.json"
+done
+```
+
+Repeat with token capacities 1/4/16/64. `device_replay_latency_ms` uses NPU
+stream events around graph replay and excludes input staging. `latency_ms`
+measures Host elapsed time including input copies, replay dispatch, events and
+completion wait; throughput uses that Host interval. Capture and compilation
+are outside both intervals. Every routing case is checked before timing unless
+`--skip-correctness` is explicit. Graph input IDs must be valid global expert
+IDs; eager replay files containing `-1` cannot be used in graph mode.
+
+`--expert-start` and `--expert-end` are graph-only benchmark options. They select
+a resident shard while routing still ranges over `--experts` global experts.
+The eager backend supports sharded deployment, but this microbenchmark does not
+currently expose eager shard filtering. Removing these flags measures all selected
+experts; changing `--experts` to 32 changes the routing workload and cannot be
+compared directly with a 32-expert shard of a 256-expert model.
+
+For the V4 ModelSlim profile, compare both backends at capacities 1/4/16/64 with
+the same global expert count, shard and synthetic routing cases:
+
+```bash
+mkdir -p results
+for backend in torch ascend_fused; do
+  for tokens in 1 4 16 64; do
+    uv run --no-sync python ek-worker/benchmarks/bench_backend.py \
+      --backend "$backend" --execution-mode graph --device npu:0 --dtype bf16 \
+      --quantization modelslim-w8a8-dynamic \
+      --expert-compute deepseek_v4 --swiglu-limit 10 \
+      --tokens "$tokens" --hidden-dim 4096 --intermediate-dim 2048 \
+      --top-k 6 --experts 256 --expert-start 0 --expert-end 32 \
+      --concurrency 1 --distribution uniform --routing-cases 35 --seed 1234 \
+      --warmup 35 --repeats 35 \
+      --output "results/random-graph-${backend}-v4-t${tokens}.json" || exit 1
+  done
+done
+```
+
+Synthetic ModelSlim sources use positive FP32 scales exactly representable in
+BF16 in both modes, recorded as `synthetic_scale_policy: bf16_exact_fp32`.
+This satisfies the Torch resident provider's scale guard and keeps seeded inputs
+identical across backends and modes; it is not checkpoint accuracy validation.
+Graph runs require BF16, an indexed NPU and concurrency one. Graph temporary
+estimates are reported as null rather than reusing eager estimates; peak device
+allocation is still reported. Add `--profile` for NPU kernel traces. Full vLLM
+benchmarks remain necessary to establish an end-to-end serving improvement.

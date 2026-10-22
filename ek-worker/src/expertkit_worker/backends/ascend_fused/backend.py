@@ -3,6 +3,7 @@ import threading
 from collections.abc import Callable
 
 import torch
+from expertkit_transport.quarantine import retain_until_process_exit
 
 from expertkit_worker.backends.base import (
     BackendBatch,
@@ -20,9 +21,7 @@ from expertkit_worker.weights import ReadyWeightLease, WeightsNotReady
 from .op import AscendFusedComputeType, run_ascend_fused_moe
 from .weights import AscendFusedExpertWeights, AscendFusedModelSlimW8A8ExpertWeights
 
-type AscendFusedReadyWeights = (
-    AscendFusedExpertWeights | AscendFusedModelSlimW8A8ExpertWeights
-)
+type AscendFusedReadyWeights = AscendFusedExpertWeights | AscendFusedModelSlimW8A8ExpertWeights
 
 type AcquireAscendFusedWeights = Callable[
     [int, tuple[int, ...]],
@@ -67,24 +66,28 @@ class _AscendFusedCompletion(BackendCompletion):
             if self._closed:
                 return
             self._closed = True
+            if self._failed:
+                self._lease.quarantine()
+                retain_until_process_exit(self)
+                return
             waited = self._waited
-            failed = self._failed
 
         close_error: BaseException | None = None
-        if not waited and not failed:
+        if not waited:
             try:
                 self._work.wait_host()
             except BaseException as error:
                 close_error = error
 
-        self._retained_tensors.clear()
-        self._lease.close()
-
         if close_error is not None:
+            self._lease.quarantine()
+            retain_until_process_exit(self)
             raise BackendFatalError(
                 BackendFatalReason.ASYNC_EXECUTION,
                 str(close_error),
             ) from close_error
+        self._retained_tensors.clear()
+        self._lease.close()
 
 
 class AscendFusedBackend(ComputeBackend):
@@ -185,6 +188,16 @@ class AscendFusedBackend(ComputeBackend):
         # restored output       T x H x B
         combined_output_bytes = max_batch_tokens * self._hidden_dim * self._dtype.itemsize
 
+        scale_conversion_bytes = 0
+        if (
+            self._compute_type is AscendFusedComputeType.DYNAMIC_W8A8
+            and self._dtype is torch.bfloat16
+        ):
+            scale_conversion_bytes = (
+                topk_items
+                * (2 * self._intermediate_dim + self._hidden_dim)
+                * torch.bfloat16.itemsize
+            )
         return BackendResourceEstimate(
             temporary_bytes_per_active_batch=(
                 expert_id_bytes
@@ -200,6 +213,7 @@ class AscendFusedBackend(ComputeBackend):
                 + activated_scale_bytes
                 + gmm2_output_bytes
                 + combined_output_bytes
+                + scale_conversion_bytes
             )
         )
 
@@ -291,7 +305,7 @@ class AscendFusedBackend(ComputeBackend):
             lease.expert_ids,
             inactive_mask=inactive_mask,
         )
-        routing_weights = batch.routing_weights.to(dtype=self._dtype)
+        routing_weights = batch.routing_weights.to(dtype=self._dtype, copy=True)
         routing_weights.masked_fill_(inactive_mask, 0.0)
 
         output = run_ascend_fused_moe(
@@ -318,12 +332,14 @@ class AscendFusedBackend(ComputeBackend):
             self._runtime.capture_current_work().wait_host()
         except BaseException as error:
             synchronization_error = error
-        lease.close()
         if synchronization_error is not None:
+            lease.quarantine()
+            retain_until_process_exit(lease)
             raise BackendFatalError(
                 BackendFatalReason.ASYNC_EXECUTION,
                 str(synchronization_error),
             ) from synchronization_error
+        lease.close()
 
 
 def _global_to_local(

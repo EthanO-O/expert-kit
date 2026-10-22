@@ -18,12 +18,14 @@ from typing import Annotated, Any
 import torch
 import torch.nn.functional as functional
 import typer
+from expertkit_transport.quarantine import retain_until_process_exit
 from safetensors.torch import save
 
 from expertkit_worker.backends import BackendBatch, ComputeBackend
 from expertkit_worker.backends.factory import (
     create_compute_backend,
     create_weight_adapter,
+    graph_resident_type,
     torch_dtype,
 )
 from expertkit_worker.config import ActivationDType, BackendName, WorkerConfig
@@ -42,6 +44,11 @@ class BenchmarkQuantization(StrEnum):
     MODELSLIM_W8A8_DYNAMIC = "modelslim-w8a8-dynamic"
 
 
+class ExecutionMode(StrEnum):
+    EAGER = "eager"
+    GRAPH = "graph"
+
+
 class ExpertCompute(StrEnum):
     SWIGLU = "swiglu"
     DEEPSEEK_V4 = "deepseek_v4"
@@ -51,6 +58,9 @@ class ExpertCompute(StrEnum):
 class BenchmarkOptions:
     backend: BackendName = BackendName.ASCEND_FUSED
     device: str = "npu:0"
+    execution_mode: ExecutionMode = ExecutionMode.EAGER
+    expert_start: int = 0
+    expert_end: int | None = None
     dtype: ActivationDType = ActivationDType.BF16
     quantization: BenchmarkQuantization = BenchmarkQuantization.NONE
     expert_compute: ExpertCompute = ExpertCompute.SWIGLU
@@ -112,6 +122,34 @@ class BenchmarkOptions:
             raise ValueError("--min-cosine must be in [-1, 1]")
         if self.expert_compute == ExpertCompute.SWIGLU and self.swiglu_limit != 0:
             raise ValueError("--swiglu-limit requires --expert-compute deepseek_v4")
+        end = self.experts if self.expert_end is None else self.expert_end
+        if not 0 <= self.expert_start < end <= self.experts:
+            raise ValueError("resident expert interval must be within [0, --experts)")
+        if self.execution_mode == ExecutionMode.EAGER:
+            if self.expert_start != 0 or end != self.experts:
+                raise ValueError("--expert-start/--expert-end require --execution-mode graph")
+        else:
+            if self.backend not in {BackendName.TORCH, BackendName.ASCEND_FUSED}:
+                raise ValueError("graph replay supports only torch and ascend_fused")
+            if not self.device.startswith("npu:") or self.dtype != ActivationDType.BF16:
+                raise ValueError("graph replay requires an indexed NPU and BF16")
+            if self.concurrency != 1:
+                raise ValueError("graph replay requires --concurrency 1")
+            if self.inactive_rate:
+                raise ValueError(
+                    "graph replay requires valid global IDs; use zero routing weights for padding"
+                )
+            maximum = 256 if self.expert_compute == ExpertCompute.DEEPSEEK_V4 else 128
+            if self.experts > maximum or end - self.expert_start > 128:
+                raise ValueError("graph expert counts exceed the resident GMM limits")
+            if self.expert_compute == ExpertCompute.DEEPSEEK_V4 and (
+                self.quantization != BenchmarkQuantization.MODELSLIM_W8A8_DYNAMIC
+                or self.swiglu_limit != 10
+                or end - self.expert_start < 2
+            ):
+                raise ValueError(
+                    "V4 graphs require ModelSlim, --swiglu-limit 10 and at least two local experts"
+                )
 
 
 @dataclass(slots=True)
@@ -123,7 +161,7 @@ class _Setup:
     backend: ComputeBackend
     batches: list[BackendBatch]
     outputs: list[torch.Tensor]
-    source_values: list[dict[str, torch.Tensor]]
+    source_values: dict[int, dict[str, torch.Tensor]]
     source_buffers: list[bytearray]
     cpu_weights: list[Any]
     concurrency: int
@@ -131,7 +169,10 @@ class _Setup:
     routing_source: str
 
     def close(self) -> None:
-        for expert_id in range(self.config.model.experts_per_layer):
+        if self.table.quarantined:
+            retain_until_process_exit(self)
+            return
+        for expert_id in self.source_values:
             self.table.begin_withdrawal(0, expert_id)
             ready = self.table.finish_withdrawal(0, expert_id)
             self.adapter.release_ready_weight(ready)
@@ -142,6 +183,8 @@ class _SubmissionGroup:
         self._setup = setup
         concurrency = setup.concurrency
         self._case_index = 0
+        self.last_batches = []
+        self.last_outputs = []
         self._pool = (
             ThreadPoolExecutor(max_workers=concurrency)
             if concurrency > 1 and setup.runtime.device.type == "cpu"
@@ -165,6 +208,7 @@ class _SubmissionGroup:
         stop = start + self._setup.concurrency
         batches = self._setup.batches[start:stop]
         outputs = self._setup.outputs[start:stop]
+        self.last_batches, self.last_outputs = batches, outputs
         self._case_index = (self._case_index + 1) % self._setup.routing_cases
 
         if self._pool is not None:
@@ -211,6 +255,111 @@ class _SubmissionGroup:
             completion.wait_host()
         finally:
             completion.close()
+
+
+class _GraphReplayGroup:
+    """Capture resident computation once; stage changing cases into fixed buffers.
+
+    Device events surround replay only. Host latency includes input copies, event
+    recording, replay dispatch and completion wait. No transport is involved.
+    """
+
+    def __init__(self, setup: _Setup, args: BenchmarkOptions, *, npu=None) -> None:
+        self._setup = setup
+        self._runtime = setup.runtime
+        # Input generation may still be queued on the caller's stream.
+        try:
+            self._runtime.capture_current_work().wait_host()
+        except BaseException:
+            setup.table.quarantine()
+            retain_until_process_exit(setup)
+            raise
+        self._stream = self._runtime.create_stream()
+        self._resident = None
+        self._graph = None
+        self._case_index = 0
+        self.last_batches = []
+        self.last_outputs = []
+        self.device_samples_ms = []
+        npu = torch.npu if npu is None else npu
+        try:
+            with (
+                self._runtime.device_context(),
+                self._runtime.stream_context(self._stream),
+                torch.inference_mode(),
+            ):
+                self._resident = graph_resident_type(setup.config)(
+                    layer_ids=(0,),
+                    experts_per_layer=args.experts,
+                    hidden_dim=args.hidden_dim,
+                    intermediate_dim=args.intermediate_dim,
+                    top_k=args.top_k,
+                    acquire_many=setup.table.acquire_many,
+                    ready_revision=lambda: setup.table.revision,
+                    expert_range=(
+                        args.expert_start,
+                        args.experts if args.expert_end is None else args.expert_end,
+                    ),
+                    expert_compute=args.expert_compute,
+                    swiglu_limit=args.swiglu_limit,
+                )
+                first = setup.batches[0]
+                self._hidden = first.hidden_states.clone()
+                self._ids = first.expert_ids.clone()
+                self._routing = first.routing_weights.clone()
+                self._output = setup.outputs[0]
+                # Compile and warm device kernels before capture, independently
+                # of the user's post-capture replay warmup count.
+                for _ in range(3):
+                    self._body()
+                self._runtime.synchronize_stream(self._stream)
+                self._graph = npu.NPUGraph()
+                with npu.graph(self._graph, stream=self._stream):
+                    self._body()
+                self._runtime.synchronize_stream(self._stream)
+                self._start = self._runtime.create_event(enable_timing=True)
+                self._end = self._runtime.create_event(enable_timing=True)
+        except BaseException:
+            self.close()
+            raise
+
+    def _body(self) -> None:
+        self._resident.compute(0, self._hidden, self._ids, self._routing, self._output)
+
+    @torch.inference_mode()
+    def run(self) -> None:
+        self._resident.require_current()
+        batch = self._setup.batches[self._case_index]
+        self._case_index = (self._case_index + 1) % self._setup.routing_cases
+        self.last_batches = [batch]
+        self.last_outputs = [self._output]
+        with self._runtime.device_context(), self._runtime.stream_context(self._stream):
+            self._hidden.copy_(batch.hidden_states)
+            self._ids.copy_(batch.expert_ids)
+            self._routing.copy_(batch.routing_weights)
+            self._runtime.record_event(self._start, self._stream)
+            self._graph.replay()
+            self._runtime.record_event(self._end, self._stream)
+            self._runtime.synchronize_stream(self._stream)
+            self.device_samples_ms.append(self._runtime.elapsed_time_ms(self._start, self._end))
+
+    def reset_routing_case(self) -> None:
+        self._case_index = 0
+
+    def close(self) -> None:
+        def completed():
+            self._runtime.synchronize_stream(self._stream)
+            self._graph = None
+
+        try:
+            if self._resident is not None:
+                self._resident.close(wait_for_completion=completed)
+            else:
+                completed()
+        except BaseException:
+            self._setup.table.quarantine()
+            retain_until_process_exit(self)
+            raise
 
 
 def _make_config(args: BenchmarkOptions) -> WorkerConfig:
@@ -311,7 +460,11 @@ def _make_source_values(
                 dtype=torch.int8,
             )
             scale = torch.rand((shape[0], 1), generator=generator, dtype=torch.float32)
-            values[f"{prefix}.{name}.weight_scale"] = scale.mul_(0.015).add_(0.005)
+            # The graph provider requires lossless BF16 scales. Use the same
+            # synthetic source recipe in eager and graph modes for matched runs.
+            values[f"{prefix}.{name}.weight_scale"] = (
+                scale.mul_(0.015).add_(0.005).bfloat16().float()
+            )
             values[f"{prefix}.{name}.weight_offset"] = torch.zeros(
                 (shape[0], 1),
                 dtype=torch.float32,
@@ -412,6 +565,10 @@ def _load_routing_replay(args: BenchmarkOptions) -> list[_RoutingReplayCase] | N
                 _require_int(value, field=f"routing replay case {case_index} expert_ids")
                 for value in row
             ]
+            if args.execution_mode == ExecutionMode.GRAPH and any(value < 0 for value in values):
+                raise ValueError(
+                    "graph routing replay requires valid global IDs; -1 is unsupported"
+                )
             if any(value < -1 or value >= args.experts for value in values):
                 raise ValueError(
                     f"routing replay case {case_index} expert IDs must be -1 or in [0, experts)"
@@ -504,12 +661,17 @@ def _build_setup(args: BenchmarkOptions) -> _Setup:
     )
     adapter.initialize_ready_storage(args.experts)
     table: ReadyWeightTable[Any] = ReadyWeightTable(1, args.experts)
-    source_values: list[dict[str, torch.Tensor]] = []
+    source_values: dict[int, dict[str, torch.Tensor]] = {}
     source_buffers: list[bytearray] = []
     cpu_weights: list[Any] = []
     quantized = args.quantization != "none"
     with runtime.device_context():
-        for expert_id in range(args.experts):
+        resident_ids = range(args.experts)
+        if args.execution_mode == ExecutionMode.GRAPH:
+            resident_ids = range(
+                args.expert_start, args.experts if args.expert_end is None else args.expert_end
+            )
+        for expert_id in resident_ids:
             values = _make_source_values(
                 expert_id=expert_id,
                 hidden_dim=args.hidden_dim,
@@ -522,7 +684,7 @@ def _build_setup(args: BenchmarkOptions) -> _Setup:
             cpu_weight = adapter.make_cpu_weight(parse_safetensors(buffer))
             ready = adapter.make_ready_weight(cpu_weight, layer_id=0, expert_id=expert_id)
             table.publish(0, expert_id, ready)
-            source_values.append(values)
+            source_values[expert_id] = values
             source_buffers.append(buffer)
             cpu_weights.append(cpu_weight)
         backend = create_compute_backend(
@@ -598,6 +760,8 @@ def _reference_output(setup: _Setup, batch: BackendBatch) -> torch.Tensor:
     output = torch.zeros_like(hidden)
     quantized = setup.config.model.quantization is not None
     for expert_id in batch.distinct_expert_ids:
+        if expert_id not in setup.source_values:
+            continue  # The graph benchmark measures this resident shard's contribution.
         coordinates = torch.nonzero(expert_ids == expert_id, as_tuple=False)
         token_indices = coordinates[:, 0]
         route_indices = coordinates[:, 1]
@@ -617,11 +781,12 @@ def _reference_output(setup: _Setup, batch: BackendBatch) -> torch.Tensor:
                 gate.clamp_(max=limit)
                 up.clamp_(min=-limit, max=limit)
         activated = functional.silu(gate) * up
+        route = routing[token_indices, route_indices].unsqueeze(1)
         expert_output = functional.linear(
             activated,
             _projection(source, expert_id, "w2", quantized=quantized),
         )
-        expert_output.mul_(routing[token_indices, route_indices].unsqueeze(1))
+        expert_output.mul_(route)
         output.index_add_(0, token_indices, expert_output)
     return output
 
@@ -629,9 +794,8 @@ def _reference_output(setup: _Setup, batch: BackendBatch) -> torch.Tensor:
 def _check_correctness(
     args: BenchmarkOptions,
     setup: _Setup,
-    runner: _SubmissionGroup,
+    runner: _SubmissionGroup | _GraphReplayGroup,
 ) -> dict[str, Any]:
-    runner.run()
     quantized = setup.config.model.quantization is not None
     default_tolerance = 0.08 if quantized else (0.02 if args.dtype != "fp32" else 1e-5)
     atol = default_tolerance if args.atol is None else args.atol
@@ -640,44 +804,50 @@ def _check_correctness(
     mean = 0.0
     maximum_relative_l2 = 0.0
     minimum_cosine = 1.0
-    batches = setup.batches[: setup.concurrency]
-    outputs = setup.outputs[: setup.concurrency]
-    for batch_index, (batch, actual) in enumerate(zip(batches, outputs, strict=True)):
-        expected = _reference_output(setup, batch)
-        actual_cpu = actual.float().cpu()
-        difference = (actual_cpu - expected).abs()
-        max_abs_error = difference.max().item()
-        relative_l2 = float(difference.norm() / expected.norm().clamp_min(1e-10))
-        if torch.count_nonzero(expected) == 0:
-            cosine = 1.0 if torch.count_nonzero(actual_cpu) == 0 else 0.0
-        else:
-            cosine = float(
-                functional.cosine_similarity(
-                    actual_cpu.flatten(),
-                    expected.flatten(),
-                    dim=0,
+    checked_batches = 0
+    runner.reset_routing_case()
+    for case_index in range(setup.routing_cases):
+        runner.run()
+        for slot, (batch, actual) in enumerate(
+            zip(runner.last_batches, runner.last_outputs, strict=True)
+        ):
+            checked_batches += 1
+            batch_index = case_index * setup.concurrency + slot
+            expected = _reference_output(setup, batch)
+            actual_cpu = actual.float().cpu()
+            difference = (actual_cpu - expected).abs()
+            max_abs_error = difference.max().item()
+            relative_l2 = float(difference.norm() / expected.norm().clamp_min(1e-10))
+            if torch.count_nonzero(expected) == 0:
+                cosine = 1.0 if torch.count_nonzero(actual_cpu) == 0 else 0.0
+            else:
+                cosine = float(
+                    functional.cosine_similarity(
+                        actual_cpu.flatten(),
+                        expected.flatten(),
+                        dim=0,
+                    )
                 )
-            )
-        maximum = max(maximum, max_abs_error)
-        mean += difference.mean().item()
-        maximum_relative_l2 = max(maximum_relative_l2, relative_l2)
-        minimum_cosine = min(minimum_cosine, cosine)
-        if quantized:
-            valid = (
-                torch.isfinite(actual_cpu).all()
-                and relative_l2 < args.max_relative_l2
-                and cosine > args.min_cosine
-            )
-        else:
-            valid = torch.allclose(actual_cpu, expected, atol=atol, rtol=rtol)
-        if not valid:
-            raise RuntimeError(
-                "backend correctness check failed: "
-                f"batch={batch_index}, max_abs_error={max_abs_error:.6g}, "
-                f"relative_l2={relative_l2:.6g}, cosine={cosine:.6g}, "
-                f"atol={atol}, rtol={rtol}, "
-                f"max_relative_l2={args.max_relative_l2}, min_cosine={args.min_cosine}"
-            )
+            maximum = max(maximum, max_abs_error)
+            mean += difference.mean().item()
+            maximum_relative_l2 = max(maximum_relative_l2, relative_l2)
+            minimum_cosine = min(minimum_cosine, cosine)
+            if quantized:
+                valid = (
+                    torch.isfinite(actual_cpu).all()
+                    and relative_l2 < args.max_relative_l2
+                    and cosine > args.min_cosine
+                )
+            else:
+                valid = torch.allclose(actual_cpu, expected, atol=atol, rtol=rtol)
+            if not valid:
+                raise RuntimeError(
+                    "backend correctness check failed: "
+                    f"batch={batch_index}, max_abs_error={max_abs_error:.6g}, "
+                    f"relative_l2={relative_l2:.6g}, cosine={cosine:.6g}, "
+                    f"atol={atol}, rtol={rtol}, "
+                    f"max_relative_l2={args.max_relative_l2}, min_cosine={args.min_cosine}"
+                )
     return {
         "checked": True,
         "reference": "independent_fp32_dequantized" if quantized else "independent_fp32",
@@ -685,7 +855,8 @@ def _check_correctness(
         "atol": atol,
         "rtol": rtol,
         "max_abs_error": maximum,
-        "mean_abs_error": mean / len(batches),
+        "mean_abs_error": mean / checked_batches,
+        "checked_batches": checked_batches,
         "max_relative_l2": maximum_relative_l2,
         "max_relative_l2_limit": args.max_relative_l2,
         "min_cosine_similarity": minimum_cosine,
@@ -751,10 +922,25 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def _latency_summary(values: list[float]) -> dict[str, float]:
+    return {
+        "mean": statistics.fmean(values),
+        "min": min(values),
+        "p50": _percentile(values, 0.50),
+        "p95": _percentile(values, 0.95),
+        "max": max(values),
+    }
+
+
 def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
     setup = _build_setup(args)
-    runner = _SubmissionGroup(setup)
+    runner = None
     try:
+        runner = (
+            _GraphReplayGroup(setup, args)
+            if args.execution_mode == ExecutionMode.GRAPH
+            else _SubmissionGroup(setup)
+        )
         correctness = (
             {"checked": False} if args.skip_correctness else _check_correctness(args, setup, runner)
         )
@@ -762,6 +948,8 @@ def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
         for _ in range(args.warmup):
             runner.run()
 
+        if isinstance(runner, _GraphReplayGroup):
+            runner.device_samples_ms.clear()
         memory_before = _memory_info(setup.runtime)
         _reset_peak_memory(setup.runtime.device)
         durations_ms: list[float] = []
@@ -781,7 +969,11 @@ def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
         peak_allocated = _peak_memory(setup.runtime.device)
         mean_ms = statistics.fmean(durations_ms)
         total_tokens = args.tokens * args.concurrency
-        estimate = setup.backend.estimate_resources(args.tokens)
+        estimate = (
+            setup.backend.estimate_resources(args.tokens)
+            if args.execution_mode == ExecutionMode.EAGER
+            else None
+        )
         return {
             "schema_version": 1,
             "backend": args.backend,
@@ -790,6 +982,9 @@ def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
             "quantization": args.quantization,
             "expert_compute": args.expert_compute,
             "swiglu_limit": args.swiglu_limit,
+            "synthetic_scale_policy": "bf16_exact_fp32"
+            if args.quantization != BenchmarkQuantization.NONE
+            else None,
             "shape": {
                 "tokens": args.tokens,
                 "hidden_dim": args.hidden_dim,
@@ -808,6 +1003,25 @@ def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
                 "seed": args.seed,
             },
             "execution": {
+                "mode": args.execution_mode,
+                "operator_path": (
+                    "ascend_fused.run_ascend_fused_moe"
+                    if args.backend == BackendName.ASCEND_FUSED
+                    else "torch.resident"
+                    if args.execution_mode == ExecutionMode.GRAPH
+                    else "backend.submit"
+                ),
+                "captured_graphs": 1 if args.execution_mode == ExecutionMode.GRAPH else 0,
+                "scope": "resident_compute_only"
+                if args.execution_mode == ExecutionMode.GRAPH
+                else "eager_backend_lifecycle",
+                "host_timing_includes": "input_staging,replay,device_events,completion_wait"
+                if args.execution_mode == ExecutionMode.GRAPH
+                else "submit,wait_host,close",
+                "resident_expert_range": [
+                    args.expert_start,
+                    args.experts if args.expert_end is None else args.expert_end,
+                ],
                 "concurrency": args.concurrency,
                 "warmup": args.warmup,
                 "repeats": args.repeats,
@@ -821,6 +1035,11 @@ def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
                 "p95": _percentile(durations_ms, 0.95),
                 "max": max(durations_ms),
             },
+            "device_replay_latency_ms": (
+                _latency_summary(runner.device_samples_ms)
+                if isinstance(runner, _GraphReplayGroup)
+                else None
+            ),
             "throughput": {
                 "tokens_per_second": total_tokens * 1000 / mean_ms,
                 "batches_per_second": args.concurrency * 1000 / mean_ms,
@@ -831,14 +1050,19 @@ def _run_benchmark(args: BenchmarkOptions) -> dict[str, Any]:
                 "total_bytes": None if memory_after is None else memory_after[1],
                 "peak_allocated_bytes": peak_allocated,
                 "estimated_temporary_bytes_per_active_batch": (
-                    estimate.temporary_bytes_per_active_batch
+                    None if estimate is None else estimate.temporary_bytes_per_active_batch
                 ),
-                "estimated_total_temporary_bytes": estimate.total_bytes(args.concurrency),
+                "estimated_total_temporary_bytes": None
+                if estimate is None
+                else estimate.total_bytes(args.concurrency),
             },
         }
     finally:
-        runner.close()
-        setup.close()
+        try:
+            if runner is not None:
+                runner.close()
+        finally:
+            setup.close()
 
 
 app = typer.Typer(help=__doc__, pretty_exceptions_show_locals=False, add_completion=False)
@@ -848,6 +1072,9 @@ app = typer.Typer(help=__doc__, pretty_exceptions_show_locals=False, add_complet
 def main(
     backend: BackendName = BackendName.ASCEND_FUSED,
     device: str = "npu:0",
+    execution_mode: ExecutionMode = ExecutionMode.EAGER,
+    expert_start: int = 0,
+    expert_end: int | None = None,
     dtype: ActivationDType = ActivationDType.BF16,
     quantization: BenchmarkQuantization = BenchmarkQuantization.NONE,
     expert_compute: ExpertCompute = ExpertCompute.SWIGLU,
@@ -896,6 +1123,9 @@ def main(
         args = BenchmarkOptions(
             backend=backend,
             device=device,
+            execution_mode=execution_mode,
+            expert_start=expert_start,
+            expert_end=expert_end,
             dtype=dtype,
             quantization=quantization,
             expert_compute=expert_compute,

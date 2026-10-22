@@ -3,8 +3,14 @@ from __future__ import annotations
 from enum import StrEnum
 
 import torch
-import torch_npu
 from torch import Tensor
+
+try:
+    import torch_npu
+except ModuleNotFoundError as error:
+    if error.name != "torch_npu":
+        raise
+    torch_npu = None
 
 
 class AscendFusedComputeType(StrEnum):
@@ -51,6 +57,15 @@ def run_ascend_fused_moe(
     """
 
     expert_num = len(w13)
+
+    # Scales stay FP32 in ready storage; the eager scaled-GMM API requires
+    # BF16 channel scales for BF16 output and FP32 scales for FP16 output.
+    if compute_type is AscendFusedComputeType.DYNAMIC_W8A8:
+        scale_dtype = torch.bfloat16 if hidden_states.dtype is torch.bfloat16 else torch.float32
+        if w13_scale is not None:
+            w13_scale = [scale.to(scale_dtype) for scale in w13_scale]
+        if w2_scale is not None:
+            w2_scale = [scale.to(scale_dtype) for scale in w2_scale]
 
     w13 = _prepare_expert_tensors_for_gmm(w13)
     w2 = _prepare_expert_tensors_for_gmm(w2)
