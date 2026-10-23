@@ -2,8 +2,8 @@
 
 By default, the graph path captures the complete model forward for Decode,
 including routed experts on separate Workers. Prefill and mixed batches use
-ordinary EK Transport. Qwen3 W8A8 with the Torch backend can also enable full
-graphs for Prefill, mixed and Decode steps.
+ordinary EK Transport. Qwen3 W8A8 with the Torch or `ascend_fused` backend can
+also enable full graphs for Prefill, mixed and Decode steps.
 Sampling stays outside the captured forward. Every role uses the same Docker
 runtime; models are mounted read-only.
 
@@ -79,9 +79,9 @@ on `weight_version`, model geometry and the same graph document.
 
 ### Enable Qwen3 Prefill graphs
 
-In the copied Qwen3 `cluster.yaml`, change the existing `expert.backend` from
-`ascend_fused` to `torch`. In the copied `experiment.yaml`, update the existing
-graph mapping while retaining its identity, endpoints, layers and Workers:
+In the copied Qwen3 `cluster.yaml`, select `expert.backend: torch` or
+`ascend_fused`. In the copied `experiment.yaml`, update the existing graph mapping
+while retaining its identity, endpoints, layers and Workers:
 
 ```yaml
 ascend_decode_graph:
@@ -97,8 +97,8 @@ raise the concurrent request limit to 2,048. Small Decode buckets remain present
 Full mode also selects native FULL attention for Decode, so a comparison with
 decode-only mode includes that attention-path change.
 
-Omitting `mode` keeps `decode` and `FULL_DECODE_ONLY`. Use decode mode for V4,
-V2-Lite and the `ascend_fused` backend. The checked-in examples are unchanged.
+Omitting `mode` keeps `decode` and `FULL_DECODE_ONLY`. Use decode mode for V4 and
+V2-Lite. The checked-in examples are unchanged.
 
 Generate and check the Compose files:
 

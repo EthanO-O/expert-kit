@@ -407,7 +407,7 @@ def test_graph_worker_requires_exact_v4_computation(tmp_path, field, value):
 
 
 @pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
-def test_full_graph_requires_torch_resident_backend(tmp_path, backend):
+def test_full_graph_accepts_resident_backends(tmp_path, backend):
     raw = _config(tmp_path, backend=backend, device="npu:0")
     raw["model"].update(
         num_layers=48,
@@ -432,7 +432,7 @@ def test_full_graph_requires_torch_resident_backend(tmp_path, backend):
             rendezvous_host="127.0.0.1",
             rendezvous_port=18080,
             layer_ids=list(range(48)),
-            capture_sizes=[1, 64, 128, 256],
+            capture_sizes=[2**power for power in range(12)],
             model={
                 k: v
                 for k, v in raw["model"].items()
@@ -449,8 +449,4 @@ def test_full_graph_requires_torch_resident_backend(tmp_path, backend):
             ],
         ),
     )
-    if backend == "torch":
-        assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph.mode == "full"
-    else:
-        with pytest.raises(ValidationError, match="Torch resident backend"):
-            WorkerConfig.model_validate(raw)
+    assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph.mode == "full"
