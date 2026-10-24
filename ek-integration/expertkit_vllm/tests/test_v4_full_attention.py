@@ -739,3 +739,84 @@ def test_decode_padding_delegates_mixed_capture_and_nonuniform_population(monkey
         assert runner._pad_query_start_loc_for_fia(*arguments) == "native"
         assert calls[-1] == (arguments, {})
     adapter._bindings.close()
+
+
+@pytest.mark.parametrize(
+    "lengths,swap",
+    [
+        ([1] * 22 + [184, 85, 380, 76, 50, 82, 14, 29, 20, 27, 1, 642, 32, 80, 324], (22, 32)),
+        ([1] * 194, None),
+        ([1, 1, 4, 8], None),
+    ],
+)
+def test_batch_reorder_delegates_native_dsa_and_restores_identity(monkeypatch, lengths, swap):
+    import sys
+
+    from expertkit_vllm.v4_full_attention import V4FullAttention, _OwnedBindings
+
+    calls = []
+
+    class NativeBuilder:
+        decode_threshold = 1
+
+        def reorder_batch(self, batch, scheduled):
+            calls.append((batch, scheduled))
+            if swap is not None:
+                batch.swap_states(*swap)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.attention.dsa_v1",
+        SimpleNamespace(AscendDSAMetadataBuilder=NativeBuilder),
+    )
+    ids = list(range(len(lengths)))
+    states = [(rid, f"slot-{rid}", f"cache-{rid}") for rid in ids]
+    batch = SimpleNamespace(req_ids=ids, states=states)
+
+    def swap_states(left, right):
+        ids[left], ids[right] = ids[right], ids[left]
+        states[left], states[right] = states[right], states[left]
+
+    batch.swap_states = swap_states
+    scheduled = SimpleNamespace(num_scheduled_tokens=dict(enumerate(lengths)))
+    before = list(states)
+
+    def original(output):
+        assert output is scheduled
+        assert calls == []
+        return "native-result"
+
+    builder = NativeBuilder()
+    runner = SimpleNamespace(
+        _may_reorder_batch=original,
+        input_batch=batch,
+        attn_groups=[[SimpleNamespace(get_metadata_builder=lambda index: builder)]],
+    )
+    adapter = object.__new__(V4FullAttention)
+    adapter.runner = runner
+    adapter._bindings = _OwnedBindings()
+    adapter._closed = False
+    adapter._buckets = {}
+    adapter._immutable = {}
+
+    def validate():
+        ordered = [scheduled.num_scheduled_tokens[rid] for rid in ids]
+        decodes = next((i for i, n in enumerate(ordered) if n != 1), len(ordered))
+        capacity = attention_capacity(2048 if swap else sum(lengths), mixed=decodes < len(ids))
+        capacity.validate_population(ordered, decodes)
+
+    if swap:
+        with pytest.raises(ValueError, match="native phase capacity"):
+            validate()
+    else:
+        validate()
+    adapter._bind_batch_reorder()
+    assert runner._may_reorder_batch(scheduled) == "native-result"
+    assert calls == [(batch, scheduled)]
+    validate()
+    assert sorted(states) == before
+    assert all(state[0] == rid for rid, state in zip(ids, states, strict=True))
+    if swap is None:
+        assert states == before
+    adapter.close()
+    assert runner._may_reorder_batch is original

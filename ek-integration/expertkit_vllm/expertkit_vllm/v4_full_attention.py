@@ -547,6 +547,7 @@ class V4FullAttention:
 
         runner = self.runner
         self._bind_decode_padding()
+        self._bind_batch_reorder()
         build = runner._build_attention_metadata
         signature = inspect.signature(build)
 
@@ -749,6 +750,23 @@ class V4FullAttention:
             )
 
         self._bindings.bind(runner, "_pad_query_start_loc_for_fia", pad)
+
+    def _bind_batch_reorder(self) -> None:
+        """Restore native DSA's single-query prefix after generic reordering."""
+        from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+
+        runner = self.runner
+        original = runner._may_reorder_batch
+
+        def reorder(scheduler_output: Any) -> Any:
+            result = original(scheduler_output)
+            builder = runner.attn_groups[0][0].get_metadata_builder(0)
+            if not isinstance(builder, AscendDSAMetadataBuilder) or builder.decode_threshold != 1:
+                raise ValueError("V4 Full requires the native single-query DSA reorder policy")
+            builder.reorder_batch(runner.input_batch, scheduler_output)
+            return result
+
+        self._bindings.bind(runner, "_may_reorder_batch", reorder)
 
     def _wrap_builders(self) -> None:
         for group_id, groups in enumerate(self.runner.attn_groups):
