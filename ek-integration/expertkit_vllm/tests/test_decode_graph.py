@@ -2,6 +2,7 @@
 
 import atexit
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -35,8 +36,10 @@ def graph_runtime(monkeypatch, request):
         def __init__(self, config):
             pass
 
-        def begin(self, phase, capacity=0):
+        def begin(self, phase, capacity=0, *, graph_phase=None):
             events.append(("begin", phase, capacity))
+            if graph_phase is not None:
+                events.append(("graph-phase", graph_phase))
 
         def finish(self):
             events.append("finish")
@@ -53,7 +56,9 @@ def graph_runtime(monkeypatch, request):
 
         def buffers(self, capacity):
             if capacity not in self.profiles:
-                self.profiles[capacity] = SimpleNamespace(output=torch.zeros(capacity, 2048))
+                self.profiles[capacity] = SimpleNamespace(
+                    output=torch.zeros(capacity, config.model.hidden_dim)
+                )
                 events.append(("allocate", capacity))
             return self.profiles[capacity]
 
@@ -88,6 +93,7 @@ def graph_runtime(monkeypatch, request):
             self.vllm_config = object()
             self.concrete_aclgraph_entries = {}
             self.fail = False
+            self.capture_failure_factory = None
 
         def __call__(self):
             if context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
@@ -96,12 +102,17 @@ def graph_runtime(monkeypatch, request):
             descriptor = context.batch_descriptor
             if descriptor not in self.concrete_aclgraph_entries:
                 events.append("native-capture")
+                if self.capture_failure_factory is not None:
+                    partial_graph = self.capture_failure_factory()
+                    raise RuntimeError(f"partial native capture: {type(partial_graph).__name__}")
                 session = graph.active_graph_session()
                 assert session is not None
                 for layer in config.layer_ids:
                     session.exchange(
                         layer,
-                        torch.zeros(descriptor.num_tokens, 2048, dtype=torch.bfloat16),
+                        torch.zeros(
+                            descriptor.num_tokens, config.model.hidden_dim, dtype=torch.bfloat16
+                        ),
                         torch.zeros(descriptor.num_tokens, config.model.top_k, dtype=torch.int32),
                         torch.full(
                             (descriptor.num_tokens, config.model.top_k),
@@ -133,6 +144,9 @@ def graph_runtime(monkeypatch, request):
             assert graph.is_graph_profile()
             return self.model()
 
+        def _capture_cudagraphs(self, descriptors, mode, profiler=None):
+            events.append(("capture-descriptors", tuple(descriptors), mode, profiler))
+
     for name, attribute, value in (
         ("vllm_ascend.compilation.acl_graph", "ACLGraphWrapper", Wrapper),
         ("vllm_ascend.worker.model_runner_v1", "NPUModelRunner", Runner),
@@ -154,6 +168,58 @@ def graph_runtime(monkeypatch, request):
     )
     if getattr(request, "param", "decode") == "full":
         config = _full_qwen_config(config)
+    if getattr(request, "param", "decode") == "v4-full":
+        values = _full_qwen_config(config).model_dump()
+        values["model"].update(
+            num_layers=43,
+            experts_per_layer=256,
+            hidden_dim=4096,
+            expert_intermediate_dim=2048,
+            top_k=6,
+            expert_compute="deepseek_v4",
+            swiglu_limit=10.0,
+        )
+        values.update(
+            layer_ids=tuple(range(43)),
+            capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+            workers=tuple(
+                dict(
+                    worker_id=f"worker-{rank}",
+                    control_endpoint=f"127.0.0.1:{18100 + rank}",
+                    expert_start=32 * rank,
+                    expert_end=32 * (rank + 1),
+                )
+                for rank in range(8)
+            ),
+        )
+        config = AscendGraphConfig.model_validate(values)
+
+        class Adapter:
+            phase = "decode"
+
+            @contextmanager
+            def capture_phase(self, phase):
+                previous, self.phase = self.phase, phase
+                events.append(("capture-phase", phase))
+                try:
+                    yield
+                finally:
+                    self.phase = previous
+
+            def close(self):
+                assert all(not entries for entries in wrapper._expertkit_v4_phase_entries.values())
+                events.append("adapter-close")
+
+        adapter = Adapter()
+        module = ModuleType("expertkit_vllm.v4_full_attention")
+
+        def install(runner, _config):
+            events.append("adapter-install")
+            runner._expertkit_v4_full_attention = adapter
+            return adapter
+
+        module.install_v4_full_attention = install
+        monkeypatch.setitem(sys.modules, module.__name__, module)
     graph.install_decode_graph_wrapper(config)
     wrapper = Wrapper()
     try:
@@ -831,3 +897,128 @@ def test_exchange_uses_shared_hidden_and_top_k_without_device_reads():
     session._layer_index = 0
     with pytest.raises(ValueError, match="Tensor contract"):
         session.exchange(0, hidden, ids[:, :6], routing[:, :6])
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_v4_capture_preserves_native_descriptors_and_phase_scope(graph_runtime):
+    events, _context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    adapter = runner._expertkit_v4_full_attention
+    items = [
+        descriptor(uniform=False, num_tokens=t)
+        for t in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+    ]
+    marker = object()
+    events.clear()
+    runner._capture_cudagraphs(items, CUDAGraphMode.FULL, marker)
+    captures = [
+        event for event in events if isinstance(event, tuple) and event[0] == "capture-descriptors"
+    ]
+    assert [event[1] for event in captures] == [tuple(items[:9]), tuple(items[1:])]
+    assert all(event[2:] == (CUDAGraphMode.FULL, marker) for event in captures)
+    assert adapter.phase == "decode"
+    assert wrapper.concrete_aclgraph_entries == {}
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_v4_selects_phase_map_before_session_lookup_and_clears_both(graph_runtime):
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    adapter = runner._expertkit_v4_full_attention
+    context.batch_descriptor = descriptor(uniform=False, num_reqs=4, num_tokens=4)
+    original_map = wrapper.concrete_aclgraph_entries
+    for phase in ("decode", "mixed"):
+        adapter.phase = phase
+        events.clear()
+        assert runner._model_forward() == "result"
+        assert "native-capture" in events and "native-replay" not in events
+        assert ("graph-phase", phase) in events
+        assert wrapper.concrete_aclgraph_entries is original_map
+    for phase in ("mixed", "decode"):
+        adapter.phase = phase
+        events.clear()
+        assert runner._model_forward() == "result"
+        assert "native-replay" in events and "native-capture" not in events
+        assert ("graph-phase", phase) in events
+    session = wrapper._expertkit_decode_session
+    assert all(len(entries) == 1 for entries in session._v4_phase_entries.values())
+    session.close()
+    assert all(not entries for entries in session._v4_phase_entries.values())
+    assert events.index("adapter-close") < events.index("data-close")
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_v4_failure_restores_phase_map_and_retains_adapter_storage(graph_runtime):
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    adapter = runner._expertkit_v4_full_attention
+    adapter.phase = "mixed"
+    context.batch_descriptor = descriptor(uniform=False, num_reqs=4, num_tokens=4)
+    previous = wrapper.concrete_aclgraph_entries
+    wrapper.fail = True
+    with pytest.raises(RuntimeError, match="native failure"):
+        runner._model_forward()
+    assert wrapper.concrete_aclgraph_entries is previous
+    session = wrapper._expertkit_decode_session
+    assert session._poisoned
+    session.close()
+    assert "adapter-close" not in events and "data-close" not in events
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_v4_capture_scope_failure_poisons_session_without_releasing_adapter(graph_runtime):
+    events, _context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    adapter = runner._expertkit_v4_full_attention
+    original_scope = adapter.capture_phase
+
+    @contextmanager
+    def failed_scope(phase):
+        with original_scope(phase):
+            yield
+            raise RuntimeError("capture scope failed")
+
+    adapter.capture_phase = failed_scope
+    with pytest.raises(RuntimeError, match="capture scope failed"):
+        runner._capture_cudagraphs([descriptor(num_tokens=4)], CUDAGraphMode.FULL)
+    assert adapter.phase == "decode"
+    session = wrapper._expertkit_decode_session
+    assert session._poisoned
+    session.close()
+    assert "adapter-close" not in events
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_v4_capture_failure_traceback_holds_unpublished_native_graph(graph_runtime):
+    import gc
+    import weakref
+
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    context.batch_descriptor = descriptor(uniform=False, num_reqs=4, num_tokens=4)
+    references = []
+
+    class PartialGraph:
+        pass
+
+    def create_graph():
+        value = PartialGraph()
+        references.append(weakref.ref(value))
+        return value
+
+    wrapper.capture_failure_factory = create_graph
+    try:
+        runner._model_forward()
+    except RuntimeError as error:
+        assert "partial native capture" in str(error)
+    else:
+        pytest.fail("capture must fail before publishing its native graph")
+    session = wrapper._expertkit_decode_session
+    assert session._poisoned and session._v4_capture_failure is not None
+    assert not any(session._v4_phase_entries.values())
+    gc.collect()
+    assert references[0]() is not None
+    session.close()
+    gc.collect()
+    assert references[0]() is not None
+    assert "adapter-close" not in events and "data-close" not in events

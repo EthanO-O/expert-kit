@@ -314,3 +314,164 @@ def test_ordinary_completion_does_not_cancel_graph_lifecycle_monitor(execution):
         assert execution._graphs == {}
 
     asyncio.run(scenario())
+
+
+def _v4_full_execution_config(execution):
+    values = execution.config.model_dump(exclude={"worker_id", "control_endpoint"})
+    values.update(
+        mode="full",
+        layer_ids=tuple(range(43)),
+        capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+        workers=[
+            dict(
+                worker_id=f"worker-{i}",
+                control_endpoint=f"127.0.0.1:{18000 + i}",
+                expert_start=i * 32,
+                expert_end=(i + 1) * 32,
+            )
+            for i in range(8)
+        ],
+    )
+    values["model"].update(
+        num_layers=43,
+        experts_per_layer=256,
+        hidden_dim=4096,
+        expert_intermediate_dim=2048,
+        top_k=6,
+        expert_compute="deepseek_v4",
+        swiglu_limit=10.0,
+        quantization=dict(type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True),
+    )
+    return AscendGraphConfig.model_validate(values)
+
+
+def test_v4_worker_pairs_graph_keys_and_rejects_phase_contract_errors(execution):
+    execution.config = _v4_full_execution_config(execution)
+    execution._weights = SimpleNamespace(
+        revision=1,
+        require_current=lambda: None,
+        close=lambda **kwargs: kwargs["wait_for_completion"](),
+    )
+    execution._session = SimpleNamespace(close=lambda: None)
+
+    def command(phase="capture", **updates):
+        return request_for(
+            execution,
+            phase=phase,
+            capacity=4,
+            graph_phase="decode",
+            worker_start_id="start-one",
+            ready_revision=1,
+            **updates,
+        )
+
+    for phase in ("decode", "mixed"):
+        request = command()
+        request["graph_phase"] = phase
+        assert execution._validate_request(request) == ("capture", 4)
+        execution._graphs[(phase, 4)] = object()
+        with pytest.raises(ValueError, match="already been captured"):
+            execution._validate_request(request)
+        assert execution._validate_request({**request, "phase": "replay"}) == ("replay", 4)
+    for updates in (
+        {"graph_phase": "bad"},
+        {"graph_phase": []},
+        {"phase": "warmup"},
+        {"graph_phase": "decode", "capacity": 512},
+        {"graph_phase": "mixed", "capacity": 1},
+    ):
+        request = {**command(), **updates}
+        with pytest.raises(ValueError):
+            execution._validate_request(request)
+    missing = command()
+    missing.pop("graph_phase")
+    with pytest.raises(ValueError, match="fields"):
+        execution._validate_request(missing)
+
+
+def test_worker_capture_failure_retains_phase_graph_owner(execution, monkeypatch):
+    from contextlib import nullcontext
+
+    execution._weights = SimpleNamespace(
+        require_current=lambda: None, close=lambda **kwargs: kwargs["wait_for_completion"]()
+    )
+    execution._session = SimpleNamespace(close=lambda: None)
+    execution._stream = SimpleNamespace(synchronize=lambda: None)
+    graph = object()
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            set_device=lambda _: None,
+            stream=lambda _: nullcontext(),
+            NPUGraph=lambda: graph,
+            graph=lambda *_args, **_kwargs: nullcontext(),
+        ),
+        raising=False,
+    )
+
+    def fail(_capacity):
+        assert execution._graphs[("mixed", 4)] is graph
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(execution, "_body", fail)
+    with pytest.raises(RuntimeError, match="capture failed"):
+        execution._run("capture", 4, threading.Event(), "mixed")
+    assert execution._poisoned and execution._graphs[("mixed", 4)] is graph
+    assert execution._admission._poisoned
+    # A poisoned device cannot be drained by the normal fixture shutdown.
+    execution._closed = True
+    execution._executor.shutdown(wait=True)
+
+
+def test_worker_phase_graph_replay_and_close_keep_both_captures(execution, monkeypatch):
+    from contextlib import nullcontext
+
+    execution.config = _v4_full_execution_config(execution)
+    events = []
+
+    class Graph:
+        def __init__(self):
+            self.number = len([item for item in events if isinstance(item, Graph)])
+            events.append(self)
+
+        def replay(self):
+            events.append(("replay", self.number))
+
+    def synchronized():
+        events.append("sync")
+
+    execution._weights = SimpleNamespace(
+        require_current=lambda: None, close=lambda **kwargs: kwargs["wait_for_completion"]()
+    )
+    execution._session = SimpleNamespace(close=lambda: events.append("session-close"))
+    execution._stream = SimpleNamespace(synchronize=synchronized)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            set_device=lambda _: None,
+            stream=lambda _: nullcontext(),
+            NPUGraph=Graph,
+            graph=lambda *_args, **_kwargs: nullcontext(),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(execution, "_body", lambda capacity: events.append(("body", capacity)))
+    for phase in ("decode", "mixed"):
+        execution._run("capture", 4, threading.Event(), phase)
+    assert len(execution._graphs) == 2
+    for phase in ("decode", "mixed", "decode"):
+        execution._run("replay", 4, threading.Event(), phase)
+    assert [item for item in events if isinstance(item, tuple) and item[0] == "replay"] == [
+        ("replay", 0),
+        ("replay", 1),
+        ("replay", 0),
+    ]
+    execution._destroy()
+    assert execution._graphs == {} and events[-2:] == ["sync", "session-close"]
+
+
+def test_legacy_worker_rejects_phase_extension(execution):
+    with pytest.raises(ValueError, match="fields"):
+        execution._validate_request(request_for(execution, graph_phase="decode"))

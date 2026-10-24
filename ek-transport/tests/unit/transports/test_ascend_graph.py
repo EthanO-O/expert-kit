@@ -596,3 +596,70 @@ def test_eight_qwen_full_graph_keeps_token_capacity_limit():
     data.update(mode="full", capture_sizes=[4096])
     with pytest.raises(ValidationError, match="capacity cannot exceed 2048"):
         AscendGraphConfig.model_validate(data)
+
+
+def test_v4_full_requires_complete_layers_and_exact_capture_profile():
+    values = v4_config_data()
+    values.update(
+        mode="full",
+        layer_ids=tuple(range(43)),
+        capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+    )
+    config = AscendGraphConfig.model_validate(values)
+    assert config.mode == "full"
+    for update in ({"layer_ids": (0, 2, 3)}, {"capture_sizes": (1, 256, 2048)}):
+        with pytest.raises(ValidationError):
+            AscendGraphConfig.model_validate({**values, **update})
+
+
+def test_v4_control_phase_field_is_narrow_and_legacy_payload_unchanged(monkeypatch):
+    values = v4_config_data()
+    values.update(
+        mode="full",
+        layer_ids=tuple(range(43)),
+        capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+    )
+    control = GraphStepControl(AscendGraphConfig.model_validate(values))
+    requests = []
+
+    def fanout(method):
+        if method == "begin":
+            requests.extend(dict(item) for item in control._requests)
+            return [
+                dict(
+                    sequence=control._sequence,
+                    state="ready",
+                    worker_start_id="start",
+                    ready_revision=1,
+                )
+                for _ in control._peers
+            ]
+        return [dict(sequence=control._sequence, state="complete") for _ in control._peers]
+
+    monkeypatch.setattr(control, "_fanout", fanout)
+    try:
+        for graph_phase in (None, "bad", []):
+            with pytest.raises(ValueError):
+                control.begin("capture", 4, graph_phase=graph_phase)
+        with pytest.raises(ValueError):
+            control.begin("warmup", 4, graph_phase="decode")
+        for phase in ("decode", "mixed"):
+            control.begin("capture", 4, graph_phase=phase)
+            control.finish()
+        assert [item["graph_phase"] for item in requests] == ["decode"] * 8 + ["mixed"] * 8
+        requests.clear()
+        control.begin("warmup", 4)
+        control.finish()
+        assert all("graph_phase" not in item for item in requests)
+    finally:
+        control.close()
+
+
+def test_legacy_control_rejects_graph_phase_before_any_rpc():
+    control = GraphStepControl(config_for())
+    try:
+        with pytest.raises(ValueError, match="only valid"):
+            control.begin("capture", 4, graph_phase="decode")
+        assert control._sequence == 0 and control._active is None
+    finally:
+        control.close()

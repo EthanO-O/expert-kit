@@ -209,6 +209,17 @@ def validate_graph_model(vllm_config: Any, config: AscendGraphConfig) -> None:
         raise ValueError("vLLM max_num_batched_tokens must cover every graph capture size")
     if os.environ.get("EK_INSTANCE_ID") != str(config.instance_id):
         raise ValueError("EK_INSTANCE_ID must match the fixed graph deployment")
+    if _is_v4_full(config) and (
+        model.max_model_len != 8192
+        or vllm_config.scheduler_config.max_num_seqs != 256
+        or vllm_config.scheduler_config.max_num_batched_tokens != 2048
+        or not vllm_config.scheduler_config.enable_chunked_prefill
+    ):
+        raise ValueError("V4 full graph requires the fixed 8192/256/2048 chunked profile")
+
+
+def _is_v4_full(config: AscendGraphConfig) -> bool:
+    return config.mode == "full" and config.model.expert_compute == "deepseek_v4"
 
 
 class DecodeGraphSession:
@@ -223,6 +234,9 @@ class DecodeGraphSession:
         self._poisoned = False
         self._closed = False
         self._native_entries: dict | None = None
+        self._v4_phase_entries: dict[str, dict] | None = None
+        self._v4_attention: Any = None
+        self._v4_capture_failure: BaseException | None = None
         self._layer_index = 0
         self._capacity = 0
         self._watchdog = threading.Thread(
@@ -251,7 +265,12 @@ class DecodeGraphSession:
         if self._poisoned:
             raise RuntimeError("Frontend Decode graph session is poisoned")
         self._deadline = time.monotonic() + self.config.timeout_seconds
-        self._control.begin(phase, capacity)
+        if _is_v4_full(self.config) and phase in {"capture", "replay"}:
+            if self._v4_attention is None:
+                raise RuntimeError("V4 full attention phase owner is missing")
+            self._control.begin(phase, capacity, graph_phase=self._v4_attention.phase)
+        else:
+            self._control.begin(phase, capacity)
         self._layer_index = 0
         self._capacity = capacity
 
@@ -322,7 +341,11 @@ class DecodeGraphSession:
             if pending is None:
                 self._complete_forward()
             return result
-        except BaseException:
+        except BaseException as error:
+            if _is_v4_full(self.config):
+                # Native capture publishes its graph only after successful exit.
+                # Its traceback owns any graph still local to the failed call.
+                self._v4_capture_failure = error
             self.poison()
             raise
 
@@ -350,6 +373,11 @@ class DecodeGraphSession:
                 torch.npu.current_stream().synchronize()
                 if self._native_entries is not None:
                     self._native_entries.clear()
+                if self._v4_phase_entries is not None:
+                    for entries in self._v4_phase_entries.values():
+                        entries.clear()
+                if self._v4_attention is not None:
+                    self._v4_attention.close()
                 self._finish()
                 if self._data is not None:
                     self._data.close()
@@ -403,6 +431,36 @@ def install_decode_graph_wrapper(config: AscendGraphConfig) -> None:
         forward._expertkit_graph_completion = True
         NPUModelRunner._model_forward = forward
 
+    capture_graphs = NPUModelRunner._capture_cudagraphs
+    if not getattr(capture_graphs, "_expertkit_v4_phases", False):
+
+        @wraps(capture_graphs)
+        def capture(runner, batch_descriptors, cudagraph_runtime_mode, profiler=None):
+            adapter = getattr(runner, "_expertkit_v4_full_attention", None)
+            if adapter is None or cudagraph_runtime_mode != CUDAGraphMode.FULL:
+                return capture_graphs(runner, batch_descriptors, cudagraph_runtime_mode, profiler)
+            try:
+                for phase in ("decode", "mixed"):
+                    descriptors = [
+                        descriptor
+                        for descriptor in batch_descriptors
+                        if (
+                            descriptor.num_tokens <= 256
+                            if phase == "decode"
+                            else descriptor.num_tokens >= 2
+                        )
+                    ]
+                    with adapter.capture_phase(phase):
+                        capture_graphs(runner, descriptors, cudagraph_runtime_mode, profiler)
+            except BaseException:
+                session = runner.model.__dict__.get("_expertkit_decode_session")
+                if session is not None:
+                    session.poison()
+                raise
+
+        capture._expertkit_v4_phases = True
+        NPUModelRunner._capture_cudagraphs = capture
+
     profile_run = NPUModelRunner.profile_run
     if not getattr(profile_run, "_expertkit_graph_profile", False):
 
@@ -420,8 +478,15 @@ def install_decode_graph_wrapper(config: AscendGraphConfig) -> None:
             session = wrapper.__dict__.get("_expertkit_decode_session")
             if session is None:
                 validate_graph_model(wrapper.vllm_config, config)
+                if _is_v4_full(config):
+                    from expertkit_vllm.v4_full_attention import install_v4_full_attention
+
+                    adapter = install_v4_full_attention(runner, config)
+                    wrapper.__dict__["_expertkit_v4_full_attention"] = adapter
                 session = DecodeGraphSession(config, runner.device)
                 wrapper.__dict__["_expertkit_decode_session"] = session
+                if _is_v4_full(config):
+                    session._v4_attention = adapter
             # Allocate persistent communication storage and initialize HCCL
             # before vLLM observes free memory and budgets its KV cache.
             session.warmup(max(config.capture_sizes))
@@ -465,12 +530,30 @@ def install_decode_graph_wrapper(config: AscendGraphConfig) -> None:
                 return original(wrapper, *args, **kwargs)
             finally:
                 context.cudagraph_runtime_mode = previous
+        adapter = wrapper.__dict__.get("_expertkit_v4_full_attention")
+        if adapter is None and _is_v4_full(config):
+            raise RuntimeError("V4 full attention must be installed before profiling")
         session = wrapper.__dict__.get("_expertkit_decode_session")
         if session is None:
             validate_graph_model(wrapper.vllm_config, config)
             session = DecodeGraphSession(config, torch.device(f"npu:{torch.npu.current_device()}"))
             wrapper.__dict__["_expertkit_decode_session"] = session
-        return session.run(wrapper, original, args, kwargs, descriptor.num_tokens)
+        if adapter is None:
+            return session.run(wrapper, original, args, kwargs, descriptor.num_tokens)
+        previous = wrapper.concrete_aclgraph_entries
+        maps = wrapper.__dict__.setdefault(
+            "_expertkit_v4_phase_entries", {"decode": previous, "mixed": {}}
+        )
+        session._v4_attention = adapter
+        session._v4_phase_entries = maps
+        phase = adapter.phase
+        if phase not in maps:
+            raise ValueError("V4 full attention phase must be decode or mixed")
+        wrapper.concrete_aclgraph_entries = maps[phase]
+        try:
+            return session.run(wrapper, original, args, kwargs, descriptor.num_tokens)
+        finally:
+            wrapper.concrete_aclgraph_entries = previous
 
     call._expertkit_decode_graph = True
     ACLGraphWrapper.__call__ = call

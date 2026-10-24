@@ -65,7 +65,7 @@ class AscendDecodeGraphExecution:
         self._weights: ResidentGraphWeights | None = None
         self._session: HcclGraphSession | None = None
         self._stream: Any = None
-        self._graphs: dict[int, Any] = {}
+        self._graphs: dict[int | tuple[str, int], Any] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ek-decode-graph")
         self._lock = threading.Lock()
         self._sequence = 0
@@ -109,7 +109,12 @@ class AscendDecodeGraphExecution:
         self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _validate_request(self, request: dict[str, Any]) -> tuple[str, int]:
-        if set(request) != {
+        paired = (
+            self.config.mode == "full"
+            and self.config.model.expert_compute == "deepseek_v4"
+            and request.get("phase") in ("capture", "replay")
+        )
+        fields = {
             "version",
             "identity",
             "sequence",
@@ -117,8 +122,13 @@ class AscendDecodeGraphExecution:
             "capacity",
             "worker_start_id",
             "ready_revision",
-        }:
+        }
+        if paired:
+            fields.add("graph_phase")
+        if set(request) != fields:
             raise ValueError("invalid graph control request fields")
+        if paired and request["graph_phase"] not in ("decode", "mixed"):
+            raise ValueError("unsupported V4 full graph phase")
         try:
             identity = AscendGraphConfig.model_validate(request["identity"]).identity()
         except ValidationError as error:
@@ -168,9 +178,15 @@ class AscendDecodeGraphExecution:
             self._weights is None or request["ready_revision"] != self._weights.revision
         ):
             raise ValueError("graph close does not match prepared ready storage")
-        if phase == "capture" and capacity in self._graphs:
+        if paired and (
+            (request["graph_phase"] == "decode" and capacity > 256)
+            or (request["graph_phase"] == "mixed" and capacity < 2)
+        ):
+            raise ValueError("capacity does not belong to the V4 full graph phase")
+        key = (request["graph_phase"], capacity) if paired else capacity
+        if phase == "capture" and key in self._graphs:
             raise ValueError("graph profile has already been captured")
-        if phase == "replay" and capacity not in self._graphs:
+        if phase == "replay" and key not in self._graphs:
             raise ValueError("graph profile has not been captured")
         sequence = request["sequence"]
         if (
@@ -198,7 +214,9 @@ class AscendDecodeGraphExecution:
             self._sequence = request["sequence"]
             self._deadline = time.monotonic() + self.config.timeout_seconds
             self._pending_request = request
-            self._pending = self._executor.submit(self._run, phase, capacity, ready)
+            self._pending = self._executor.submit(
+                self._run, phase, capacity, ready, request.get("graph_phase")
+            )
             pending = self._pending
         timeout = min(
             timeout if timeout is not None else self.config.timeout_seconds,
@@ -248,7 +266,9 @@ class AscendDecodeGraphExecution:
             self._pending_request = None
         return {"state": "complete", "sequence": request["sequence"]}
 
-    def _run(self, phase: str, capacity: int, ready: threading.Event) -> None:
+    def _run(
+        self, phase: str, capacity: int, ready: threading.Event, graph_phase: str | None = None
+    ) -> None:
         try:
             if phase == "close":
                 ready.set()
@@ -276,14 +296,18 @@ class AscendDecodeGraphExecution:
                     assert self._weights is not None and self._session is not None
                     self._weights.require_current()
                     ready.set()
+                    key = (graph_phase, capacity) if graph_phase is not None else capacity
                     if phase == "capture":
                         graph = torch.npu.NPUGraph()
+                        if graph_phase is not None:
+                            # Paired graphs retain partial capture resources on poison.
+                            self._graphs[key] = graph
                         with torch.npu.graph(graph, stream=self._stream):
                             self._body(capacity)
-                        self._graphs[capacity] = graph
+                        self._graphs[key] = graph
                         logger.info("worker_decode_graph_captured", token_capacity=capacity)
                     elif phase == "replay":
-                        self._graphs[capacity].replay()
+                        self._graphs[key].replay()
                     else:
                         self._body(capacity)
                     self._stream.synchronize()

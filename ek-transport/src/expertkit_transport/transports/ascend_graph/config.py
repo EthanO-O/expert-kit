@@ -176,7 +176,8 @@ class AscendGraphConfig(BaseModel):
         if self.layer_ids[-1] >= self.model.num_layers:
             raise ValueError("graph layer IDs exceed model.num_layers")
         if self.mode == "full":
-            if (
+            v4_full = v4 and self.layer_ids == tuple(range(43))
+            if not v4_full and (
                 not qwen
                 or self.layer_ids != tuple(range(48))
                 or tuple((worker.expert_start, worker.expert_end) for worker in participants)
@@ -186,8 +187,23 @@ class AscendGraphConfig(BaseModel):
                 )
             ):
                 raise ValueError(
-                    "full graph mode requires the complete two- or eight-Worker Qwen3 W8A8 model"
+                    "full graph mode requires the complete Qwen3 or eight-Worker V4 W8A8 model"
                 )
+            if v4_full and self.capture_sizes != (
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+            ):
+                raise ValueError("V4 full graph requires the twelve fixed token capacities")
             if max(self.capture_sizes) > 2048:
                 raise ValueError("full graph token capacity cannot exceed 2048")
         if len({worker.worker_id for worker in participants}) != len(participants):

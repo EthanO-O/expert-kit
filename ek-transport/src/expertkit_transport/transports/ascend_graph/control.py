@@ -179,10 +179,24 @@ class GraphStepControl:
                 future.cancel()
             raise
 
-    def begin(self, phase: str, capacity: int = 0) -> None:
-        """Wait until every Worker owns admission, preserving independent identities."""
+    def begin(self, phase: str, capacity: int = 0, *, graph_phase: str | None = None) -> None:
+        """Wait until every Worker owns admission, preserving independent identities.
+
+        Only V4 Full capture/replay carries a graph phase, pairing each Frontend
+        graph with its independently captured Worker collective graph.
+        """
         if self._poisoned or self._active is not None:
             raise RuntimeError("graph control is poisoned or already executing a step")
+        paired = (
+            self.config.mode == "full"
+            and self.config.model.expert_compute == "deepseek_v4"
+            and phase in {"capture", "replay"}
+        )
+        if paired:
+            if graph_phase not in ("decode", "mixed"):
+                raise ValueError("V4 full capture/replay requires a graph phase")
+        elif graph_phase is not None:
+            raise ValueError("graph phase is only valid for V4 full capture/replay")
         self._sequence += 1
         self._deadline = time.monotonic() + self.config.timeout_seconds
         self._requests = [
@@ -197,6 +211,9 @@ class GraphStepControl:
             }
             for peer in self._peers
         ]
+        if paired:
+            for request in self._requests:
+                request["graph_phase"] = graph_phase
         self._active = self._requests[0]
         try:
             replies = self._fanout("begin")
