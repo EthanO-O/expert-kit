@@ -407,7 +407,8 @@ def test_graph_worker_requires_exact_v4_computation(tmp_path, field, value):
 
 
 @pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
-def test_full_graph_accepts_resident_backends(tmp_path, backend):
+@pytest.mark.parametrize("worker_count", [2, 8])
+def test_full_graph_accepts_resident_backends(tmp_path, backend, worker_count):
     raw = _config(tmp_path, backend=backend, device="npu:0")
     raw["model"].update(
         num_layers=48,
@@ -442,10 +443,10 @@ def test_full_graph_accepts_resident_backends(tmp_path, backend):
                 dict(
                     worker_id=f"worker-{i}",
                     control_endpoint=f"127.0.0.1:{18100 + i}",
-                    expert_start=64 * i,
-                    expert_end=64 * (i + 1),
+                    expert_start=(128 // worker_count) * i,
+                    expert_end=(128 // worker_count) * (i + 1),
                 )
-                for i in range(2)
+                for i in range(worker_count)
             ],
         ),
     )

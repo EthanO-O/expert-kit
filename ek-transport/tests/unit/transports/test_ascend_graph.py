@@ -260,11 +260,12 @@ def test_buffer_geometry_conflict_fails_before_process_group_creation():
         )
 
 
-def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_ownership():
-    begin_barrier = threading.Barrier(2, timeout=2)
-    finish_arrived = [threading.Event(), threading.Event()]
+@pytest.mark.parametrize("worker_count", [2, 8])
+def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_ownership(worker_count):
+    begin_barrier = threading.Barrier(worker_count, timeout=2)
+    finish_arrived = [threading.Event() for _ in range(worker_count)]
     release_finish = threading.Event()
-    requests = [[], []]
+    requests = [[] for _ in range(worker_count)]
     fail_finish = [False]
     servers = []
     ports = []
@@ -285,7 +286,7 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
     def finish_for(rank):
         def finish(request, *, timeout):
             finish_arrived[rank].set()
-            if rank == 1:
+            if rank == worker_count - 1:
                 assert release_finish.wait(2)
                 if fail_finish[0]:
                     raise GraphCompletionUnproven("peer completion failed")
@@ -293,14 +294,24 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
 
         return finish
 
-    with ThreadPoolExecutor(max_workers=4) as rpc_executor, ThreadPoolExecutor(1) as caller:
-        for rank in range(2):
+    with (
+        ThreadPoolExecutor(max_workers=2 * worker_count) as rpc_executor,
+        ThreadPoolExecutor(1) as caller,
+    ):
+        for rank in range(worker_count):
             server = grpc.server(rpc_executor)
             server.add_generic_rpc_handlers((control_handler(begin_for(rank), finish_for(rank)),))
             ports.append(server.add_insecure_port("127.0.0.1:0"))
             server.start()
             servers.append(server)
-        control = GraphStepControl(two_worker_config(ports))
+        if worker_count == 8:
+            data = qwen_config_data()
+            for worker, port in zip(data["workers"], ports, strict=True):
+                worker["control_endpoint"] = f"127.0.0.1:{port}"
+            config = AscendGraphConfig.model_validate(data)
+        else:
+            config = two_worker_config(ports)
+        control = GraphStepControl(config)
         try:
             control.begin("prepare")
             deadline = control._deadline
@@ -310,7 +321,7 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
             release_finish.set()
             pending.result(timeout=2)
             control.begin("capture", 4)
-            for rank in range(2):
+            for rank in range(worker_count):
                 assert requests[rank][-1]["worker_start_id"] == f"start-{rank}"
                 assert requests[rank][-1]["ready_revision"] == 7 + rank
             fail_finish[0] = True
@@ -523,3 +534,65 @@ def test_real_buffer_allocation_selects_multiworker_fp32_reduction(workers):
                 assert torch.equal(buffers.output, torch.full_like(buffers.output, 1.234567))
         else:
             assert session._group.broadcasts == 2 and session._group.reductions == 0
+
+
+def qwen_config_data():
+    """Declare the exact Qwen checkpoint with eight contiguous resident shards."""
+    data = v4_config_data()
+    data["model"].update(
+        num_layers=48,
+        experts_per_layer=128,
+        hidden_dim=2048,
+        expert_intermediate_dim=768,
+        top_k=8,
+        expert_compute="swiglu",
+        swiglu_limit=0.0,
+    )
+    data["layer_ids"] = list(range(48))
+    for rank, worker in enumerate(data["workers"]):
+        worker.update(expert_start=rank * 16, expert_end=(rank + 1) * 16)
+    return data
+
+
+@pytest.mark.parametrize("mode", ["decode", "full"])
+def test_exact_qwen_accepts_eight_ordered_16_expert_shards(mode):
+    data = qwen_config_data()
+    data["mode"] = mode
+    config = AscendGraphConfig.model_validate(data)
+    assert [config.worker_rank(f"worker{rank}") for rank in range(8)] == list(range(1, 9))
+    assert (
+        AscendGraphConfig.model_validate_json(config.model_dump_json()).identity()
+        == config.identity()
+    )
+
+
+@pytest.mark.parametrize("mode", ["decode", "full"])
+@pytest.mark.parametrize(
+    "change", ["missing", "reversed", "gap", "overlap", "layers", "geometry", "quantization"]
+)
+def test_eight_qwen_shards_reject_incomplete_or_inexact_declarations(mode, change):
+    data = qwen_config_data()
+    data["mode"] = mode
+    if change == "missing":
+        data["workers"].pop()
+    elif change == "reversed":
+        data["workers"].reverse()
+    elif change == "gap":
+        data["workers"][3]["expert_start"] += 1
+    elif change == "overlap":
+        data["workers"][3]["expert_start"] -= 1
+    elif change == "layers":
+        data["layer_ids"].pop()
+    elif change == "geometry":
+        data["model"]["expert_intermediate_dim"] = 769
+    else:
+        data["model"]["quantization"] = None
+    with pytest.raises(ValidationError, match="partition"):
+        AscendGraphConfig.model_validate(data)
+
+
+def test_eight_qwen_full_graph_keeps_token_capacity_limit():
+    data = qwen_config_data()
+    data.update(mode="full", capture_sizes=[4096])
+    with pytest.raises(ValidationError, match="capacity cannot exceed 2048"):
+        AscendGraphConfig.model_validate(data)

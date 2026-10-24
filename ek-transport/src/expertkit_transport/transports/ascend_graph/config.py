@@ -133,6 +133,15 @@ class AscendGraphConfig(BaseModel):
             raise ValueError("provide workers or both legacy Worker fields")
         participants = self.participants
         boundaries = [0, *(worker.expert_end for worker in participants)]
+        qwen = (
+            self.model.num_layers,
+            self.model.experts_per_layer,
+            self.model.hidden_dim,
+            self.model.expert_intermediate_dim,
+            self.model.top_k,
+            self.model.expert_compute,
+        ) == (48, 128, 2048, 768, 8, "swiglu") and self.model.quantization is not None
+        qwen_eight = qwen and len(participants) == 8
         v4 = (
             self.model.num_layers,
             self.model.experts_per_layer,
@@ -143,9 +152,16 @@ class AscendGraphConfig(BaseModel):
             self.model.swiglu_limit,
         ) == (43, 256, 4096, 2048, 6, "deepseek_v4", 10.0) and self.model.quantization is not None
         if (
-            (len(participants) != 8 if v4 else len(participants) not in (1, 2))
+            (len(participants) != 8 if v4 else len(participants) not in (1, 2) and not qwen_eight)
             or (
                 v4 and any(worker.expert_end - worker.expert_start != 32 for worker in participants)
+            )
+            or (
+                qwen_eight
+                and (
+                    self.layer_ids != tuple(range(48))
+                    or any(worker.expert_end - worker.expert_start != 16 for worker in participants)
+                )
             )
             or boundaries[-1] != self.model.experts_per_layer
             or any(
@@ -155,28 +171,22 @@ class AscendGraphConfig(BaseModel):
         ):
             raise ValueError(
                 "graph Workers must partition all model experts into one or two fixed intervals, "
-                "or eight 32-expert intervals for the exact ModelSlim V4 declaration"
+                "or eight 16-expert Qwen / 32-expert V4 intervals for exact ModelSlim declarations"
             )
         if self.layer_ids[-1] >= self.model.num_layers:
             raise ValueError("graph layer IDs exceed model.num_layers")
         if self.mode == "full":
-            geometry = (
-                self.model.num_layers,
-                self.model.experts_per_layer,
-                self.model.hidden_dim,
-                self.model.expert_intermediate_dim,
-                self.model.top_k,
-                self.model.expert_compute,
-            )
             if (
-                geometry != (48, 128, 2048, 768, 8, "swiglu")
-                or self.model.quantization is None
+                not qwen
                 or self.layer_ids != tuple(range(48))
                 or tuple((worker.expert_start, worker.expert_end) for worker in participants)
-                != ((0, 64), (64, 128))
+                not in (
+                    ((0, 64), (64, 128)),
+                    tuple((start, start + 16) for start in range(0, 128, 16)),
+                )
             ):
                 raise ValueError(
-                    "full graph mode requires the complete two-Worker Qwen3 W8A8 model"
+                    "full graph mode requires the complete two- or eight-Worker Qwen3 W8A8 model"
                 )
             if max(self.capture_sizes) > 2048:
                 raise ValueError("full graph token capacity cannot exceed 2048")

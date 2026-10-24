@@ -180,6 +180,41 @@ def test_qwen_full_generation_keeps_request_limit_separate_from_token_capacity(
         assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
 
 
+@pytest.mark.parametrize("mode", ["decode", "full"])
+@pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
+def test_qwen_generation_supports_eight_contiguous_resident_workers(tmp_path, mode, backend):
+    from expertkit_worker.config import WorkerConfig
+
+    examples = ASCEND / "configs/qwen3-30b-a3b-w8a8"
+    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
+    cluster["expert"]["backend"] = backend
+    cluster["pools"][0]["devices"] = list(range(1, 9))
+    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
+    graph = experiment["ascend_decode_graph"]
+    graph["mode"] = mode
+    graph["workers"] = [
+        dict(
+            worker_id=f"worker-pool1-worker-{rank:02d}",
+            control_endpoint=f"192.0.2.10:{18079 + rank}",
+            expert_start=rank * 16,
+            expert_end=(rank + 1) * 16,
+        )
+        for rank in range(8)
+    ]
+    result = _generate(tmp_path, cluster, experiment)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "generated"
+    shared = json.loads((output / "ascend-decode-graph.json").read_text())
+    assert shared["mode"] == mode
+    configs = sorted((output / "worker-pool1/workers").glob("*.yaml"))
+    assert len(configs) == 8
+    for rank, path in enumerate(configs, 1):
+        worker = WorkerConfig.model_validate(yaml.safe_load(path.read_text()))
+        assert worker.worker.backend.value == backend
+        assert worker.worker.ascend_decode_graph.worker_rank(worker.worker.id) == rank
+        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
+
+
 def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path):
     from expertkit_worker.config import WorkerConfig
 

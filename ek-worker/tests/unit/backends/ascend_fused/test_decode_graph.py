@@ -83,8 +83,17 @@ def cpu_operators(monkeypatch):
     return operators
 
 
-def weights(quantized, *, device="cpu", hidden=4, intermediate=6, experts=(1, 2), layers=1):
-    table = ReadyWeightTable(layers, 4)
+def weights(
+    quantized,
+    *,
+    device="cpu",
+    hidden=4,
+    intermediate=6,
+    experts=(1, 2),
+    layers=1,
+    experts_per_layer=4,
+):
+    table = ReadyWeightTable(layers, experts_per_layer)
     generator = torch.Generator().manual_seed(196)
     for layer in range(layers):
         for expert in experts:
@@ -114,11 +123,21 @@ def weights(quantized, *, device="cpu", hidden=4, intermediate=6, experts=(1, 2)
     return table
 
 
-def resident(table, quantized, *, interval=(1, 3), layers=(0,), v4=False, hidden=4, intermediate=6):
+def resident(
+    table,
+    quantized,
+    *,
+    interval=(1, 3),
+    layers=(0,),
+    v4=False,
+    hidden=4,
+    intermediate=6,
+    experts_per_layer=4,
+):
     factory = create_modelslim_graph_weights if quantized else ResidentAscendFusedGraphWeights
     return factory(
         layer_ids=layers,
-        experts_per_layer=4,
+        experts_per_layer=experts_per_layer,
         hidden_dim=hidden,
         intermediate_dim=intermediate,
         top_k=2,
@@ -360,3 +379,26 @@ def test_native_capture_replays_changing_routes_like_eager(quantized):
                 stream.synchronize()
                 graph = None
                 provider.close(wait_for_completion=stream.synchronize)
+
+
+@pytest.mark.parametrize("interval", [(0, 16), (48, 64), (112, 128)])
+def test_modelslim_sixteen_expert_shards_mask_global_routes(cpu_operators, interval):
+    start, end = interval
+    table = weights(True, experts=range(start, end), experts_per_layer=128)
+    provider = resident(table, True, interval=interval, experts_per_layer=128)
+    hidden = torch.ones(3, 4, dtype=torch.bfloat16)
+    routing = torch.tensor([[0.25, 0.75]] * 3)
+    outside = 127 if start == 0 else start - 1
+    try:
+        for pair in ((start, end - 1), (outside, outside), (end - 1, end % 128)):
+            ids = torch.tensor([pair] * 3, dtype=torch.int32)
+            output = torch.full_like(hidden, float("nan"))
+            provider.compute(0, hidden, ids, routing, output)
+            expected = eager_reference(table, True, hidden, ids, routing, interval=interval)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            if pair == (outside, outside):
+                assert not output.count_nonzero()
+        assert table.usage_count(0, start) == table.usage_count(0, end - 1) == 1
+    finally:
+        provider.close(wait_for_completion=lambda: None)
+    assert table.usage_count(0, start) == table.usage_count(0, end - 1) == 0

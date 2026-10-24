@@ -87,12 +87,13 @@ def cpu_ordered_combine(
 
 
 @pytest.mark.parametrize("direct_combine", [False, True])
-@pytest.mark.parametrize("expert_range", [(0, 2), (2, 3)])
+@pytest.mark.parametrize("expert_range", [(0, 2), (2, 3), (0, 16), (48, 64), (112, 128)])
 def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
     expert_range, direct_combine
 ):
     generator = torch.Generator().manual_seed(61)
-    table = ReadyWeightTable(1, 3)
+    experts_per_layer = 128 if expert_range[1] - expert_range[0] == 16 else 3
+    table = ReadyWeightTable(1, experts_per_layer)
     weights = {}
     for expert in range(*expert_range):
         weight = TorchModelSlimW8A8Weights(
@@ -111,7 +112,7 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
     operators = CpuModelSlimOperators()
     resident = ResidentModelSlimExpertGraphWeights(
         layer_ids=(0,),
-        experts_per_layer=3,
+        experts_per_layer=experts_per_layer,
         hidden_dim=4,
         intermediate_dim=6,
         top_k=2,
@@ -123,7 +124,17 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
     if direct_combine:
         resident._ordered_combine = cpu_ordered_combine
     try:
-        for pair in ((0, 1), (2, 2), (1, 2), (2, 1)):
+        pairs = ((0, 1), (2, 2), (1, 2), (2, 1))
+        if experts_per_layer == 128:
+            start, end = expert_range
+            nonlocal_id = 127 if start == 0 else start - 1
+            pairs = (
+                (start, end - 1),
+                (nonlocal_id, nonlocal_id),
+                (nonlocal_id, start),
+                (end - 1, end % 128),
+            )
+        for pair in pairs:
             hidden = torch.randn(3, 4, generator=generator).bfloat16()
             hidden[0].zero_()
             ids = torch.tensor([pair] * 3, dtype=torch.int32)
