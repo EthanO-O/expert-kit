@@ -55,14 +55,16 @@ def test_default_instance_resolution_round_trip() -> None:
     assert decoded_response == response
 
 
+@pytest.mark.parametrize("weight_version", ["", "revision-1", "revision with spaces"])
 @pytest.mark.parametrize("graph_endpoint", ["", "worker-0:50053"])
-def test_registration_round_trip_uses_one_device(graph_endpoint: str) -> None:
+def test_registration_round_trip_uses_one_device(graph_endpoint: str, weight_version: str) -> None:
     request = lifecycle_pb2.RegisterWorkerRequest(
         worker_id="worker-0",
         start_id="start-1",
         instance_id=7,
         computation_endpoint="worker-0:50051",
         graph_control_endpoint=graph_endpoint,
+        weight_version=weight_version,
         peer_weight_endpoint="http://worker-0:50052",
         backend="torch",
         activation_dtype=common_pb2.ACTIVATION_DTYPE_BF16,
@@ -77,7 +79,9 @@ def test_registration_round_trip_uses_one_device(graph_endpoint: str) -> None:
 
     assert decoded == request
     assert decoded.graph_control_endpoint == graph_endpoint
+    assert decoded.weight_version == weight_version
     assert request.DESCRIPTOR.fields_by_name["graph_control_endpoint"].number == 13
+    assert request.DESCRIPTOR.fields_by_name["weight_version"].number == 14
     assert decoded.device.device == "cuda:0"
     assert decoded.device.max_experts == 8
     assert decoded.transport_type == lifecycle_pb2.WORKER_TRANSPORT_GRPC
@@ -140,6 +144,7 @@ def test_worker_route_publishes_all_dispatch_limits() -> None:
         "max_batch_tokens": 7,
         "transport_type": 8,
         "graph_control_endpoint": 9,
+        "weight_version": 10,
     }
 
 
@@ -201,17 +206,27 @@ def test_empty_target_list_is_one_explicit_part() -> None:
     assert len(message.targets.experts) == 0
 
 
+@pytest.mark.parametrize("weight_version", ["", "revision-1", "revision with spaces"])
 @pytest.mark.parametrize("graph_endpoint", ["", "worker-0:50053"])
-def test_worker_route_round_trip_preserves_optional_graph_endpoint(graph_endpoint: str) -> None:
+def test_worker_route_round_trip_preserves_optional_graph_endpoint(
+    graph_endpoint: str, weight_version: str
+) -> None:
     route = lifecycle_pb2.WorkerRoute(
         worker_id="worker-0",
         start_id="start-1",
         computation_endpoint="worker-0:50051",
         graph_control_endpoint=graph_endpoint,
+        weight_version=weight_version,
         transport_type=lifecycle_pb2.WORKER_TRANSPORT_SHM,
     )
     decoded = lifecycle_pb2.WorkerRoute.FromString(route.SerializeToString())
     assert decoded == route
     assert decoded.graph_control_endpoint == graph_endpoint
+    assert decoded.weight_version == weight_version
     assert decoded.computation_endpoint == "worker-0:50051"
     assert decoded.transport_type == lifecycle_pb2.WORKER_TRANSPORT_SHM
+
+
+def test_old_worker_messages_default_to_empty_weight_version():
+    assert lifecycle_pb2.RegisterWorkerRequest.FromString(b"").weight_version == ""
+    assert lifecycle_pb2.WorkerRoute.FromString(b"").weight_version == ""

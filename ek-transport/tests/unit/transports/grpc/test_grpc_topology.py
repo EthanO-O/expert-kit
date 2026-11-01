@@ -449,3 +449,56 @@ def test_topology_rejects_inconsistent_graph_endpoint_for_one_worker_start() -> 
             installed_version=0,
             installed_routes={},
         )
+
+
+@pytest.mark.parametrize(
+    "version", ["", "revision-1", "revision with spaces", " ", "版本", "x" * 256]
+)
+def test_topology_preserves_optional_weight_version_in_snapshot_and_update(version):
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    advertised = worker("worker-a")
+    advertised.weight_version = version
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    completed = messages.consume(
+        snapshot(1, [route(0, 0, advertised)]), installed_version=0, installed_routes={}
+    )
+    assert completed is not None
+    installed_version, descriptions = completed
+    assert descriptions[(0, 0)][0].weight_version == version
+    advertised.weight_version = "new-version"
+    changed = update(
+        1, 2, [lifecycle_pb2.RouteChange(layer_id=0, expert_id=0, replicas=[advertised])]
+    )
+    completed = messages.consume(
+        changed, installed_version=installed_version, installed_routes=descriptions
+    )
+    assert completed is not None
+    assert completed[1][(0, 0)][0].weight_version == "new-version"
+
+
+@pytest.mark.parametrize("version", ["x" * 257, "版" * 257])
+def test_topology_rejects_malformed_weight_version(version):
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    advertised = worker("worker-a")
+    advertised.weight_version = version
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    with pytest.raises(TopologyProtocolError, match="weight_version"):
+        messages.consume(
+            snapshot(1, [route(0, 0, advertised)]), installed_version=0, installed_routes={}
+        )
+
+
+def test_topology_rejects_inconsistent_weight_version_for_one_worker_start():
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    first, second = worker("worker-a"), worker("worker-a")
+    first.weight_version, second.weight_version = "one", "two"
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    with pytest.raises(TopologyProtocolError, match="inconsistent topology metadata"):
+        messages.consume(
+            snapshot(1, [route(0, 0, first), route(0, 1, second)]),
+            installed_version=0,
+            installed_routes={},
+        )

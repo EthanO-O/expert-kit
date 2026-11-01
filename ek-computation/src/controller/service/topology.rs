@@ -170,6 +170,7 @@ mod tests {
                     instance_id: 7,
                     computation_endpoint: "127.0.0.1:50051".to_owned(),
                     graph_control_endpoint: String::new(),
+                    weight_version: String::new(),
                     peer_weight_endpoint: "http://127.0.0.1:50052".to_owned(),
                     backend: "torch".to_owned(),
                     activation_dtype: ActivationDType::ActivationDtypeBf16 as i32,

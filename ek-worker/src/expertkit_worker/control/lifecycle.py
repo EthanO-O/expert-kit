@@ -69,6 +69,7 @@ class WorkerRegistration:
     max_pending_batches: int
     transport_type: str
     graph_control_endpoint: str = ""
+    weight_version: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -90,6 +91,8 @@ class WorkerRegistration:
             _require_positive_int(name, getattr(self, name), _UINT32_MAX)
         if self.graph_control_endpoint != "":
             validate_graph_control_endpoint(self.graph_control_endpoint)
+        if not isinstance(self.weight_version, str) or len(self.weight_version) > 256:
+            raise ValueError("weight_version must be a string of at most 256 characters")
         if self.activation_dtype not in ACTIVATION_DTYPES:
             raise ValueError("activation_dtype must be FP16, BF16, or FP32")
         if self.transport_type not in _TRANSPORT_TO_PROTO:
@@ -115,6 +118,7 @@ class WorkerRegistration:
             max_pending_batches_per_device=self.max_pending_batches,
             transport_type=_TRANSPORT_TO_PROTO[self.transport_type],
             graph_control_endpoint=self.graph_control_endpoint,
+            weight_version=self.weight_version,
         )
 
 

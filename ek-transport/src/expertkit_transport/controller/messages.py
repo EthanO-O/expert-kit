@@ -29,6 +29,7 @@ class WorkerRoute:
     max_batch_tokens: int
     transport_type: int
     graph_control_endpoint: str = ""
+    weight_version: str = ""
 
     @property
     def max_in_flight(self) -> int:
@@ -239,6 +240,8 @@ class TopologyMessageAssembler:
                         validate_graph_control_endpoint(replica.graph_control_endpoint)
                     except ValueError as error:
                         raise TopologyProtocolError(str(error)) from error
+                if len(replica.weight_version) > 256:
+                    raise TopologyProtocolError("weight_version must have at most 256 characters")
                 identity = WorkerIdentity(replica.worker_id, replica.start_id)
                 if identity in identities:
                     raise TopologyProtocolError("topology route repeats one Worker process")
@@ -252,6 +255,7 @@ class TopologyMessageAssembler:
                     max_batch_tokens=replica.max_batch_tokens,
                     transport_type=replica.transport_type,
                     graph_control_endpoint=replica.graph_control_endpoint,
+                    weight_version=replica.weight_version,
                 )
                 existing = worker_metadata.setdefault(identity, description)
                 if existing != description:

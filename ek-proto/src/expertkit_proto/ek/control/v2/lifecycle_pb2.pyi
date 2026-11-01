@@ -44,7 +44,7 @@ class ResolveDefaultInstanceResponse(_message.Message):
     def __init__(self, instance_id: _Optional[int] = ..., model_name: _Optional[str] = ..., instance_name: _Optional[str] = ...) -> None: ...
 
 class RegisterWorkerRequest(_message.Message):
-    __slots__ = ("worker_id", "start_id", "instance_id", "computation_endpoint", "peer_weight_endpoint", "backend", "activation_dtype", "device", "max_batch_tokens", "max_active_batches_per_device", "max_pending_batches_per_device", "transport_type", "graph_control_endpoint")
+    __slots__ = ("worker_id", "start_id", "instance_id", "computation_endpoint", "peer_weight_endpoint", "backend", "activation_dtype", "device", "max_batch_tokens", "max_active_batches_per_device", "max_pending_batches_per_device", "transport_type", "graph_control_endpoint", "weight_version")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     START_ID_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -58,6 +58,7 @@ class RegisterWorkerRequest(_message.Message):
     MAX_PENDING_BATCHES_PER_DEVICE_FIELD_NUMBER: _ClassVar[int]
     TRANSPORT_TYPE_FIELD_NUMBER: _ClassVar[int]
     GRAPH_CONTROL_ENDPOINT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHT_VERSION_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     start_id: str
     instance_id: int
@@ -71,7 +72,8 @@ class RegisterWorkerRequest(_message.Message):
     max_pending_batches_per_device: int
     transport_type: WorkerTransportType
     graph_control_endpoint: str
-    def __init__(self, worker_id: _Optional[str] = ..., start_id: _Optional[str] = ..., instance_id: _Optional[int] = ..., computation_endpoint: _Optional[str] = ..., peer_weight_endpoint: _Optional[str] = ..., backend: _Optional[str] = ..., activation_dtype: _Optional[_Union[_common_pb2.ActivationDType, str]] = ..., device: _Optional[_Union[WorkerDevice, _Mapping]] = ..., max_batch_tokens: _Optional[int] = ..., max_active_batches_per_device: _Optional[int] = ..., max_pending_batches_per_device: _Optional[int] = ..., transport_type: _Optional[_Union[WorkerTransportType, str]] = ..., graph_control_endpoint: _Optional[str] = ...) -> None: ...
+    weight_version: str
+    def __init__(self, worker_id: _Optional[str] = ..., start_id: _Optional[str] = ..., instance_id: _Optional[int] = ..., computation_endpoint: _Optional[str] = ..., peer_weight_endpoint: _Optional[str] = ..., backend: _Optional[str] = ..., activation_dtype: _Optional[_Union[_common_pb2.ActivationDType, str]] = ..., device: _Optional[_Union[WorkerDevice, _Mapping]] = ..., max_batch_tokens: _Optional[int] = ..., max_active_batches_per_device: _Optional[int] = ..., max_pending_batches_per_device: _Optional[int] = ..., transport_type: _Optional[_Union[WorkerTransportType, str]] = ..., graph_control_endpoint: _Optional[str] = ..., weight_version: _Optional[str] = ...) -> None: ...
 
 class WorkerDevice(_message.Message):
     __slots__ = ("device", "max_experts")
@@ -164,7 +166,7 @@ class ExpertRoute(_message.Message):
     def __init__(self, layer_id: _Optional[int] = ..., expert_id: _Optional[int] = ..., replicas: _Optional[_Iterable[_Union[WorkerRoute, _Mapping]]] = ...) -> None: ...
 
 class WorkerRoute(_message.Message):
-    __slots__ = ("worker_id", "start_id", "computation_endpoint", "device", "max_active_batches", "max_pending_batches", "max_batch_tokens", "transport_type", "graph_control_endpoint")
+    __slots__ = ("worker_id", "start_id", "computation_endpoint", "device", "max_active_batches", "max_pending_batches", "max_batch_tokens", "transport_type", "graph_control_endpoint", "weight_version")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     START_ID_FIELD_NUMBER: _ClassVar[int]
     COMPUTATION_ENDPOINT_FIELD_NUMBER: _ClassVar[int]
@@ -174,6 +176,7 @@ class WorkerRoute(_message.Message):
     MAX_BATCH_TOKENS_FIELD_NUMBER: _ClassVar[int]
     TRANSPORT_TYPE_FIELD_NUMBER: _ClassVar[int]
     GRAPH_CONTROL_ENDPOINT_FIELD_NUMBER: _ClassVar[int]
+    WEIGHT_VERSION_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     start_id: str
     computation_endpoint: str
@@ -183,7 +186,8 @@ class WorkerRoute(_message.Message):
     max_batch_tokens: int
     transport_type: WorkerTransportType
     graph_control_endpoint: str
-    def __init__(self, worker_id: _Optional[str] = ..., start_id: _Optional[str] = ..., computation_endpoint: _Optional[str] = ..., device: _Optional[str] = ..., max_active_batches: _Optional[int] = ..., max_pending_batches: _Optional[int] = ..., max_batch_tokens: _Optional[int] = ..., transport_type: _Optional[_Union[WorkerTransportType, str]] = ..., graph_control_endpoint: _Optional[str] = ...) -> None: ...
+    weight_version: str
+    def __init__(self, worker_id: _Optional[str] = ..., start_id: _Optional[str] = ..., computation_endpoint: _Optional[str] = ..., device: _Optional[str] = ..., max_active_batches: _Optional[int] = ..., max_pending_batches: _Optional[int] = ..., max_batch_tokens: _Optional[int] = ..., transport_type: _Optional[_Union[WorkerTransportType, str]] = ..., graph_control_endpoint: _Optional[str] = ..., weight_version: _Optional[str] = ...) -> None: ...
 
 class RouteChange(_message.Message):
     __slots__ = ("layer_id", "expert_id", "replicas")

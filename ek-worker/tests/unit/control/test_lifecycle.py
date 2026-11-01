@@ -315,3 +315,18 @@ def test_control_factory_only_advertises_its_configured_graph_endpoint(graph_ena
 def test_registration_rejects_non_string_graph_endpoint(endpoint: Any) -> None:
     with pytest.raises(ValueError, match="graph_control_endpoint"):
         replace(_registration(), graph_control_endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "version", ["", "revision-1", "revision with spaces", " ", "版本", "x" * 256]
+)
+def test_registration_preserves_optional_weight_version(version):
+    request = replace(_registration(), weight_version=version).to_protobuf()
+    assert request.weight_version == version
+    assert request.start_id == "start-1"
+
+
+@pytest.mark.parametrize("version", [None, 0, False, "x" * 257])
+def test_registration_rejects_invalid_weight_version(version):
+    with pytest.raises(ValueError, match="weight_version"):
+        replace(_registration(), weight_version=version)

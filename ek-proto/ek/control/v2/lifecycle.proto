@@ -42,6 +42,8 @@ message RegisterWorkerRequest {
   WorkerTransportType transport_type = 12;
   // Optional Host gRPC graph-control address in host:port form; empty disables advertisement.
   string graph_control_endpoint = 13;
+  // Optional resolved checkpoint version; empty preserves legacy ordinary Worker registration.
+  string weight_version = 14;
 }
 
 message WorkerDevice {
@@ -134,6 +136,8 @@ message WorkerRoute {
   WorkerTransportType transport_type = 8;
   // Optional Host gRPC graph-control address; empty means no graph capability is advertised.
   string graph_control_endpoint = 9;
+  // Optional registered checkpoint version; graph sessions require a nonempty consistent value.
+  string weight_version = 10;
 }
 
 // RouteChange replaces the complete replica list; an empty list removes the route.

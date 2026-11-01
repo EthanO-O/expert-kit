@@ -1109,6 +1109,11 @@ fn validate_registration(registration: &RegisterWorkerRequest) -> Result<(), Con
             "device and capacity limits must be positive",
         ));
     }
+    if registration.weight_version.chars().count() > 256 {
+        return Err(ControllerStateError::InvalidRegistration(
+            "weight version must have at most 256 characters",
+        ));
+    }
     validate_host_port(&registration.computation_endpoint)?;
     if !registration.graph_control_endpoint.is_empty() {
         if registration.graph_control_endpoint.starts_with(':')
@@ -1367,6 +1372,7 @@ fn worker_route(worker: &WorkerRecord) -> WorkerRoute {
         max_batch_tokens: worker.registration.max_batch_tokens,
         transport_type: worker.registration.transport_type,
         graph_control_endpoint: worker.registration.graph_control_endpoint.clone(),
+        weight_version: worker.registration.weight_version.clone(),
     }
 }
 
@@ -1504,6 +1510,7 @@ mod tests {
             instance_id: 7,
             computation_endpoint: "127.0.0.1:50051".to_owned(),
             graph_control_endpoint: String::new(),
+            weight_version: String::new(),
             peer_weight_endpoint: "http://127.0.0.1:50052".to_owned(),
             backend: "torch".to_owned(),
             activation_dtype: ActivationDType::ActivationDtypeBf16 as i32,
@@ -1653,10 +1660,15 @@ mod tests {
 
     #[tokio::test]
     async fn ready_routes_publish_the_optional_graph_endpoint_without_changing_placement() {
-        for endpoint in ["", "worker-0:50053", "[::1]:65535"] {
+        for (endpoint, weight_version) in [
+            ("", ""),
+            ("worker-0:50053", "revision with spaces"),
+            ("[::1]:65535", "版本"),
+        ] {
             let state = ControllerRuntimeState::new(8);
             let mut request = registration("worker-0", "start-0");
             request.graph_control_endpoint = endpoint.to_owned();
+            request.weight_version = weight_version.to_owned();
             state.register(request).await.unwrap();
             let lease = state.open_heartbeat("worker-0", "start-0").await.unwrap();
             state
@@ -1696,6 +1708,7 @@ mod tests {
             );
             let route = &snapshot.routes[0].replicas[0];
             assert_eq!(route.graph_control_endpoint, endpoint);
+            assert_eq!(route.weight_version, weight_version);
             assert_eq!(route.computation_endpoint, "127.0.0.1:50051");
             assert_eq!(
                 route.transport_type,
@@ -1703,6 +1716,66 @@ mod tests {
             );
             assert_eq!(route.start_id, "start-0");
         }
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_malformed_optional_weight_versions() {
+        let state = ControllerRuntimeState::new(8);
+        for version in ["x".repeat(257), "版".repeat(257)] {
+            let mut request = registration("worker-0", "start-0");
+            request.weight_version = version;
+            assert!(matches!(
+                state.register(request).await,
+                Err(ControllerStateError::InvalidRegistration(
+                    "weight version must have at most 256 characters"
+                ))
+            ));
+        }
+        assert_eq!(state.topology_version(7).await, 0);
+        for version in [
+            "",
+            "revision-1",
+            "revision with spaces",
+            " ",
+            &"版".repeat(256),
+        ] {
+            let mut request = registration("worker-0", version);
+            request.start_id = format!("start-{}", version.chars().count());
+            request.weight_version = version.to_owned();
+            state.register(request).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_weight_version_requires_a_new_worker_start() {
+        let state = ControllerRuntimeState::new(8);
+        let mut request = registration("worker-0", "start-0");
+        request.weight_version = "revision-1".to_owned();
+        state.register(request.clone()).await.unwrap();
+        state.register(request.clone()).await.unwrap();
+        request.weight_version = "revision-2".to_owned();
+        assert!(matches!(
+            state.register(request.clone()).await,
+            Err(ControllerStateError::InvalidRegistration(_))
+        ));
+        assert_eq!(
+            state
+                .registration("worker-0", "start-0")
+                .await
+                .unwrap()
+                .weight_version,
+            "revision-1"
+        );
+        request.start_id = "start-1".to_owned();
+        state.register(request).await.unwrap();
+        assert_eq!(
+            state
+                .registration("worker-0", "start-1")
+                .await
+                .unwrap()
+                .weight_version,
+            "revision-2"
+        );
     }
 
     #[tokio::test]
