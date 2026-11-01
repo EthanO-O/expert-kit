@@ -14,12 +14,14 @@ from typing import Any
 
 import structlog
 import torch
-from expertkit_transport.ascend_graph import AscendGraphConfig, GraphStepControl, HcclGraphSession
-from expertkit_transport.quarantine import retain_until_process_exit
-from expertkit_transport.transports.ascend_graph.config import (
+from expertkit_transport.ascend_graph import (
+    AscendGraphConfig,
     AscendGraphModel,
     AscendGraphQuantization,
+    GraphStepControl,
+    HcclGraphSession,
 )
+from expertkit_transport.quarantine import retain_until_process_exit
 
 logger = structlog.get_logger(__name__)
 _ACTIVE: ContextVar[DecodeGraphSession | None] = ContextVar("ek_decode_graph_session", default=None)
