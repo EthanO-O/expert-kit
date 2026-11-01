@@ -7,7 +7,7 @@ Capture, HCCL and replay remain the executor's responsibility.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import NotRequired, TypedDict, Unpack
 
@@ -32,6 +32,7 @@ class _GraphWeightsOptions(TypedDict):
     acquire_many: Callable[[int, tuple[int, ...]], ReadyWeightLease[PackedReadyWeights]]
     ready_revision: Callable[[], int]
     expert_range: NotRequired[tuple[int, int] | None]
+    expert_ids_by_layer: NotRequired[Mapping[int, tuple[int, ...]] | None]
     expert_compute: NotRequired[str]
     swiglu_limit: NotRequired[float]
 
@@ -64,6 +65,7 @@ class ResidentAscendFusedGraphWeights:
         acquire_many: Callable[[int, tuple[int, ...]], ReadyWeightLease[PackedReadyWeights]],
         ready_revision: Callable[[], int],
         expert_range: tuple[int, int] | None = None,
+        expert_ids_by_layer: Mapping[int, tuple[int, ...]] | None = None,
         expert_compute: str = "swiglu",
         swiglu_limit: float = 0.0,
         compute_type: AscendFusedComputeType = AscendFusedComputeType.UNQUANTIZED,
@@ -77,6 +79,7 @@ class ResidentAscendFusedGraphWeights:
             expert_range,
             expert_compute,
             swiglu_limit,
+            expert_ids_by_layer,
         )
         self._compute_type = compute_type
         self._weight_type = _COMPUTE_TYPE_TO_WEIGHTS[compute_type]
@@ -85,6 +88,7 @@ class ResidentAscendFusedGraphWeights:
         self._owner = ResidentWeightOwner[PackedReadyWeights](ready_revision)
         self._device: torch.device | None = None
         self._prepared: dict[int, _PreparedLayer] = {}
+        self._routing_maps: dict[int, torch.Tensor | None] = {}
         try:
             self._owner.acquire(self._profile, acquire_many, self._validate_weights)
         except BaseException:
@@ -92,6 +96,9 @@ class ResidentAscendFusedGraphWeights:
             raise
         try:
             self._prepare_layers(compute_type)
+            assert self._device is not None
+            for layer in self._profile.layer_ids:
+                self._routing_maps[layer] = self._profile.routing_map(layer, self._device)
             self.require_current()
         except BaseException:
             self.quarantine()
@@ -115,11 +122,6 @@ class ResidentAscendFusedGraphWeights:
                 prepared.w2_scale.append(weight.w2_scale.to(torch.bfloat16))
 
     def _validate_weights(self, lease: ReadyWeightLease[PackedReadyWeights]) -> None:
-        start, end = self._profile.interval
-        if lease.expert_ids != tuple(range(start, end)) or len(lease.objects) != end - start:
-            raise ValueError(
-                "resident Ascend fused graph requires the complete local expert interval"
-            )
         for weight in lease.objects:
             if not isinstance(weight, self._weight_type):
                 raise ValueError("resident Ascend fused graph received the wrong ready weight type")
@@ -172,12 +174,20 @@ class ResidentAscendFusedGraphWeights:
             prepared_output,
         )
         prepared = self._prepared[layer_id]
-        start, end = self._profile.interval
-        # Identify routes assigned to this Worker's contiguous shard [start, end).
-        local_mask = (expert_ids >= start) & (expert_ids < end)
-        # Map global IDs to local weight-list indices. Nonlocal routes use the
-        # inactive sentinel E = end - start, one past the last local expert.
-        local_ids = torch.where(local_mask, expert_ids - start, end - start)
+        if not prepared.w13:
+            prepared_output.zero_()
+            return
+        interval = self._profile.layer_interval(layer_id)
+        mapping = self._routing_maps[layer_id]
+        if interval is not None:
+            start, end = interval
+            local_mask = (expert_ids >= start) & (expert_ids < end)
+            local_ids = torch.where(local_mask, expert_ids - start, end - start)
+        else:
+            assert mapping is not None
+            mapped = mapping.index_select(0, expert_ids.flatten().long()).reshape_as(expert_ids)
+            local_mask = mapped < len(prepared.w13)
+            local_ids = mapped.clamp(max=len(prepared.w13))
         # Cast routing weights to the activation dtype and zero nonlocal contributions.
         local_weights = routing_weights.to(hidden_states.dtype).masked_fill(~local_mask, 0)
         result = run_ascend_fused_moe(
@@ -202,6 +212,7 @@ class ResidentAscendFusedGraphWeights:
             raise
         if self._owner.closed:
             self._prepared.clear()
+            self._routing_maps.clear()
 
     def quarantine(self) -> None:
         if self._owner.closed or self._owner.quarantined:

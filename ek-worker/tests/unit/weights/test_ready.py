@@ -150,3 +150,47 @@ def test_quarantined_lease_wakes_withdrawal_without_releasing_weight() -> None:
     del errors, lease, table, weight, thread
     gc.collect()
     assert retained() is not None
+
+
+def test_lease_current_checks_selected_storage_and_closed_state():
+    table = ReadyWeightTable(2, 4)
+    table.publish(0, 0, object())
+    table.publish(0, 2, object())
+    lease = table.acquire_many(0, (0, 2))
+    lease.require_current()
+    table.publish(1, 3, object())
+    table.begin_withdrawal(1, 3)
+    lease.require_current()
+    table.begin_withdrawal(0, 2)
+    with pytest.raises(RuntimeError, match="invalidated"):
+        lease.require_current()
+    lease.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        lease.require_current()
+
+
+def test_lease_current_checks_entry_identity_even_without_revision_change():
+    table = ReadyWeightTable(1, 1)
+    table.publish(0, 0, object())
+    lease = table.acquire_many(0, (0,))
+    original = table._entries[0][0]
+    # Simulate a broken storage owner replacing an entry despite a retained lease.
+    with table._condition:
+        table._entries[0][0] = None
+    try:
+        with pytest.raises(RuntimeError, match="invalidated"):
+            lease.require_current()
+    finally:
+        with table._condition:
+            table._entries[0][0] = original
+        lease.close()
+
+
+def test_empty_lease_current_rejects_quarantined_table():
+    table = ReadyWeightTable(1, 1)
+    lease = table.acquire_many(0, ())
+    lease.require_current()
+    table.quarantine()
+    with pytest.raises(RuntimeError, match="quarantined"):
+        lease.require_current()
+    lease.close()

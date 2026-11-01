@@ -12,8 +12,10 @@ def native_operators(monkeypatch):
     monkeypatch.setattr(op, "torch_npu", operators)
 
 
+@pytest.mark.parametrize("experts", [1, 2])
 def test_dynamic_w8a8_passes_list_weights_and_scales_to_gmm(
     monkeypatch: pytest.MonkeyPatch,
+    experts: int,
 ) -> None:
     calls: list[dict[str, object]] = []
 
@@ -22,7 +24,7 @@ def test_dynamic_w8a8_passes_list_weights_and_scales_to_gmm(
         return (
             hidden.to(torch.int8),
             torch.tensor([0, 1], dtype=torch.int32),
-            torch.tensor([1, 1], dtype=torch.int32),
+            torch.tensor([2] if experts == 1 else [1, 1], dtype=torch.int32),
             torch.ones(hidden.shape[0], dtype=torch.float32),
         )
 
@@ -31,7 +33,9 @@ def test_dynamic_w8a8_passes_list_weights_and_scales_to_gmm(
         x = kwargs["x"]
         weight = kwargs["weight"]
         assert isinstance(x, list) and isinstance(weight, list)
-        return [torch.ones((x[0].shape[0], weight[0].shape[1]), dtype=torch.bfloat16)]
+        assert kwargs["group_list_type"] == (0 if experts == 1 else 1)
+        assert all(matrix.ndim == (3 if experts == 1 else 2) for matrix in weight)
+        return [torch.ones((x[0].shape[0], weight[0].shape[-1]), dtype=torch.bfloat16)]
 
     def dynamic_quant(x: torch.Tensor, **_kwargs: object):
         return x.to(torch.int8), torch.ones(x.shape[0], dtype=torch.float32)
@@ -51,13 +55,13 @@ def test_dynamic_w8a8_passes_list_weights_and_scales_to_gmm(
     monkeypatch.setattr(op.torch_npu, "npu_dynamic_quant", dynamic_quant, raising=False)
     monkeypatch.setattr(op.torch_npu, "npu_moe_token_unpermute", unpermute, raising=False)
 
-    w13 = [torch.ones((2, 4), dtype=torch.int8) for _ in range(2)]
-    w2 = [torch.ones((2, 2), dtype=torch.int8) for _ in range(2)]
-    w13_scale = [torch.ones(4, dtype=torch.float32) for _ in range(2)]
-    w2_scale = [torch.ones(2, dtype=torch.float32) for _ in range(2)]
+    w13 = [torch.ones((2, 4), dtype=torch.int8) for _ in range(experts)]
+    w2 = [torch.ones((2, 2), dtype=torch.int8) for _ in range(experts)]
+    w13_scale = [torch.ones(4, dtype=torch.float32) for _ in range(experts)]
+    w2_scale = [torch.ones(2, dtype=torch.float32) for _ in range(experts)]
     output = op.run_ascend_fused_moe(
         torch.ones((2, 2), dtype=torch.bfloat16),
-        torch.tensor([[0], [1]], dtype=torch.int32),
+        torch.tensor([[0], [experts - 1]], dtype=torch.int32),
         torch.ones((2, 1), dtype=torch.float32),
         w13=w13,
         w2=w2,
@@ -69,10 +73,20 @@ def test_dynamic_w8a8_passes_list_weights_and_scales_to_gmm(
     route_call = calls[0]
     first_gmm, second_gmm = (call for call in calls if call["operator"] == "gmm")
     assert route_call["quant_mode"] == 1
-    assert first_gmm["weight"] is w13
-    assert all(torch.equal(a, b) for a, b in zip(first_gmm["scale"], w13_scale, strict=True))
-    assert second_gmm["weight"] is w2
-    assert all(torch.equal(a, b) for a, b in zip(second_gmm["scale"], w2_scale, strict=True))
+    if experts == 1:
+        assert first_gmm["weight"][0].shape == (1, *w13[0].shape)
+        assert first_gmm["weight"][0].data_ptr() == w13[0].data_ptr()
+        assert second_gmm["weight"][0].shape == (1, *w2[0].shape)
+        assert second_gmm["weight"][0].data_ptr() == w2[0].data_ptr()
+    else:
+        assert first_gmm["weight"] is w13
+        assert second_gmm["weight"] is w2
+    assert all(
+        torch.equal(a.reshape_as(b), b) for a, b in zip(first_gmm["scale"], w13_scale, strict=True)
+    )
+    assert all(
+        torch.equal(a.reshape_as(b), b) for a, b in zip(second_gmm["scale"], w2_scale, strict=True)
+    )
     assert all(scale.dtype is torch.bfloat16 for scale in first_gmm["scale"] + second_gmm["scale"])
     assert all(scale.dtype is torch.float32 for scale in w13_scale + w2_scale)
     assert first_gmm["output_dtype"] is torch.bfloat16
@@ -93,14 +107,17 @@ def test_dynamic_w8a8_requires_both_scale_lists() -> None:
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-def test_clipped_swiglu_routes_after_down_projection(monkeypatch, quantized):
+@pytest.mark.parametrize("clip", [0, 2.5, 10, 13])
+def test_clipped_swiglu_routes_after_down_projection(monkeypatch, quantized, clip):
     calls = []
     hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
     ids = torch.tensor([[1], [0]], dtype=torch.int32)
     routing = torch.tensor([[0.1234567], [0.7654321]])
-    gate_up = torch.tensor([[12.0, -12.0, 14.0, -14.0], [2.0, 3.0, 4.0, 5.0]], dtype=torch.bfloat16)
+    gate_up = torch.tensor([[20.0, -20.0, 24.0, -24.0], [2.0, 3.0, 4.0, 5.0]], dtype=torch.bfloat16)
     gate, up = gate_up.chunk(2, dim=-1)
-    activated = torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
+    if clip > 0:
+        gate, up = gate.clamp(max=clip), up.clamp(-clip, clip)
+    activated = torch.nn.functional.silu(gate) * up
     down = torch.tensor([[3.0, 7.0], [11.0, 13.0]], dtype=torch.bfloat16)
 
     def route(*args, **kwargs):
@@ -118,7 +135,8 @@ def test_clipped_swiglu_routes_after_down_projection(monkeypatch, quantized):
     def swiglu(x, *, dim):
         gate, up = x.chunk(2, dim=dim)
         assert x.dtype is torch.bfloat16
-        assert gate.max() <= 10 and up.abs().max() <= 10
+        if clip > 0:
+            assert gate.max() <= clip and up.abs().max() <= clip
         return torch.nn.functional.silu(gate) * up
 
     def quantize(x, **kwargs):
@@ -140,7 +158,7 @@ def test_clipped_swiglu_routes_after_down_projection(monkeypatch, quantized):
             if quantized
             else op.AscendFusedComputeType.UNQUANTIZED
         ),
-        swiglu_limit=10.0,
+        swiglu_limit=clip,
     )
     if quantized:
         options.update(w13_scale=[torch.ones(4)] * 2, w2_scale=[torch.ones(2)] * 2)

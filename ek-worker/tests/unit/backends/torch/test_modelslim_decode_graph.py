@@ -844,3 +844,182 @@ def test_ordered_combine_precompile_failure_quarantines_allocations_and_lease(mo
     assert len(resident._combine_temporaries) == 7
     resident.close(wait_for_completion=lambda: None)
     assert len(resident._combine_temporaries) == 7
+
+
+@pytest.mark.parametrize("clip", [None, 0, 2.5, 10, 13])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_per_layer_noncontiguous_empty_and_varying_modelslim_groups(clip, output_dtype):
+    v4 = clip is not None
+    generator = torch.Generator().manual_seed(754)
+    selection = {2: (1,), 1: (0, 128, 256), 0: ()}
+    table = ReadyWeightTable(3, 257)
+    weights = {}
+    for layer, experts in selection.items():
+        for expert in experts:
+            weight = TorchModelSlimW8A8Weights(
+                tuple(
+                    torch.randint(-8, 9, shape, generator=generator, dtype=torch.int8)
+                    for shape in ((4, 6), (4, 6), (6, 4))
+                ),
+                tuple(torch.rand(width, generator=generator) / 8 + 0.001 for width in (6, 6, 4)),
+                torch.bfloat16,
+            )
+            table.publish(layer, expert, weight)
+            weights[layer, expert] = weight
+    operators = CpuModelSlimOperators()
+    resident = ResidentModelSlimExpertGraphWeights(
+        layer_ids=(0, 1, 2),
+        experts_per_layer=257,
+        hidden_dim=4,
+        intermediate_dim=6,
+        top_k=2,
+        acquire_many=table.acquire_many,
+        ready_revision=lambda: table.revision,
+        expert_ids_by_layer=selection,
+        operators=operators,
+        expert_compute="deepseek_v4" if v4 else "swiglu",
+        swiglu_limit=clip if v4 else 0,
+    )
+    hidden = (torch.randn(4, 4, generator=generator) * 20).bfloat16()
+    routing = torch.tensor([[0.125, 0.75], [0.25, 0.5], [0.375, 0.25], [0.0, 1.0]])
+    output = torch.full((4, 4), float("nan"), dtype=output_dtype)
+    try:
+        for layer in resident.layer_ids:
+            assert resident._layers[layer].expert_ids == selection[layer]
+            for ids in (
+                torch.tensor([[256, 0], [1, 129], [128, 128], [129, 256]], dtype=torch.int32),
+                torch.tensor([[2, 2]] * 4, dtype=torch.int32),
+            ):
+                for stale in (float("nan"), 17.0):
+                    output.fill_(stale)
+                    pointer = output.data_ptr()
+                    before = len(operators.calls)
+                    resident.compute(layer, hidden, ids, routing, output)
+                    expected = torch.zeros(4, 4)
+                    for row in range(4):
+                        for column in sorted(range(2), key=lambda c: (int(ids[row, c]), c)):
+                            expert = int(ids[row, column])
+                            if expert not in selection[layer]:
+                                continue
+                            weight = weights[layer, expert]
+                            gate, up = (
+                                projection(
+                                    hidden[row : row + 1], weight.matrices[p], weight.scales[p]
+                                )
+                                for p in (0, 1)
+                            )
+                            if v4:
+                                gate, up = gate.float(), up.float()
+                                if clip > 0:
+                                    gate, up = gate.clamp(max=clip), up.clamp(-clip, clip)
+                                intermediate = (
+                                    functional.silu(gate) * up * routing[row, column]
+                                ).bfloat16()
+                            else:
+                                intermediate = functional.silu(gate) * up
+                            down = projection(intermediate, weight.matrices[2], weight.scales[2])
+                            expected[row] += (
+                                down[0].float() if v4 else down[0].float() * routing[row, column]
+                            )
+                    assert output.data_ptr() == pointer
+                    torch.testing.assert_close(
+                        output, expected.bfloat16().to(output_dtype), rtol=0, atol=0
+                    )
+                    if not selection[layer]:
+                        assert len(operators.calls) == before
+                        assert torch.equal(output, torch.zeros_like(output))
+        assert len(resident._fp32_scales) == 2
+        assert all(table.usage_count(layer, expert) == 1 for layer, expert in weights)
+    finally:
+        resident.close(wait_for_completion=lambda: None)
+    assert all(table.usage_count(layer, expert) == 0 for layer, expert in weights)
+
+
+@pytest.mark.parametrize(
+    "layout,expected_interval",
+    [
+        ("legacy_lower", (0, 64)),
+        ("explicit_lower", (0, 64)),
+        ("legacy_upper", (64, 128)),
+        ("explicit_upper", (64, 128)),
+        ("mixed_halves", None),
+        ("empty_layer", None),
+        ("noncontiguous_layer", None),
+        ("different_counts", None),
+        ("uniform_noncontiguous", None),
+    ],
+)
+def test_qwen_ordered_combine_eligibility_uses_equivalent_uniform_layout(
+    monkeypatch, layout, expected_interval
+):
+    class NpuDevice:
+        type = "npu"
+
+        def __eq__(self, other):
+            return other is self or other == torch.device("cpu")
+
+    device = NpuDevice()
+    monkeypatch.setattr(TorchModelSlimW8A8Weights, "device", property(lambda self: device))
+    monkeypatch.setitem(sys.modules, "torch_npu", CpuModelSlimOperators())
+    original_tensor = torch.tensor
+
+    def allocate_on_cpu(*args, **kwargs):
+        if kwargs.get("device") is device:
+            kwargs["device"] = "cpu"
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", allocate_on_cpu)
+    selections = {
+        "explicit_lower": {1: tuple(range(64)), 0: tuple(range(64))},
+        "explicit_upper": {1: tuple(range(64, 128)), 0: tuple(range(64, 128))},
+        "mixed_halves": {0: tuple(range(64)), 1: tuple(range(64, 128))},
+        "empty_layer": {0: tuple(range(64)), 1: ()},
+        "noncontiguous_layer": {0: tuple(range(64)), 1: tuple(range(0, 128, 2))},
+        "different_counts": {0: tuple(range(64)), 1: tuple(range(63))},
+        "uniform_noncontiguous": {0: tuple(range(0, 128, 2)), 1: tuple(range(0, 128, 2))},
+    }
+    interval = (64, 128) if layout == "legacy_upper" else (0, 64)
+    selection = selections.get(layout, {0: tuple(range(*interval)), 1: tuple(range(*interval))})
+    prepared_intervals = []
+
+    def prepare_existing_kernel(provider):
+        prepared_intervals.append((provider._expert_start, provider._expert_end))
+        provider._ordered_combine = cpu_ordered_combine
+
+    monkeypatch.setattr(
+        ResidentModelSlimExpertGraphWeights, "_prepare_ordered_combine", prepare_existing_kernel
+    )
+    gate = torch.zeros(2048, 768, dtype=torch.int8)
+    down = torch.zeros(768, 2048, dtype=torch.int8)
+    weight = TorchModelSlimW8A8Weights(
+        (gate, gate, down),
+        (torch.ones(768), torch.ones(768), torch.ones(2048)),
+        torch.bfloat16,
+    )
+    table = ReadyWeightTable(2, 128)
+    for layer, experts in selection.items():
+        for expert in experts:
+            table.publish(layer, expert, weight)
+    provider = ResidentModelSlimExpertGraphWeights(
+        layer_ids=(0, 1),
+        experts_per_layer=128,
+        hidden_dim=2048,
+        intermediate_dim=768,
+        top_k=8,
+        acquire_many=table.acquire_many,
+        ready_revision=lambda: table.revision,
+        **(
+            {"expert_range": interval}
+            if layout.startswith("legacy")
+            else {"expert_ids_by_layer": selection}
+        ),
+    )
+    try:
+        assert prepared_intervals == ([] if expected_interval is None else [expected_interval])
+        assert (provider._ordered_combine is not None) == (expected_interval is not None)
+        if expected_interval is not None:
+            assert (provider._expert_start, provider._expert_end) == expected_interval
+            assert all(mapping is None for mapping in provider._routing_maps.values())
+        assert provider.layer_ids == (0, 1)
+    finally:
+        provider.close(wait_for_completion=lambda: None)

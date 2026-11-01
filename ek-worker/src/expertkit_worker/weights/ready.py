@@ -45,6 +45,19 @@ class ReadyWeightLease[T]:
         self._close_lock = threading.Lock()
         self._closed = False
 
+    def require_current(self) -> None:
+        """Reject closed leases or selected storage that no longer accepts work."""
+        with self._close_lock, self._table._condition:
+            if self._closed or self._table._quarantined:
+                raise RuntimeError("ready weight lease is closed or quarantined")
+            if any(
+                self._table._entries[self._layer_id][expert_id] is not entry or not entry.accepting
+                for expert_id, entry in zip(self.expert_ids, self._entries, strict=True)
+            ):
+                raise RuntimeError(
+                    "ready weight lease was invalidated by a selected storage change"
+                )
+
     def quarantine(self) -> None:
         """Retain the table and wake withdrawal waiters without releasing this lease."""
 
@@ -83,8 +96,8 @@ class ReadyWeightTable[T]:
     def revision(self) -> int:
         """Return a storage revision changed before withdrawal can wait for users.
 
-        Graph owners freeze this value after acquiring their leases and check it
-        before admitting work. Lease acquisition and release do not change it.
+        Graph owners use changes to trigger validation of their selected leases.
+        Lease acquisition and release do not change this value.
         """
         with self._condition:
             return self._revision

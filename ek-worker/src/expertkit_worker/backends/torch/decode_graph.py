@@ -7,7 +7,7 @@ device completion before closing the resident weights.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from importlib import import_module
 from typing import Protocol
 
@@ -16,6 +16,7 @@ import torch.nn.functional as functional
 from expertkit_transport.quarantine import retain_until_process_exit
 
 from expertkit_worker.backends.graph_common import (
+    ASCEND_ROUTING_MAX_EXPERTS,
     ResidentGraphProfile,
     ResidentWeightOwner,
 )
@@ -59,6 +60,7 @@ class ResidentExpertGraphWeights:
         ready_revision: Callable[[], int],
         operators: ExpertGraphOperators | None = None,
         expert_range: tuple[int, int] | None = None,
+        expert_ids_by_layer: Mapping[int, tuple[int, ...]] | None = None,
         expert_compute: str = "swiglu",
         swiglu_limit: float = 0.0,
     ) -> None:
@@ -71,7 +73,13 @@ class ResidentExpertGraphWeights:
             expert_range,
             expert_compute,
             swiglu_limit,
+            expert_ids_by_layer,
         )
+        if experts_per_layer > ASCEND_ROUTING_MAX_EXPERTS:
+            raise ValueError(
+                f"resident Torch routing requires at most {ASCEND_ROUTING_MAX_EXPERTS} "
+                "global experts"
+            )
         start, end = self._profile.interval
         self._expert_compute = expert_compute
         self._swiglu_limit = swiglu_limit
@@ -85,6 +93,7 @@ class ResidentExpertGraphWeights:
         self._experts_per_layer = experts_per_layer
         self._layers = self._owner.layers
         self._device: torch.device | None = None
+        self._routing_maps: dict[int, torch.Tensor | None] = {}
         try:
             self._owner.acquire(self._profile, acquire_many, self._validate_weights)
             if operators is None:
@@ -93,6 +102,14 @@ class ResidentExpertGraphWeights:
                 self._operators = import_module("torch_npu")
         except BaseException:
             self._owner.close(wait_for_completion=lambda: None)
+            raise
+
+        try:
+            assert self._device is not None
+            for layer in self._profile.layer_ids:
+                self._routing_maps[layer] = self._profile.routing_map(layer, self._device)
+        except BaseException:
+            self.quarantine()
             raise
 
     @property
@@ -141,12 +158,23 @@ class ResidentExpertGraphWeights:
             raise RuntimeError("resident graph weights are closed or quarantined")
         weights = self._layers[layer_id]
         self._validate_inputs(hidden_states, expert_ids, routing_weights, prepared_output)
+        if not weights.objects:
+            prepared_output.zero_()
+            return
+        interval = self._profile.layer_interval(layer_id)
+        start, end = interval if interval is not None else (0, len(weights.objects))
+        mapping = self._routing_maps[layer_id]
+        routed_ids = (
+            expert_ids
+            if mapping is None
+            else mapping.index_select(0, expert_ids.flatten().long()).reshape_as(expert_ids)
+        )
         operators = self._operators
         assert operators is not None
         capacity = hidden_states.shape[0]
         packed, original_rows, counts, _ = operators.npu_moe_init_routing_v2(
             hidden_states,
-            expert_ids,
+            routed_ids,
             active_num=capacity * self._top_k,
             expert_num=self._experts_per_layer,
             drop_pad_mode=0,
@@ -157,15 +185,15 @@ class ResidentExpertGraphWeights:
             row_idx_type=1,
         )
         global_original_rows = original_rows
-        group_list = counts[self._expert_start : self._expert_end].to(torch.int64)
+        group_list = counts[start:end].to(torch.int64)
         local_rows = None
         offset: int | torch.Tensor = 0
         local_count: int | torch.Tensor = capacity * self._top_k
-        if self._expert_start != 0 or self._expert_end != self._experts_per_layer:
+        if start != 0 or end != self._experts_per_layer:
             # All global assignments are packed, so every source index is defined.
             # The local prefix is useful; fixed tail gathers stay in bounds.
             rows = torch.arange(capacity * self._top_k, device=hidden_states.device)
-            offset = counts[: self._expert_start].sum()
+            offset = counts[:start].sum()
             indices = (rows + offset).clamp(max=capacity * self._top_k - 1).long()
             packed = packed.index_select(0, indices)
             original_rows = original_rows.index_select(0, indices)
@@ -182,8 +210,10 @@ class ResidentExpertGraphWeights:
         gate = self._project(packed, weights, 0, group_list)
         up = self._project(packed, weights, 1, group_list)
         if self._expert_compute == "deepseek_v4":
-            gate = gate.float().clamp(max=self._swiglu_limit)
-            up = up.float().clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
+            gate, up = gate.float(), up.float()
+            if self._swiglu_limit > 0:
+                gate = gate.clamp(max=self._swiglu_limit)
+                up = up.clamp(min=-self._swiglu_limit, max=self._swiglu_limit)
             intermediate = (functional.silu(gate) * up * routing).to(torch.bfloat16)
         else:
             intermediate = functional.silu(gate) * up
@@ -237,6 +267,8 @@ class ResidentExpertGraphWeights:
         """
         try:
             self._owner.close(wait_for_completion=wait_for_completion)
+            if self._closed:
+                self._routing_maps.clear()
         except BaseException:
             self.quarantine()
             raise
@@ -256,20 +288,23 @@ class ResidentExpertGraphWeights:
         group_list: torch.Tensor,
     ) -> torch.Tensor:
         assert self._operators is not None
+        matrices = [weight.tensors[projection].t() for weight in lease.objects]
+        singleton = len(matrices) == 1
+        if singleton:
+            # A single group uses a leading weight axis and cumulative endpoints.
+            matrices[0] = matrices[0].unsqueeze(0)
         return self._operators.npu_grouped_matmul(
             [inputs],
-            [weight.tensors[projection].t() for weight in lease.objects],
+            matrices,
             group_list=group_list,
             split_item=2,
             group_type=0,
-            group_list_type=1,
+            group_list_type=0 if singleton else 1,
         )[0]
 
     def _validate_weights(self, lease: ReadyWeightLease[TorchExpertWeights]) -> None:
         if self._expert_compute == "deepseek_v4":
             raise ValueError("resident V4 graph requires ModelSlim I8 weights")
-        if lease.expert_ids != tuple(range(self._expert_start, self._expert_end)):
-            raise ValueError("resident graph requires its local experts in logical order")
         for weight in lease.objects:
             if not isinstance(weight, TorchExpertWeights):
                 raise ValueError("resident graph requires unquantized Torch expert weights")

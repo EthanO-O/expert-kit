@@ -25,6 +25,12 @@ from expertkit_worker.backends.base import (
     ComputeBackend,
     InvalidBackendInput,
 )
+from expertkit_worker.backends.graph_common import (
+    ASCEND_GROUPED_MAX_EXPERTS as _ASCEND_GROUPED_MAX_EXPERTS,
+)
+from expertkit_worker.backends.graph_common import (
+    ASCEND_ROUTING_MAX_EXPERTS as _ASCEND_ROUTING_MAX_EXPERTS,
+)
 from expertkit_worker.backends.torch.fp4 import fp8_activation_reference
 from expertkit_worker.backends.torch.modelslim_w8a8 import (
     TorchModelSlimW8A8Weights,
@@ -45,8 +51,6 @@ type AcquireTorchWeights = Callable[
 
 # Reserve the measured NPU temporary peak in addition to explicit expert tensors.
 _ASCEND_GROUPED_TEMPORARY_BYTES = 16 * 1024 * 1024
-_ASCEND_ROUTING_MAX_EXPERTS = 10240
-_ASCEND_GROUPED_MAX_EXPERTS = 128
 
 
 class _TorchCompletion(BackendCompletion):

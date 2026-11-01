@@ -47,6 +47,13 @@ class CpuFusedOperators:
         return packed, inverse, counts, scale
 
     def npu_grouped_matmul(self, *, x, weight, group_list, **options):
+        singleton = group_list.numel() == 1
+        assert options["group_list_type"] == (0 if singleton else 1)
+        assert all(matrix.ndim == (3 if singleton else 2) for matrix in weight)
+        if singleton:
+            assert weight[0].shape[0] == 1
+            if "scale" in options:
+                assert options["scale"][0].ndim == 2 and options["scale"][0].shape[0] == 1
         self.gmms.append((weight, options))
         matrices = [w[0] if w.ndim == 3 else w for w in weight]
         result = torch.zeros(x[0].shape[0], matrices[0].shape[-1], dtype=torch.bfloat16)
@@ -402,3 +409,80 @@ def test_modelslim_sixteen_expert_shards_mask_global_routes(cpu_operators, inter
     finally:
         provider.close(wait_for_completion=lambda: None)
     assert table.usage_count(0, start) == table.usage_count(0, end - 1) == 0
+
+
+@pytest.mark.parametrize(
+    "quantized,clip", [(False, None), (True, None), (True, 0), (True, 2.5), (True, 10), (True, 13)]
+)
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_per_layer_noncontiguous_and_empty_fused_layout(
+    cpu_operators, quantized, clip, output_dtype
+):
+    v4 = clip is not None
+    table = weights(quantized, layers=3, experts=range(5), experts_per_layer=10241)
+    selection = {2: (1,), 1: (0, 2, 4), 0: ()}
+    provider = ResidentAscendFusedGraphWeights(
+        layer_ids=(0, 1, 2),
+        experts_per_layer=10241,
+        hidden_dim=4,
+        intermediate_dim=6,
+        top_k=2,
+        acquire_many=table.acquire_many,
+        ready_revision=lambda: table.revision,
+        expert_ids_by_layer=selection,
+        expert_compute="deepseek_v4" if v4 else "swiglu",
+        swiglu_limit=clip if v4 else 0,
+        compute_type=(
+            AscendFusedComputeType.DYNAMIC_W8A8 if quantized else AscendFusedComputeType.UNQUANTIZED
+        ),
+    )
+    hidden = torch.arange(16).reshape(4, 4).bfloat16() / 16
+    ids = torch.tensor([[4, 0], [1, 3], [2, 2], [3, 4]], dtype=torch.int32)
+    routing = torch.tensor([[0.125, 0.75]] * 4)
+    output = torch.full((4, 4), float("nan"), dtype=output_dtype)
+    try:
+        assert provider.layer_ids == (0, 1, 2)
+        assert provider._routing_maps[2] is None
+        for layer in provider.layer_ids:
+            assert provider._owner.layers[layer].expert_ids == selection[layer]
+            for stale in (float("nan"), 17.0):
+                output.fill_(stale)
+                pointer = output.data_ptr()
+                before = len(cpu_operators.routes)
+                provider.compute(layer, hidden, ids, routing, output)
+                if not selection[layer]:
+                    assert len(cpu_operators.routes) == before
+                    assert torch.equal(output, torch.zeros_like(output))
+                    continue
+                expected_routes = torch.full_like(ids, len(selection[layer]))
+                for local, expert in enumerate(selection[layer]):
+                    expected_routes[ids == expert] = local
+                assert torch.equal(cpu_operators.routes[-1], expected_routes)
+                lease = table.acquire_many(layer, selection[layer])
+                try:
+                    expected = run_ascend_fused_moe(
+                        hidden,
+                        expected_routes,
+                        routing.bfloat16().masked_fill(expected_routes == len(selection[layer]), 0),
+                        w13=[weight.w13 for weight in lease.objects],
+                        w2=[weight.w2 for weight in lease.objects],
+                        compute_type=provider._compute_type,
+                        w13_scale=[weight.w13_scale for weight in lease.objects]
+                        if quantized
+                        else None,
+                        w2_scale=[weight.w2_scale for weight in lease.objects]
+                        if quantized
+                        else None,
+                        swiglu_limit=clip if v4 else 0,
+                    )
+                finally:
+                    lease.close()
+                assert output.data_ptr() == pointer
+                torch.testing.assert_close(output, expected.to(output_dtype), rtol=0, atol=0)
+        assert all(
+            table.usage_count(layer, expert) == int(expert in selection[layer])
+            for layer in range(3)
+            for expert in range(5)
+        )
+    finally:
+        provider.close(wait_for_completion=lambda: None)

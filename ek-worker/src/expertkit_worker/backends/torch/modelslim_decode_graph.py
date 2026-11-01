@@ -10,7 +10,7 @@ Device graph execution and numerical equivalence still require qualification.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, cast
 
 import torch
@@ -49,6 +49,7 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         ready_revision: Callable[[], int],
         operators: ModelSlimGraphOperators | None = None,
         expert_range: tuple[int, int] | None = None,
+        expert_ids_by_layer: Mapping[int, tuple[int, ...]] | None = None,
         expert_compute: str = "swiglu",
         swiglu_limit: float = 0.0,
     ) -> None:
@@ -71,6 +72,7 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
             ready_revision=ready_revision,
             operators=operators,
             expert_range=expert_range,
+            expert_ids_by_layer=expert_ids_by_layer,
             expert_compute=expert_compute,
             swiglu_limit=swiglu_limit,
         )
@@ -88,6 +90,14 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         except BaseException:
             self.close(wait_for_completion=lambda: None)
             raise
+        uniform_interval = self._profile.layer_interval(self._profile.layer_ids[0])
+        if any(
+            self._profile.layer_interval(layer) != uniform_interval
+            for layer in self._profile.layer_ids
+        ):
+            uniform_interval = None
+        if uniform_interval is not None:
+            self._expert_start, self._expert_end = uniform_interval
         if (
             self._device is not None
             and self._device.type == "npu"
@@ -97,7 +107,7 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
             and intermediate_dim == 768
             and top_k == 8
             and expert_compute == "swiglu"
-            and expert_range in ((0, 64), (64, 128))
+            and uniform_interval in ((0, 64), (64, 128))
         ):
             try:
                 self._prepare_ordered_combine()
@@ -255,12 +265,9 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         order = (expert_ids.long() * self._top_k + columns).argsort(dim=1)
         assignments = rows.reshape(capacity, self._top_k).gather(1, order)
         positions = inverse.index_select(0, assignments.flatten()) - local_offset
-        sorted_ids = expert_ids.gather(1, order)
-        valid = (
-            (sorted_ids >= self._expert_start)
-            & (sorted_ids < self._expert_end)
-            & (positions.reshape(capacity, self._top_k) >= 0)
-            & (positions.reshape(capacity, self._top_k) < local_count)
+        # Only selected experts occupy this packed interval, including remapped layers.
+        valid = (positions.reshape(capacity, self._top_k) >= 0) & (
+            positions.reshape(capacity, self._top_k) < local_count
         )
         ordered = contribution.index_select(0, positions.clamp(0, rows.numel() - 1))
         ordered = ordered.reshape(capacity, self._top_k, self._hidden_dim)
@@ -286,6 +293,8 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
     def _prepare_projections(self) -> bool:
         """Retain GMM views and synchronously guard scales before capture begins."""
         for lease in self._layers.values():
+            if not lease.objects:
+                continue
             self._matrices[lease] = ([], [], [])
             singleton = len(lease.objects) == 1
             for projection in range(3):
@@ -298,6 +307,8 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
                     if not bool(torch.all(torch.isfinite(source) & (source > 0))):
                         return False
         for lease in self._layers.values():
+            if not lease.objects:
+                continue
             self._fp32_scales[lease] = []
             for projection in range(3):
                 # Publish each table before a later device allocation can fail.
@@ -307,8 +318,6 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         return True
 
     def _validate_weights(self, lease: ReadyWeightLease[TorchModelSlimW8A8Weights]) -> None:
-        if lease.expert_ids != tuple(range(self._expert_start, self._expert_end)):
-            raise ValueError("resident ModelSlim graph requires local experts in logical order")
         for weight in lease.objects:
             if not isinstance(weight, TorchModelSlimW8A8Weights):
                 raise ValueError("resident ModelSlim graph requires ModelSlim I8 ready weights")
