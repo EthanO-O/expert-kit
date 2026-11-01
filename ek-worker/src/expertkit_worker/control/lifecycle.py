@@ -18,6 +18,7 @@ from expertkit_proto.ek.control.v2 import (
 )
 from expertkit_proto.ek.worker.v2 import common_pb2
 from expertkit_transport.batches import ACTIVATION_DTYPES
+from expertkit_transport.transports.ascend_graph.contracts import validate_graph_control_endpoint
 
 _CONTROL_MESSAGE_BYTES = 1024 * 1024
 _UINT32_MAX = (1 << 32) - 1
@@ -67,6 +68,7 @@ class WorkerRegistration:
     max_active_batches: int
     max_pending_batches: int
     transport_type: str
+    graph_control_endpoint: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -86,6 +88,8 @@ class WorkerRegistration:
             "max_pending_batches",
         ):
             _require_positive_int(name, getattr(self, name), _UINT32_MAX)
+        if self.graph_control_endpoint != "":
+            validate_graph_control_endpoint(self.graph_control_endpoint)
         if self.activation_dtype not in ACTIVATION_DTYPES:
             raise ValueError("activation_dtype must be FP16, BF16, or FP32")
         if self.transport_type not in _TRANSPORT_TO_PROTO:
@@ -110,6 +114,7 @@ class WorkerRegistration:
             max_active_batches_per_device=self.max_active_batches,
             max_pending_batches_per_device=self.max_pending_batches,
             transport_type=_TRANSPORT_TO_PROTO[self.transport_type],
+            graph_control_endpoint=self.graph_control_endpoint,
         )
 
 

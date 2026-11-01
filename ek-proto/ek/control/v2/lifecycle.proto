@@ -40,6 +40,8 @@ message RegisterWorkerRequest {
   uint32 max_pending_batches_per_device = 11;
   // Data Transport exposed by this Worker. Unspecified values are rejected.
   WorkerTransportType transport_type = 12;
+  // Optional Host gRPC graph-control address in host:port form; empty disables advertisement.
+  string graph_control_endpoint = 13;
 }
 
 message WorkerDevice {
@@ -130,6 +132,8 @@ message WorkerRoute {
   uint32 max_batch_tokens = 7;
   // Data Transport required to connect to computation_endpoint.
   WorkerTransportType transport_type = 8;
+  // Optional Host gRPC graph-control address; empty means no graph capability is advertised.
+  string graph_control_endpoint = 9;
 }
 
 // RouteChange replaces the complete replica list; an empty list removes the route.

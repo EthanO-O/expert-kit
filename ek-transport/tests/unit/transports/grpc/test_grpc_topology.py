@@ -379,3 +379,73 @@ def test_ascend_route_capacity_is_validated_before_allocating_resources(pending:
             messages.consume(payload, installed_version=0, installed_routes={})
     else:
         assert messages.consume(payload, installed_version=0, installed_routes={}) is not None
+
+
+@pytest.mark.parametrize("graph_endpoint", ["", "worker-a:50053", "[::1]:65535"])
+def test_topology_preserves_optional_graph_endpoint_in_snapshots_and_updates(
+    graph_endpoint: str,
+) -> None:
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    advertised = worker("worker-a", transport_type=lifecycle_pb2.WORKER_TRANSPORT_SHM)
+    advertised.graph_control_endpoint = graph_endpoint
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    completed = messages.consume(
+        snapshot(1, [route(0, 0, advertised)]), installed_version=0, installed_routes={}
+    )
+    assert completed is not None
+    version, descriptions = completed
+    decoded = descriptions[(0, 0)][0]
+    assert decoded.graph_control_endpoint == graph_endpoint
+    assert decoded.endpoint == advertised.computation_endpoint
+    assert decoded.transport_type == lifecycle_pb2.WORKER_TRANSPORT_SHM
+
+    advertised.graph_control_endpoint = "worker-a:50054"
+    changed = update(
+        1, 2, [lifecycle_pb2.RouteChange(layer_id=0, expert_id=0, replicas=[advertised])]
+    )
+    completed = messages.consume(changed, installed_version=version, installed_routes=descriptions)
+    assert completed is not None
+    assert completed[1][(0, 0)][0].graph_control_endpoint == "worker-a:50054"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "worker",
+        ":5000",
+        "worker:0",
+        "worker:65536",
+        "worker:abc",
+        "http://worker:5000",
+        "bad host:5000",
+        "worker/path:5000",
+        "@worker:5000",
+    ],
+)
+def test_topology_rejects_malformed_graph_endpoint(endpoint: str) -> None:
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    advertised = worker("worker-a")
+    advertised.graph_control_endpoint = endpoint
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    with pytest.raises(TopologyProtocolError, match="graph_control_endpoint"):
+        messages.consume(
+            snapshot(1, [route(0, 0, advertised)]), installed_version=0, installed_routes={}
+        )
+
+
+def test_topology_rejects_inconsistent_graph_endpoint_for_one_worker_start() -> None:
+    from expertkit_transport.controller.messages import TopologyMessageAssembler
+
+    first = worker("worker-a")
+    second = worker("worker-a")
+    first.graph_control_endpoint = "worker-a:50053"
+    second.graph_control_endpoint = "worker-a:50054"
+    messages = TopologyMessageAssembler(instance_id=7, num_layers=10, experts_per_layer=10)
+    with pytest.raises(TopologyProtocolError, match="inconsistent topology metadata"):
+        messages.consume(
+            snapshot(1, [route(0, 0, first), route(0, 1, second)]),
+            installed_version=0,
+            installed_routes={},
+        )

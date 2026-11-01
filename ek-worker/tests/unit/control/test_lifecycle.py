@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Coroutine
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import grpc
@@ -233,3 +234,84 @@ def test_registration_advertises_ascend_transport_without_changing_start_identit
     ).to_protobuf()
     assert request.transport_type == lifecycle_pb2.WORKER_TRANSPORT_TRANSFER_ENGINE
     assert request.start_id == "start-1"
+
+
+@pytest.mark.parametrize("graph_endpoint", ["", "worker-0:50053", "[::1]:65535"])
+def test_registration_preserves_optional_graph_endpoint(graph_endpoint: str) -> None:
+    request = replace(_registration(), graph_control_endpoint=graph_endpoint).to_protobuf()
+    assert request.graph_control_endpoint == graph_endpoint
+    assert request.computation_endpoint == "worker-0:50051"
+    assert request.transport_type == lifecycle_pb2.WORKER_TRANSPORT_GRPC
+    assert request.start_id == "start-1"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "worker",
+        ":5000",
+        "worker:0",
+        "worker:65536",
+        "worker:abc",
+        "http://worker:5000",
+        "bad host:5000",
+        "worker/path:5000",
+        "@worker:5000",
+    ],
+)
+def test_registration_rejects_malformed_graph_endpoint(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="graph_control_endpoint"):
+        replace(_registration(), graph_control_endpoint=endpoint)
+
+
+@pytest.mark.parametrize("graph_enabled", [False, True])
+def test_control_factory_only_advertises_its_configured_graph_endpoint(graph_enabled: bool) -> None:
+    from expertkit_worker.control.factory import create_controller_supervisor
+    from expertkit_worker.control.state_reporter import ExpertStateReporter
+
+    graph = SimpleNamespace(
+        participants=(
+            SimpleNamespace(control_endpoint="other-worker:50053"),
+            SimpleNamespace(control_endpoint="worker-0:50053"),
+        ),
+        worker_rank=lambda worker_id: 2 if worker_id == "worker-0" else 1,
+    )
+    config = SimpleNamespace(
+        worker=SimpleNamespace(
+            id="worker-0",
+            backend=SimpleNamespace(value="torch"),
+            device="npu:0",
+            max_batch_tokens=4096,
+            max_active_batches_per_device=1,
+            shutdown_grace_secs=5,
+            ascend_decode_graph=graph if graph_enabled else None,
+        ),
+        controller=SimpleNamespace(
+            endpoint="controller:5002", heartbeat_interval_secs=1, heartbeat_timeout_secs=5
+        ),
+        transport=SimpleNamespace(max_pending_batches_per_device=1),
+        weight_manager=SimpleNamespace(peer=SimpleNamespace(advertise="http://worker-0:50052")),
+    )
+    supervisor = create_controller_supervisor(
+        config,
+        instance_id=7,
+        activation_dtype=torch.bfloat16,
+        receiver=object(),
+        manager=SimpleNamespace(max_experts=8),
+        reporter=ExpertStateReporter(
+            num_layers=2, experts_per_layer=8, max_updates=8, max_delay_ms=10
+        ),
+        computation_endpoint="worker-0:50051",
+        transport_type="grpc",
+        start_id="start-1",
+    )
+    registration = supervisor._registration.to_protobuf()
+    assert registration.graph_control_endpoint == ("worker-0:50053" if graph_enabled else "")
+    assert registration.computation_endpoint == "worker-0:50051"
+    assert registration.start_id == "start-1"
+
+
+@pytest.mark.parametrize("endpoint", [None, 0, False])
+def test_registration_rejects_non_string_graph_endpoint(endpoint: Any) -> None:
+    with pytest.raises(ValueError, match="graph_control_endpoint"):
+        replace(_registration(), graph_control_endpoint=endpoint)

@@ -1,5 +1,7 @@
 """Protocol tests for v2 lifecycle, Topology, and weight-control messages."""
 
+import pytest
+
 from expertkit_proto.ek.control.v2 import (
     lifecycle_pb2,
     lifecycle_pb2_grpc,
@@ -53,12 +55,14 @@ def test_default_instance_resolution_round_trip() -> None:
     assert decoded_response == response
 
 
-def test_registration_round_trip_uses_one_device() -> None:
+@pytest.mark.parametrize("graph_endpoint", ["", "worker-0:50053"])
+def test_registration_round_trip_uses_one_device(graph_endpoint: str) -> None:
     request = lifecycle_pb2.RegisterWorkerRequest(
         worker_id="worker-0",
         start_id="start-1",
         instance_id=7,
         computation_endpoint="worker-0:50051",
+        graph_control_endpoint=graph_endpoint,
         peer_weight_endpoint="http://worker-0:50052",
         backend="torch",
         activation_dtype=common_pb2.ACTIVATION_DTYPE_BF16,
@@ -72,6 +76,8 @@ def test_registration_round_trip_uses_one_device() -> None:
     decoded = lifecycle_pb2.RegisterWorkerRequest.FromString(request.SerializeToString())
 
     assert decoded == request
+    assert decoded.graph_control_endpoint == graph_endpoint
+    assert request.DESCRIPTOR.fields_by_name["graph_control_endpoint"].number == 13
     assert decoded.device.device == "cuda:0"
     assert decoded.device.max_experts == 8
     assert decoded.transport_type == lifecycle_pb2.WORKER_TRANSPORT_GRPC
@@ -133,6 +139,7 @@ def test_worker_route_publishes_all_dispatch_limits() -> None:
         "max_pending_batches": 6,
         "max_batch_tokens": 7,
         "transport_type": 8,
+        "graph_control_endpoint": 9,
     }
 
 
@@ -192,3 +199,19 @@ def test_empty_target_list_is_one_explicit_part() -> None:
     assert message.WhichOneof("message") == "targets"
     assert message.targets.part_count == 1
     assert len(message.targets.experts) == 0
+
+
+@pytest.mark.parametrize("graph_endpoint", ["", "worker-0:50053"])
+def test_worker_route_round_trip_preserves_optional_graph_endpoint(graph_endpoint: str) -> None:
+    route = lifecycle_pb2.WorkerRoute(
+        worker_id="worker-0",
+        start_id="start-1",
+        computation_endpoint="worker-0:50051",
+        graph_control_endpoint=graph_endpoint,
+        transport_type=lifecycle_pb2.WORKER_TRANSPORT_SHM,
+    )
+    decoded = lifecycle_pb2.WorkerRoute.FromString(route.SerializeToString())
+    assert decoded == route
+    assert decoded.graph_control_endpoint == graph_endpoint
+    assert decoded.computation_endpoint == "worker-0:50051"
+    assert decoded.transport_type == lifecycle_pb2.WORKER_TRANSPORT_SHM

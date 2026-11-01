@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from expertkit_proto.ek.control.v2 import lifecycle_pb2
 
 from expertkit_transport.routing import WorkerIdentity
+from expertkit_transport.transports.ascend_graph.contracts import validate_graph_control_endpoint
 
 _MAX_ROUTES_PER_PART = 64
 
@@ -27,6 +28,7 @@ class WorkerRoute:
     max_pending_batches: int
     max_batch_tokens: int
     transport_type: int
+    graph_control_endpoint: str = ""
 
     @property
     def max_in_flight(self) -> int:
@@ -232,6 +234,11 @@ class TopologyMessageAssembler:
                     and replica.max_active_batches + replica.max_pending_batches > 4096
                 ):
                     raise TopologyProtocolError("Transfer Engine capacity cannot exceed 4096")
+                if replica.graph_control_endpoint:
+                    try:
+                        validate_graph_control_endpoint(replica.graph_control_endpoint)
+                    except ValueError as error:
+                        raise TopologyProtocolError(str(error)) from error
                 identity = WorkerIdentity(replica.worker_id, replica.start_id)
                 if identity in identities:
                     raise TopologyProtocolError("topology route repeats one Worker process")
@@ -244,6 +251,7 @@ class TopologyMessageAssembler:
                     max_pending_batches=replica.max_pending_batches,
                     max_batch_tokens=replica.max_batch_tokens,
                     transport_type=replica.transport_type,
+                    graph_control_endpoint=replica.graph_control_endpoint,
                 )
                 existing = worker_metadata.setdefault(identity, description)
                 if existing != description:

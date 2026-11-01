@@ -1059,7 +1059,10 @@ fn validate_registration(registration: &RegisterWorkerRequest) -> Result<(), Con
             "identity, instance, and backend are required",
         ));
     }
-    if !matches!(registration.backend.as_str(), "torch" | "ggml" | "fused" | "ascend_fused" ) {
+    if !matches!(
+        registration.backend.as_str(),
+        "torch" | "ggml" | "fused" | "ascend_fused"
+    ) {
         return Err(ControllerStateError::InvalidRegistration(
             "backend is not supported",
         ));
@@ -1107,6 +1110,22 @@ fn validate_registration(registration: &RegisterWorkerRequest) -> Result<(), Con
         ));
     }
     validate_host_port(&registration.computation_endpoint)?;
+    if !registration.graph_control_endpoint.is_empty() {
+        if registration.graph_control_endpoint.starts_with(':')
+            || registration
+                .graph_control_endpoint
+                .contains(['/', '?', '#', '@'])
+        {
+            return Err(ControllerStateError::InvalidRegistration(
+                "graph control endpoint must use host:port without a scheme",
+            ));
+        }
+        validate_host_port(&registration.graph_control_endpoint).map_err(|_| {
+            ControllerStateError::InvalidRegistration(
+                "graph control endpoint must use host:port without a scheme",
+            )
+        })?;
+    }
     let peer = url::Url::parse(&registration.peer_weight_endpoint).map_err(|_| {
         ControllerStateError::InvalidRegistration("peer weight endpoint must be an HTTP URL")
     })?;
@@ -1347,6 +1366,7 @@ fn worker_route(worker: &WorkerRecord) -> WorkerRoute {
         max_pending_batches: worker.registration.max_pending_batches_per_device,
         max_batch_tokens: worker.registration.max_batch_tokens,
         transport_type: worker.registration.transport_type,
+        graph_control_endpoint: worker.registration.graph_control_endpoint.clone(),
     }
 }
 
@@ -1483,6 +1503,7 @@ mod tests {
             start_id: start_id.to_owned(),
             instance_id: 7,
             computation_endpoint: "127.0.0.1:50051".to_owned(),
+            graph_control_endpoint: String::new(),
             peer_weight_endpoint: "http://127.0.0.1:50052".to_owned(),
             backend: "torch".to_owned(),
             activation_dtype: ActivationDType::ActivationDtypeBf16 as i32,
@@ -1595,6 +1616,93 @@ mod tests {
                 "worker Transport type is invalid"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_optional_graph_endpoints() {
+        let state = ControllerRuntimeState::new(8);
+        for endpoint in [
+            "worker",
+            ":5000",
+            "worker:0",
+            "worker:65536",
+            "worker:abc",
+            "http://worker:5000",
+            "bad host:5000",
+            "worker/path:5000",
+            "@worker:5000",
+        ] {
+            let mut request = registration("worker-0", "start-0");
+            request.graph_control_endpoint = endpoint.to_owned();
+            assert!(
+                matches!(
+                    state.register(request).await,
+                    Err(ControllerStateError::InvalidRegistration(
+                        "graph control endpoint must use host:port without a scheme"
+                    ))
+                ),
+                "accepted invalid endpoint {endpoint}"
+            );
+        }
+        assert!(matches!(
+            state.registration("worker-0", "start-0").await,
+            Err(ControllerStateError::UnknownWorker)
+        ));
+        assert_eq!(state.topology_version(7).await, 0);
+    }
+
+    #[tokio::test]
+    async fn ready_routes_publish_the_optional_graph_endpoint_without_changing_placement() {
+        for endpoint in ["", "worker-0:50053", "[::1]:65535"] {
+            let state = ControllerRuntimeState::new(8);
+            let mut request = registration("worker-0", "start-0");
+            request.graph_control_endpoint = endpoint.to_owned();
+            state.register(request).await.unwrap();
+            let lease = state.open_heartbeat("worker-0", "start-0").await.unwrap();
+            state
+                .heartbeat(
+                    "worker-0",
+                    "start-0",
+                    lease,
+                    1,
+                    WorkerRunState::WorkerRunning as i32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(state.topology_version(7).await, 0);
+            let placement = state
+                .set_targets("worker-0", "start-0", vec![target(1, 2)])
+                .await
+                .unwrap();
+            state
+                .apply_state_report(
+                    "worker-0",
+                    "start-0",
+                    placement.generation,
+                    1,
+                    true,
+                    vec![ready(1, 2)],
+                )
+                .await
+                .unwrap();
+            let messages = state.topology_messages(7, 0).await.unwrap();
+            let Some(topology_message::Message::Snapshot(snapshot)) = &messages[0].message else {
+                panic!("expected ready snapshot");
+            };
+            assert_eq!(snapshot.routes.len(), 1);
+            assert_eq!(
+                (snapshot.routes[0].layer_id, snapshot.routes[0].expert_id),
+                (1, 2)
+            );
+            let route = &snapshot.routes[0].replicas[0];
+            assert_eq!(route.graph_control_endpoint, endpoint);
+            assert_eq!(route.computation_endpoint, "127.0.0.1:50051");
+            assert_eq!(
+                route.transport_type,
+                WorkerTransportType::WorkerTransportGrpc as i32
+            );
+            assert_eq!(route.start_id, "start-0");
+        }
     }
 
     #[tokio::test]

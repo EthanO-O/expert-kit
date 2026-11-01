@@ -8,13 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
-
-def _validate_endpoint(endpoint: str) -> None:
-    host, separator, port = endpoint.rpartition(":")
-    if not separator or not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
-        raise ValueError("control_endpoint must use host:port")
-    if "://" in host or any(c.isspace() for c in host):
-        raise ValueError("graph addresses must be hostnames without a URL scheme or whitespace")
+from expertkit_transport.transports.ascend_graph.contracts import validate_graph_control_endpoint
 
 
 class AscendGraphQuantization(BaseModel):
@@ -86,7 +80,7 @@ class AscendGraphWorker(BaseModel):
         """Reject an empty interval or an ambiguous control address."""
         if self.expert_start >= self.expert_end:
             raise ValueError("expert interval must be nonempty")
-        _validate_endpoint(self.control_endpoint)
+        validate_graph_control_endpoint(self.control_endpoint)
         return self
 
 

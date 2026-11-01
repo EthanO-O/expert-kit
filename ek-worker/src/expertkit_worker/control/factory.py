@@ -48,6 +48,12 @@ def create_controller_supervisor(
         reporter=reporter,
         receiver=receiver,
     )
+    graph = config.worker.ascend_decode_graph
+    graph_control_endpoint = (
+        graph.participants[graph.worker_rank(config.worker.id) - 1].control_endpoint
+        if graph is not None
+        else ""
+    )
     registration = WorkerRegistration(
         worker_id=config.worker.id,
         start_id=start_id,
@@ -62,6 +68,7 @@ def create_controller_supervisor(
         max_active_batches=config.worker.max_active_batches_per_device,
         max_pending_batches=config.transport.max_pending_batches_per_device,
         transport_type=transport_type,
+        graph_control_endpoint=graph_control_endpoint,
     )
     return ControllerSupervisor(
         connection=connection,
