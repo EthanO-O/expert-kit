@@ -1,5 +1,6 @@
 """Check bounded graph control over its real gRPC boundary on CPU."""
 
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -57,12 +58,43 @@ def test_encode_round_trip_and_limits() -> None:
 
 
 @pytest.mark.parametrize(
+    ("capture_sizes", "expected"),
+    [
+        ([256, 64, 128, 64], (64, 128, 256)),
+        ([9, 3, 9], (3, 9)),
+        ([17], (17,)),
+    ],
+)
+def test_capture_sizes_normalize_without_adding_capacities(capture_sizes, expected) -> None:
+    config = config_for(capture_sizes=capture_sizes)
+    assert config.capture_sizes == expected
+    assert config.identity()["capture_sizes"] == list(expected)
+
+
+@pytest.mark.parametrize("capture_sizes", [[], [0], [-1], [1.5], [1.0], [True], ["4"]])
+def test_capture_sizes_reject_empty_or_nonpositive_strict_integers(capture_sizes) -> None:
+    with pytest.raises(ValidationError, match="capture_sizes"):
+        config_for(capture_sizes=capture_sizes)
+
+
+@pytest.mark.parametrize("capture_sizes", [[256, 64, 128, 64], (128, 256, 64)])
+def test_equivalent_capture_sizes_preserve_group_identity(capture_sizes) -> None:
+    canonical = config_for(capture_sizes=[64, 128, 256])
+    equivalent = config_for(capture_sizes=capture_sizes)
+    assert equivalent.identity() == canonical.identity()
+    document = {**canonical.model_dump(mode="json"), "capture_sizes": capture_sizes}
+    assert (
+        AscendGraphConfig.model_validate_json(json.dumps(document)).identity()
+        == canonical.identity()
+    )
+    assert config_for(capture_sizes=[64, 256]).identity() != canonical.identity()
+
+
+@pytest.mark.parametrize(
     "updates",
     [
-        {"capture_sizes": []},
-        {"capture_sizes": [4, 1]},
-        {"capture_sizes": [True]},
         {"layer_ids": [1, 1]},
+        {"layer_ids": [2, 1]},
         {"instance_id": True},
         {"control_endpoint": "http://host:3"},
         {"timeout_seconds": float("nan")},
@@ -607,6 +639,8 @@ def test_v4_full_requires_complete_layers_and_exact_capture_profile():
     )
     config = AscendGraphConfig.model_validate(values)
     assert config.mode == "full"
+    equivalent = {**values, "capture_sizes": [*reversed(values["capture_sizes"]), 64]}
+    assert AscendGraphConfig.model_validate(equivalent).identity() == config.identity()
     for update in ({"layer_ids": (0, 2, 3)}, {"capture_sizes": (1, 256, 2048)}):
         with pytest.raises(ValidationError):
             AscendGraphConfig.model_validate({**values, **update})

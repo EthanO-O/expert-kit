@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from expertkit_transport.transports.ascend_graph.contracts import validate_graph_control_endpoint
 
@@ -107,19 +107,23 @@ class AscendGraphConfig(BaseModel):
     capture_sizes: tuple[StrictInt, ...] = Field(default=(1, 2, 4, 8, 16, 32, 64), strict=False)
     timeout_seconds: float = Field(default=120.0, gt=0, le=600, allow_inf_nan=False)
 
+    @field_validator("capture_sizes")
+    @classmethod
+    def normalize_capture_sizes(cls, values: tuple[int, ...]) -> tuple[int, ...]:
+        """Normalize positive capacities without adding unrequested graph sizes."""
+        if not values or any(value <= 0 for value in values):
+            raise ValueError("capture_sizes must be nonempty and contain positive integers")
+        return tuple(sorted(set(values)))
+
     @model_validator(mode="after")
     def validate_fixed_profiles(self) -> AscendGraphConfig:
-        """Reject ambiguous layer order, empty capacities and invalid endpoints."""
-        for name, values, minimum in (
-            ("layer_ids", self.layer_ids, 0),
-            ("capture_sizes", self.capture_sizes, 1),
+        """Reject ambiguous layer order, incompatible profiles and invalid endpoints."""
+        if (
+            not self.layer_ids
+            or any(isinstance(value, bool) or value < 0 for value in self.layer_ids)
+            or tuple(sorted(set(self.layer_ids))) != self.layer_ids
         ):
-            if (
-                not values
-                or any(isinstance(value, bool) or value < minimum for value in values)
-                or tuple(sorted(set(values))) != values
-            ):
-                raise ValueError(f"{name} must be nonempty, sorted and unique")
+            raise ValueError("layer_ids must be nonempty, sorted and unique")
         if self.workers:
             if self.worker_id is not None or self.control_endpoint is not None:
                 raise ValueError("workers cannot be combined with legacy Worker fields")
