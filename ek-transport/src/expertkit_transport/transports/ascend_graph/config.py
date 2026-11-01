@@ -1,14 +1,66 @@
-"""Validate one fixed Frontend/Worker Ascend graph deployment."""
+"""Validate graph choices and one immutable, Controller-resolved graph session."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from expertkit_transport.transports.ascend_graph.contracts import validate_graph_control_endpoint
+
+_MIGRATION_ERROR = (
+    "Legacy Ascend graph deployment documents are no longer supported. Use ordinary "
+    "ek-cli schedule and wait for READY experts; keep only mode, capture_sizes, "
+    "timeout_seconds, rendezvous_host and rendezvous_port in the graph options file. "
+    "Configure each Worker's control_listen/control_advertise locally; model facts, "
+    "instance identity, weight version and expert assignments are resolved at startup."
+)
+_LEGACY_FIELDS = {
+    "session_id",
+    "workers",
+    "worker_id",
+    "control_endpoint",
+    "model",
+    "layer_ids",
+    "instance_id",
+    "weight_version",
+}
+
+
+def normalize_capture_sizes(values: tuple[int, ...]) -> tuple[int, ...]:
+    """Sort and deduplicate positive capacities without adding unrequested sizes."""
+    if not values or any(type(value) is not int or value <= 0 for value in values):
+        raise ValueError("capture_sizes must be nonempty and contain positive integers")
+    return tuple(sorted(set(values)))
+
+
+def _validate_rendezvous_host(value: str) -> str:
+    if any(character.isspace() for character in value) or any(c in value for c in "/?#@"):
+        raise ValueError("rendezvous_host must be a host without whitespace or URL components")
+    return value
+
+
+_CaptureSizes = Annotated[
+    tuple[StrictInt, ...], Field(strict=False), AfterValidator(normalize_capture_sizes)
+]
+_RendezvousHost = Annotated[
+    str, Field(min_length=1, max_length=253), AfterValidator(_validate_rendezvous_host)
+]
+_IdentityText = Annotated[str, Field(min_length=1, max_length=128)]
+_WeightVersion = Annotated[str, Field(min_length=1, max_length=256)]
+_ExpertIds = Annotated[tuple[StrictInt, ...], Field(strict=False)]
 
 
 class AscendGraphQuantization(BaseModel):
@@ -49,200 +101,205 @@ class AscendGraphModel(BaseModel):
         return self
 
 
-def _legacy_v2_model() -> AscendGraphModel:
-    return AscendGraphModel(
-        num_layers=27,
-        experts_per_layer=64,
-        hidden_dim=2048,
-        expert_intermediate_dim=1408,
-        top_k=6,
-        activation_dtype="bf16",
-        weight_dtype="bf16",
-        activation="silu",
-        expert_compute="swiglu",
-        swiglu_limit=0.0,
-        quantization=None,
-    )
-
-
-class AscendGraphWorker(BaseModel):
-    """Identify one fixed Worker and its contiguous global expert interval."""
+class AscendGraphOptions(BaseModel):
+    """Hold user graph choices without duplicating model or placement authority."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    worker_id: str = Field(min_length=1, max_length=128)
-    control_endpoint: str = Field(min_length=3, max_length=256)
-    expert_start: int = Field(ge=0)
-    expert_end: int = Field(gt=0)
+    mode: Literal["decode", "full"] = "decode"
+    capture_sizes: _CaptureSizes = (1, 2, 4, 8, 16, 32, 64)
+    timeout_seconds: float = Field(default=120.0, gt=0, le=600, allow_inf_nan=False)
+    rendezvous_host: _RendezvousHost
+    rendezvous_port: StrictInt = Field(gt=0, le=65535)
 
-    @model_validator(mode="after")
-    def validate_worker(self) -> AscendGraphWorker:
-        """Reject an empty interval or an ambiguous control address."""
-        if self.expert_start >= self.expert_end:
-            raise ValueError("expert interval must be nonempty")
-        validate_graph_control_endpoint(self.control_endpoint)
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_document(cls, value: object) -> object:
+        """Explain how to migrate documents that formerly controlled placement."""
+        if isinstance(value, dict) and _LEGACY_FIELDS.intersection(value):
+            raise ValueError(_MIGRATION_ERROR)
+        return value
+
+    @classmethod
+    def from_file(cls, path: Path) -> AscendGraphOptions:
+        """Read graph options with strict unknown-field and legacy-document checks."""
+        return cls.model_validate_json(path.read_bytes())
+
+
+class AscendGraphWorker(BaseModel):
+    """Freeze one selected Worker process and its IDs aligned with session layers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    worker_id: _IdentityText
+    expected_start_id: _IdentityText
+    control_endpoint: str = Field(min_length=3, max_length=256)
+    device: str = Field(pattern=r"^npu:[0-9]+$")
+    experts_by_layer: tuple[_ExpertIds, ...] = Field(strict=False)
+
+    @field_validator("control_endpoint")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        """Require an independently reachable graph-control host and port."""
+        validate_graph_control_endpoint(value)
+        return value
+
+    @field_validator("experts_by_layer")
+    @classmethod
+    def validate_expert_order(
+        cls, values: tuple[tuple[int, ...], ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        """Preserve layer order and reject duplicate, negative or unsorted local IDs."""
+        if any(ids != tuple(sorted(set(ids))) or any(i < 0 for i in ids) for ids in values):
+            raise ValueError("expert IDs must be nonnegative, sorted and unique per layer")
+        if not any(values):
+            raise ValueError("a graph participant must own at least one expert")
+        return values
+
+    def expert_ids_by_layer(self, layer_ids: tuple[int, ...]) -> dict[int, tuple[int, ...]]:
+        """Return a new backend mapping, retaining empty layers and immutable ID tuples."""
+        return dict(zip(layer_ids, self.experts_by_layer, strict=True))
 
 
 class AscendGraphConfig(BaseModel):
-    """Declare identity, capacities and the model's fixed Worker partition.
+    """Freeze resolved facts consumed by every rank for exactly one graph session.
 
-    All participants consume the same document. Changing any field requires a new
-    session and process restart; graph mode does not perform online migration.
+    Construct this object at startup from native model facts and Controller READY
+    routes. A dependency change requires process restart and a new session.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     session_id: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-    mode: Literal["decode", "full"] = "decode"
-    instance_id: int = Field(gt=0)
-    worker_id: str | None = Field(default=None, min_length=1, max_length=128)
-    weight_version: str = Field(min_length=1, max_length=256)
-    model: AscendGraphModel = Field(default_factory=_legacy_v2_model)
-    control_endpoint: str | None = Field(default=None, min_length=3, max_length=256)
-    workers: tuple[AscendGraphWorker, ...] = Field(default=(), strict=False)
-    rendezvous_host: str = Field(min_length=1, max_length=253)
-    rendezvous_port: int = Field(gt=0, le=65535)
+    instance_id: StrictInt = Field(gt=0, le=(1 << 64) - 1)
+    model_name: str = Field(min_length=1, max_length=256)
+    weight_version: _WeightVersion
+    model: AscendGraphModel
     layer_ids: tuple[StrictInt, ...] = Field(strict=False)
-    capture_sizes: tuple[StrictInt, ...] = Field(default=(1, 2, 4, 8, 16, 32, 64), strict=False)
-    timeout_seconds: float = Field(default=120.0, gt=0, le=600, allow_inf_nan=False)
-
-    @field_validator("capture_sizes")
-    @classmethod
-    def normalize_capture_sizes(cls, values: tuple[int, ...]) -> tuple[int, ...]:
-        """Normalize positive capacities without adding unrequested graph sizes."""
-        if not values or any(value <= 0 for value in values):
-            raise ValueError("capture_sizes must be nonempty and contain positive integers")
-        return tuple(sorted(set(values)))
+    mode: Literal["decode", "full"]
+    capture_sizes: _CaptureSizes
+    decode_capture_sizes: _CaptureSizes
+    timeout_seconds: float = Field(gt=0, le=600, allow_inf_nan=False)
+    rendezvous_host: _RendezvousHost
+    rendezvous_port: StrictInt = Field(gt=0, le=65535)
+    workers: tuple[AscendGraphWorker, ...] = Field(min_length=1, strict=False)
+    source_topology_version: StrictInt = Field(ge=0, le=(1 << 64) - 1)
 
     @model_validator(mode="after")
-    def validate_fixed_profiles(self) -> AscendGraphConfig:
-        """Reject ambiguous layer order, incompatible profiles and invalid endpoints."""
+    def validate_assignments(self) -> AscendGraphConfig:
+        """Require ordered ranks and exact-once coverage of every routed-layer expert."""
         if (
             not self.layer_ids
-            or any(isinstance(value, bool) or value < 0 for value in self.layer_ids)
-            or tuple(sorted(set(self.layer_ids))) != self.layer_ids
-        ):
-            raise ValueError("layer_ids must be nonempty, sorted and unique")
-        if self.workers:
-            if self.worker_id is not None or self.control_endpoint is not None:
-                raise ValueError("workers cannot be combined with legacy Worker fields")
-        elif self.worker_id is None or self.control_endpoint is None:
-            raise ValueError("provide workers or both legacy Worker fields")
-        participants = self.participants
-        boundaries = [0, *(worker.expert_end for worker in participants)]
-        qwen = (
-            self.model.num_layers,
-            self.model.experts_per_layer,
-            self.model.hidden_dim,
-            self.model.expert_intermediate_dim,
-            self.model.top_k,
-            self.model.expert_compute,
-        ) == (48, 128, 2048, 768, 8, "swiglu") and self.model.quantization is not None
-        qwen_eight = qwen and len(participants) == 8
-        v4 = (
-            self.model.num_layers,
-            self.model.experts_per_layer,
-            self.model.hidden_dim,
-            self.model.expert_intermediate_dim,
-            self.model.top_k,
-            self.model.expert_compute,
-            self.model.swiglu_limit,
-        ) == (43, 256, 4096, 2048, 6, "deepseek_v4", 10.0) and self.model.quantization is not None
-        if (
-            (len(participants) != 8 if v4 else len(participants) not in (1, 2) and not qwen_eight)
-            or (
-                v4 and any(worker.expert_end - worker.expert_start != 32 for worker in participants)
-            )
-            or (
-                qwen_eight
-                and (
-                    self.layer_ids != tuple(range(48))
-                    or any(worker.expert_end - worker.expert_start != 16 for worker in participants)
-                )
-            )
-            or boundaries[-1] != self.model.experts_per_layer
-            or any(
-                worker.expert_start != start
-                for worker, start in zip(participants, boundaries[:-1], strict=True)
-            )
+            or self.layer_ids != tuple(sorted(set(self.layer_ids)))
+            or self.layer_ids[0] < 0
+            or self.layer_ids[-1] >= self.model.num_layers
         ):
             raise ValueError(
-                "graph Workers must partition all model experts into one or two fixed intervals, "
-                "or eight 16-expert Qwen / 32-expert V4 intervals for exact ModelSlim declarations"
+                "layer_ids must be nonempty, sorted, unique and within model.num_layers"
             )
-        if self.layer_ids[-1] >= self.model.num_layers:
-            raise ValueError("graph layer IDs exceed model.num_layers")
-        if self.mode == "full":
-            v4_full = v4 and self.layer_ids == tuple(range(43))
-            if not v4_full and (
-                not qwen
-                or self.layer_ids != tuple(range(48))
-                or tuple((worker.expert_start, worker.expert_end) for worker in participants)
-                not in (
-                    ((0, 64), (64, 128)),
-                    tuple((start, start + 16) for start in range(0, 128, 16)),
-                )
-            ):
-                raise ValueError(
-                    "full graph mode requires the complete Qwen3 or eight-Worker V4 W8A8 model"
-                )
-            if v4_full and self.capture_sizes != (
-                1,
-                2,
-                4,
-                8,
-                16,
-                32,
-                64,
-                128,
-                256,
-                512,
-                1024,
-                2048,
-            ):
-                raise ValueError("V4 full graph requires the twelve fixed token capacities")
-            if max(self.capture_sizes) > 2048:
-                raise ValueError("full graph token capacity cannot exceed 2048")
-        if len({worker.worker_id for worker in participants}) != len(participants):
-            raise ValueError("graph Worker IDs must be distinct")
-        if len({worker.control_endpoint for worker in participants}) != len(participants):
+        if self.decode_capture_sizes != self.capture_sizes[: len(self.decode_capture_sizes)]:
+            raise ValueError("decode_capture_sizes must be a nonempty prefix of capture_sizes")
+        if self.mode == "decode" and self.decode_capture_sizes != self.capture_sizes:
+            raise ValueError("decode mode requires decode_capture_sizes to equal capture_sizes")
+        worker_ids = tuple(worker.worker_id for worker in self.workers)
+        if worker_ids != tuple(sorted(set(worker_ids))):
+            raise ValueError("graph Worker IDs must be distinct and sorted in rank order")
+        if len({worker.control_endpoint for worker in self.workers}) != len(self.workers):
             raise ValueError("graph Worker control endpoints must be distinct")
-        if any(c.isspace() for c in self.rendezvous_host):
-            raise ValueError("graph rendezvous host must not contain whitespace")
+        if any(len(worker.experts_by_layer) != len(self.layer_ids) for worker in self.workers):
+            raise ValueError("each Worker expert list must align with every session layer")
+        for index in range(len(self.layer_ids)):
+            seen: set[int] = set()
+            for worker in self.workers:
+                for expert_id in worker.experts_by_layer[index]:
+                    if expert_id >= self.model.experts_per_layer or expert_id in seen:
+                        raise ValueError(
+                            "graph assignments must cover each expert exactly once per layer"
+                        )
+                    seen.add(expert_id)
+            if len(seen) != self.model.experts_per_layer:
+                raise ValueError("graph assignments must cover each expert exactly once per layer")
         return self
 
     @classmethod
     def from_file(cls, path: Path) -> AscendGraphConfig:
-        """Read the shared JSON deployment document with strict unknown-field checks."""
-        return cls.model_validate_json(path.read_bytes())
+        """Reject the former public deployment-file API with migration instructions."""
+        raise ValueError(_MIGRATION_ERROR)
 
     @property
     def participants(self) -> tuple[AscendGraphWorker, ...]:
-        """Return canonical rank order, accepting the original single-Worker JSON."""
-        if self.workers:
-            return self.workers
-        assert self.worker_id is not None and self.control_endpoint is not None
-        return (
-            AscendGraphWorker(
-                worker_id=self.worker_id,
-                control_endpoint=self.control_endpoint,
-                expert_start=0,
-                expert_end=self.model.experts_per_layer,
-            ),
-        )
+        """Return the immutable Controller-selected rank order."""
+        return self.workers
 
     def worker_rank(self, worker_id: str) -> int:
-        """Resolve exactly one Worker to its stable private HCCL rank."""
-        for rank, worker in enumerate(self.participants, 1):
+        """Resolve one selected Worker to its stable private HCCL rank."""
+        for rank, worker in enumerate(self.workers, 1):
             if worker.worker_id == worker_id:
                 return rank
-        raise ValueError("Worker is absent from the graph deployment")
+        raise ValueError("Worker is absent from the graph session")
 
     def identity(self) -> dict[str, object]:
-        """Return one canonical group identity regardless of legacy input syntax."""
-        identity = json.loads(
-            self.model_dump_json(exclude={"worker_id", "control_endpoint", "workers"})
+        """Return protocol-v2 session dependencies, excluding topology provenance."""
+        return {
+            "version": 2,
+            **self.model_dump(mode="json", exclude={"source_topology_version"}),
+        }
+
+    @property
+    def assignment_id(self) -> str:
+        """Hash canonical executable/session facts without unrelated topology changes."""
+        encoded = json.dumps(
+            self.identity(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class GraphExecutionLimits:
+    """Keep native allocation budgets distinct from effective scheduling limits."""
+
+    capture_sizes: tuple[int, ...]
+    decode_capture_sizes: tuple[int, ...]
+    running_requests: int
+    graph_stage_tokens: int
+    ordinary_prefill_tokens: int
+
+
+def resolve_graph_limits(
+    options: AscendGraphOptions,
+    *,
+    allocated_requests: int,
+    allocated_tokens: int,
+    scheduled_tokens: int,
+) -> GraphExecutionLimits:
+    """Validate actual padded-buffer bounds without changing native allocations."""
+    for name, value in (
+        ("allocated_requests", allocated_requests),
+        ("allocated_tokens", allocated_tokens),
+        ("scheduled_tokens", scheduled_tokens),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    captures = options.capture_sizes
+    if captures[-1] > allocated_tokens:
+        raise ValueError(
+            f"graph capture {captures[-1]} exceeds native allocated token buffers "
+            f"{allocated_tokens}"
         )
-        identity["workers"] = [worker.model_dump(mode="json") for worker in self.participants]
-        return identity
+    decode = tuple(capacity for capacity in captures if capacity <= allocated_requests)
+    if not decode:
+        raise ValueError(
+            f"no configured Decode graph fits native allocated request buffers {allocated_requests}"
+        )
+    if options.mode == "decode" and decode != captures:
+        raise ValueError(
+            f"Decode-only captures {captures} exceed native allocated request buffers "
+            f"{allocated_requests}"
+        )
+    return GraphExecutionLimits(
+        capture_sizes=captures,
+        decode_capture_sizes=decode,
+        running_requests=min(allocated_requests, decode[-1]),
+        graph_stage_tokens=min(scheduled_tokens, captures[-1]),
+        ordinary_prefill_tokens=scheduled_tokens,
+    )

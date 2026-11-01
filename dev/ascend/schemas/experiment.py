@@ -5,12 +5,18 @@ import yaml
 from typing import Self
 from typing import Any, Literal
 from pathlib import Path
-from pydantic import AnyHttpUrl, Field, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    Field,
+    StrictBool,
+    StrictInt,
+    computed_field,
+    model_validator,
+)
 
 from enum import StrEnum
-from expertkit_transport.transports.ascend_graph.config import (
-    AscendGraphConfig,
-    AscendGraphModel,
+from expertkit_transport.ascend_graph import (
+    AscendGraphOptions,
     AscendGraphQuantization,
 )
 
@@ -64,22 +70,7 @@ class ExperimentConfig(ConfigModel):
     serve: ServeConfig
     run: RunConfig
     tracing: TracingConfig = Field(default_factory=TracingConfig)
-    ascend_decode_graph: AscendGraphConfig | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def derive_graph_model(cls, data: Any) -> Any:
-        """Fill an omitted shared model before validating its expert intervals."""
-        if not isinstance(data, dict):
-            return data
-        graph = data.get("ascend_decode_graph")
-        if isinstance(graph, dict) and "model" not in graph and "model" in data:
-            model = ModelConfig.model_validate(data["model"])
-            return {
-                **data,
-                "ascend_decode_graph": {**graph, "model": model.graph_model()},
-            }
-        return data
+    ascend_decode_graph: AscendGraphOptions | None = None
 
     @classmethod
     def from_yaml(cls, file: Path) -> Self:
@@ -105,11 +96,11 @@ class ModelConfig(ConfigModel):
     name: str
     path_ref: str
     weight_version: str
-    num_layers: int
-    experts_per_layer: int
-    hidden_dim: int
-    intermediate_dim: int
-    topk: int
+    num_layers: int | None = Field(default=None, gt=0)
+    experts_per_layer: int | None = Field(default=None, gt=0)
+    hidden_dim: int | None = Field(default=None, gt=0)
+    intermediate_dim: int | None = Field(default=None, gt=0)
+    topk: int | None = Field(default=None, gt=0)
     weight_dtype: Dtype
     activation_dtype: Dtype
     expert_compute: Literal["swiglu", "deepseek_v4"] = "swiglu"
@@ -119,25 +110,41 @@ class ModelConfig(ConfigModel):
     @model_validator(mode="after")
     def validate_computation(self) -> Self:
         """Keep clipping specific to the declared V4 expert expression."""
-        if self.expert_compute == "swiglu" and self.swiglu_limit != 0:
+        if (
+            "expert_compute" in self.model_fields_set
+            and self.expert_compute == "swiglu"
+            and self.swiglu_limit != 0
+        ):
             raise ValueError("swiglu_limit requires deepseek_v4 expert computation")
         return self
 
-    def graph_model(self) -> AscendGraphModel:
-        """Map deployment geometry and computation to the shared graph contract."""
-        return AscendGraphModel(
-            num_layers=self.num_layers,
-            experts_per_layer=self.experts_per_layer,
-            hidden_dim=self.hidden_dim,
-            expert_intermediate_dim=self.intermediate_dim,
-            top_k=self.topk,
-            activation_dtype=str(self.activation_dtype),
-            weight_dtype=str(self.weight_dtype),
-            activation="silu",
-            expert_compute=self.expert_compute,
-            swiglu_limit=self.swiglu_limit,
-            quantization=self.quantization,
-        )
+    @computed_field
+    @property
+    def worker_model(self) -> dict[str, Any]:
+        """Render required execution settings and only explicitly supplied model facts."""
+        values = {
+            "name": self.name,
+            "weight_version": self.weight_version,
+            "activation_dtype": str(self.activation_dtype),
+            "weight_dtype": str(self.weight_dtype),
+        }
+        aliases = {"intermediate_dim": "expert_intermediate_dim", "topk": "top_k"}
+        for field in (
+            "num_layers",
+            "experts_per_layer",
+            "hidden_dim",
+            "intermediate_dim",
+            "topk",
+            "expert_compute",
+            "swiglu_limit",
+            "quantization",
+        ):
+            value = getattr(self, field)
+            if field in self.model_fields_set and value is not None:
+                values[aliases.get(field, field)] = (
+                    value.model_dump(mode="json") if field == "quantization" else value
+                )
+        return values
 
 
 class DatasetConfig(ConfigModel):
@@ -176,6 +183,13 @@ class ServeConfig(ConfigModel):
     gpu_memory_utilization: float
     max_model_len: int
     enforce_eager: bool = False
+    max_num_seqs: StrictInt | None = None
+    max_num_batched_tokens: StrictInt | None = None
+    max_num_scheduled_tokens: StrictInt | None = None
+    block_size: StrictInt | None = None
+    num_gpu_blocks_override: StrictInt | None = None
+    kv_cache_memory_bytes: StrictInt | None = None
+    enable_chunked_prefill: StrictBool | None = None
 
 
 class RunConfig(ConfigModel):

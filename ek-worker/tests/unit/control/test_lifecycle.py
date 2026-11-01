@@ -264,19 +264,26 @@ def test_registration_rejects_malformed_graph_endpoint(endpoint: str) -> None:
         replace(_registration(), graph_control_endpoint=endpoint)
 
 
-@pytest.mark.parametrize("graph_enabled", [False, True])
-def test_control_factory_only_advertises_its_configured_graph_endpoint(graph_enabled: bool) -> None:
+@pytest.mark.parametrize(
+    ("graph_enabled", "weight_version"),
+    [
+        (False, "resolved-revision"),
+        (True, "resolved-revision"),
+        (False, "revision with spaces"),
+        (True, "revision with spaces"),
+        (False, "x" * 257),
+    ],
+)
+def test_control_factory_only_advertises_its_configured_graph_endpoint(
+    graph_enabled: bool,
+    weight_version: str,
+) -> None:
     from expertkit_worker.control.factory import create_controller_supervisor
     from expertkit_worker.control.state_reporter import ExpertStateReporter
 
-    graph = SimpleNamespace(
-        participants=(
-            SimpleNamespace(control_endpoint="other-worker:50053"),
-            SimpleNamespace(control_endpoint="worker-0:50053"),
-        ),
-        worker_rank=lambda worker_id: 2 if worker_id == "worker-0" else 1,
-    )
+    graph = SimpleNamespace(control_advertise="worker-0:50053")
     config = SimpleNamespace(
+        model=SimpleNamespace(weight_version=weight_version),
         worker=SimpleNamespace(
             id="worker-0",
             backend=SimpleNamespace(value="torch"),
@@ -307,6 +314,7 @@ def test_control_factory_only_advertises_its_configured_graph_endpoint(graph_ena
     )
     registration = supervisor._registration.to_protobuf()
     assert registration.graph_control_endpoint == ("worker-0:50053" if graph_enabled else "")
+    assert registration.weight_version == (weight_version if graph_enabled else "")
     assert registration.computation_endpoint == "worker-0:50051"
     assert registration.start_id == "start-1"
 

@@ -105,72 +105,59 @@ for the short run and Jaeger UI procedure. `serve.enforce_eager` independently
 keeps eager execution on when tracing is disabled, which is useful for an
 overhead comparison.
 
-## Fixed Ascend graphs
+## Ascend graphs
 
-`experiment.ascend_decode_graph` optionally accepts the shared graph deployment
-fields: session/instance/Worker/weight identity, control and rendezvous endpoints,
-routed layer IDs, capture sizes and timeout. It defaults to absent. The
-[Qwen3/V4 graph guide](../../doc/tutorial/ascend/decode-graphs.md) describes
-the example pairs, shared prebuilt runtime image and startup commands. The
-[V2-Lite notes](../../doc/tutorial/ascend/deepseek-v2-lite-decode-graphs.md)
-record its different model geometry and historical qualification.
+`experiment.ascend_decode_graph` contains only Frontend graph choices: `mode`,
+`capture_sizes`, `timeout_seconds`, `rendezvous_host` and `rendezvous_port`.
+The shared options validator sorts and deduplicates capture sizes without adding
+buckets. Omit the mapping for ordinary execution. See the
+[graph guide](../../doc/tutorial/ascend/decode-graphs.md) for the existing Qwen3/V4
+examples and pinned prebuilt runtime.
 
-The generator validates one host, one Frontend and one expert pool on distinct
-devices, matching identity, unused graph ports and one active Worker batch.
-It accepts the fixed V2-Lite and Qwen3 profiles, and eight ordered 32-expert
-shards for the exact ModelSlim V4 profile. It emits `ascend-decode-graph.json`,
-identical Worker settings, Frontend identity/mounts and native
-`FULL_DECODE_ONLY` flags by default (`mode: decode`). All participants use host
-networking even when ordinary Prefill Transport is gRPC.
+Choose Worker counts, devices and hosts in the normal cluster pools. Each graph
+pool additionally declares `start_graph_control_port`; the generator gives each
+Worker its own `control_listen` and `control_advertise`. These ports are separate
+from ordinary Transport and peer-weight ports. Only the Frontend receives the
+options JSON. No generated document declares expert ownership or a session ID.
 
-For Qwen3-30B-A3B W8A8, `mode: full` also captures Prefill and mixed steps.
-In a local copy of the Qwen3 example, use `cluster.expert.backend: torch` or
-`ascend_fused` and set `experiment.ascend_decode_graph.mode: full`, retaining all
-48 layers and the two 64-expert Worker intervals. Use capture sizes
-`[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]`. The generator selects native
-`FULL`, a 2,048-token step budget and `max-num-seqs: 64`; token capacity and request
-count are separate limits. Both modes reuse the shared prebuilt 0.26 runtime;
-enabling full mode requires no additional native build. V2-Lite and V4 continue
-to use `mode: decode`. The checked-in examples keep their existing defaults.
+Start Workers, use ordinary `ek-cli schedule rebalance` (or the existing manual,
+static or duplicate commands), and wait for the target instance's experts to be
+READY before starting the Frontend. The Frontend builds its graph session from
+native vLLM/Hugging Face model facts and the Controller's READY snapshot. Workers
+resolve model facts from Weight Server metadata and check PREPARE against those
+resolved facts. Noncontinuous expert IDs, different layer
+assignments and replicas do not need a second placement manifest. The old
+`schedule graph` command now fails with migration instructions before accessing
+configuration or services.
 
-For V2-Lite, two Workers require explicit, disjoint desired placement of experts
-0..31 and 32..63 on every routed layer; the generator does
-not create these Controller assignments. Start the Frontend only after actual
-READY routes prove all 1,664 experts have the declared owner and process start ID.
+Model dimensions may be omitted from the generator input; Worker startup fills
+them from Weight Server metadata before complete validation. Explicit dimensions
+and computation declarations remain assertions and must match metadata. Current
+W8A8 examples retain their export/quantization hints for native Frontend loading.
+The generator performs no network lookup or additional Hugging Face parsing.
 
-DeepSeek-V4-Flash W8A8 requires a vLLM-Ascend build with native V4 support.
-V4 generation selects the native `mp` executor to keep the TP=1 native executor's
-KV-cache configuration separate from scheduler-derived block sizes.
-Declare 43 layers, 256 experts, hidden size 4096, intermediate size 2048 and
-top-k 6, with these additional model fields:
+`serve.max_num_seqs`, `max_num_batched_tokens`, `max_num_scheduled_tokens`,
+`block_size`, `num_gpu_blocks_override`, `kv_cache_memory_bytes` and
+`enable_chunked_prefill` are optional native settings. Unspecified values stay
+absent in generated serving YAML. The graph does not force a 64-request,
+2048-token or 128-block configuration. Omit the KV block override to use native
+memory planning. Full graph steps and running requests are bounded by the native
+resolved allocation and compatible captures; Decode-only ordinary Prefill keeps
+its native token budget. Native startup reports effective limits.
 
-```yaml
-expert_compute: deepseek_v4
-swiglu_limit: 10.0
-quantization:
-  type: modelslim-w8a8-dynamic
-  bits: 8
-  group_size: null
-  symmetric: true
-```
+Multiple hosts and pools are accepted; known device and port collisions are
+checked per host. `rendezvous_host` is user-owned and must address the Worker
+selected as the first graph rank after READY selection, ordered by Worker ID.
+That Worker owns the TCPStore listener. The generator cannot infer its ownership
+offline and does not replace this address with the Frontend host. Multi-host
+configuration acceptance is not NPU qualification.
 
-Set `layer_ids` to all integers from 0 through 42 and declare eight complete
-intervals in `ascend_decode_graph.workers`. Place the Frontend and eight Workers
-on separate devices. The generator writes matching Worker declarations and the native
-Ascend quantization setting. Controller placement must make all 11,008 experts
-READY in those declared shards before the Frontend starts. The V2-Lite recipe's
-expert counts and placement do not apply to V4.
-
-After Workers register, `ek-cli schedule graph --graph-config <generated-json>
---wait-ready-seconds 1800` installs the declared expert placement and waits for
-readiness. Run it with the generated Controller configuration, automatic
-assignment disabled and the Frontend stopped. Do not run another scheduling
-operation concurrently. Qwen3 requires 6,144 routed experts READY; V4 requires
-11,008. See the graph guide for the complete Compose command.
-
-The V2-Lite qualification results belong to the historical runtime recorded
-in its notes. They do not qualify the new prebuilt 0.26 image or Qwen3/V4 on
-that image. Full serving and graph replay require target-server validation.
+Keep graph execution/tracing settings compatible with the selected runtime.
+After related placement, weights or participating processes change, stop incoming
+work, drain and restart affected graph processes to rebuild the session while
+retaining containers. There is no automatic recapture or eager retry after a
+partially submitted graph failure. Device qualification of changed configurations
+remains separate from successful generation.
 
 ## File tree
 

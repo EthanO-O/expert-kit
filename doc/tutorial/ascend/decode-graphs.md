@@ -2,8 +2,8 @@
 
 By default, the graph path captures the complete model forward for Decode,
 including routed experts on separate Workers. Prefill and mixed batches use
-ordinary EK Transport. Qwen3 W8A8 with the Torch or `ascend_fused` backend can
-also enable full graphs for Prefill, mixed and Decode steps.
+ordinary EK Transport. Full mode also covers Prefill and mixed steps with the
+supported Torch or `ascend_fused` backend and native model/operator checks.
 Sampling stays outside the captured forward. Every role uses the same Docker
 runtime; models are mounted read-only.
 
@@ -24,44 +24,17 @@ still run.
 The PyPI `expertkit-vllm[engine]` extra selects a different CUDA engine; use the
 Docker build below for Ascend.
 
-## Select a model
+## Configure the existing examples
 
-Use one host with a separate physical NPU for each role:
+The checked-in `dev/ascend/configs/qwen3-30b-a3b-w8a8` and
+`deepseek-v4-flash-w8a8` pairs select two and eight Workers respectively.
+These are example placements, not required Worker counts or expert partitions.
+Choose the pools, hosts, unused devices and ports for your deployment. Each
+Worker process serves one device. `backend: torch` and `ascend_fused` use their
+existing computation paths; the Torch path retains original FP32 scales, while
+the fused path performs its required BF16 scale conversion.
 
-| Example directory under `dev/ascend/configs/` | Frontend | Workers | Experts per Worker, per layer | Total routed experts |
-| --- | ---: | ---: | ---: | ---: |
-| `qwen3-30b-a3b-w8a8` | 1 | 2 | 64 | 6,144 |
-| `deepseek-v4-flash-w8a8` | 1 | 8 | 32 | 11,008 |
-
-Both examples select `backend: ascend_fused` in the expert pool and use
-ModelSlim dynamic W8A8 weights and BF16 activations. Set the pool's backend to
-`torch` to select the existing three-projection implementation instead. The fused
-resident provider captures the same `run_ascend_fused_moe()` operator pipeline
-used by eager `ascend_fused`: packed W13 projection, clipped SwiGLU, W2 projection,
-and native routing-weighted token unpermute. It maps global expert IDs to the
-local interval with subtraction and masking; nonlocal routes use an inactive
-sentinel and zero routing weight. All experts in the local interval are loaded
-and leased before capture and remain resident until the session closes.
-
-The fused provider implements the shared resident interface without inheriting
-Torch's computation. It uses native scaled GMM and scale conversion, rather than
-Torch's explicit INT32-dot rescaling or optional Triton ordered reduction. The
-lossless FP32/BF16 scale round-trip guard belongs to the Torch graph provider;
-`ascend_fused` converts scales just as its eager operator path does.
-
-Worker capture records communication and computation across the configured routed
-layers for each token capacity. Later decode steps replay those graphs with new
-hidden states and routing. A backend-only graph benchmark measures one layer's
-local shard; full-model HCCL capture/replay and generation accuracy require
-separate qualification on the target runtime. See the
-[resident graph benchmark](../../../ek-worker/README.md#compare-resident-graph-computation)
-for a matched backend comparison.
-
-Reserve space for the checkpoint, images and expert cache before deployment; the V4
-expert cache alone needs approximately 277 GB. The examples reserve Worker
-memory separately from Frontend KV cache memory.
-
-From the repository root, select one example pair:
+From the repository root:
 
 ```bash
 cp dev/ascend/configs/qwen3-30b-a3b-w8a8/cluster.example.yaml \
@@ -70,37 +43,83 @@ cp dev/ascend/configs/qwen3-30b-a3b-w8a8/experiment.example.yaml \
   dev/ascend/configs/experiment.yaml
 ```
 
-For V4, substitute `deepseek-v4-flash-w8a8` in both source paths. In the copied
-files, replace every `192.0.2.10` with the host's routable address and fill in
-absolute checkpoint and result paths. Choose unused devices and ports. The
-example `instance_id: 1` assumes a fresh deployment database; an existing
-installation must use its actual configured instance ID. All roles must agree
-on `weight_version`, model geometry and the same graph document.
+For V4 substitute `deepseek-v4-flash-w8a8`. Replace example addresses and absolute
+checkpoint/result paths. Reserve checkpoint, image and expert-cache disk space.
+Each pool's `start_graph_control_port` reserves one graph-control port per Worker,
+separate from `start_worker_port` and `start_peer_port`. Generated Workers bind
+`0.0.0.0` and advertise the pool host address; they receive no model/placement
+manifest from the Frontend.
 
-### Enable Qwen3 Prefill graphs
-
-In the copied Qwen3 `cluster.yaml`, select `expert.backend: torch` or
-`ascend_fused`. In the copied `experiment.yaml`, update the existing graph mapping
-while retaining its identity, endpoints, layers and Workers:
+The experiment's graph mapping is only:
 
 ```yaml
 ascend_decode_graph:
-  mode: full
-  capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
-  # Retain the other fields from the Qwen3 example.
+  mode: decode
+  capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+  timeout_seconds: 600.0
+  rendezvous_host: 192.0.2.10
+  rendezvous_port: 18090
 ```
 
-Keep all 48 routed layers and the two Worker intervals `[0, 64)` and `[64, 128)`.
-The generator selects synchronous native `FULL`, a 2,048-token step budget and
-`max-num-seqs: 64`. Capture sizes count tokens, including padding; they do not
-raise the concurrent request limit to 2,048. Small Decode buckets remain present.
-Full mode also selects native FULL attention for Decode, so a comparison with
-decode-only mode includes that attention-path change.
+Do not add `session_id`, `instance_id`, `model`, `layer_ids`, expert ranges or
+Workers here. Frontend bootstrap creates a fresh session from native vLLM/Hugging
+Face model facts and the Controller's READY topology. Workers resolve omitted
+geometry from Weight Server metadata, validate explicit model declarations, and
+check PREPARE against the resolved facts.
+The examples retain their quantization/export hints for native Frontend loading.
+Neither the generator nor the user needs a second HF parser or placement list.
 
-Omitting `mode` keeps `decode` and `FULL_DECODE_ONLY`. Use decode mode for V4 and
-V2-Lite. The checked-in examples are unchanged.
+The graph's TCPStore listener belongs to the first selected Worker rank, ordered
+by Worker ID after READY replica selection. `rendezvous_host` must address that
+Worker's host. On multiple hosts, check the actual selected participants; the
+Frontend is not automatically the listener. The generator preserves this explicit
+address and checks known collisions, but cannot establish runtime rank ownership.
+Multi-host configuration acceptance does not establish hardware qualification.
 
-Generate and check the Compose files:
+### Full graphs and native serving capacity
+
+`mode: decode` selects `FULL_DECODE_ONLY`; Prefill and mixed steps use ordinary
+execution. `mode: full` also captures Prefill and mixed steps. For example:
+
+```yaml
+serve:
+  gpu_memory_utilization: 0.8
+  max_model_len: 4096
+  max_num_seqs: 128
+  max_num_batched_tokens: 2048
+  enable_chunked_prefill: true
+ascend_decode_graph:
+  mode: full
+  capture_sizes: [64, 128, 256]
+  timeout_seconds: 600.0
+  rendezvous_host: 192.0.2.10
+  rendezvous_port: 18090
+```
+
+Only these graph sizes are captured; smaller steps use the smallest compatible
+bucket with padding. Capture sizes need not be powers of two or start at 1.
+Long Prefill is chunked by native scheduling rather than rejected as a request
+larger than one graph. Request count, token allocation/scheduling budget and
+context length remain distinct. In Decode-only mode, ordinary Prefill is not
+capped by the Decode graph size.
+
+Optional native fields also include `max_num_scheduled_tokens`, `block_size`,
+`num_gpu_blocks_override` and `kv_cache_memory_bytes`. Unspecified fields stay
+absent; the generator does not supply hidden 64/2048/128 defaults. Normally omit
+KV overrides and use native automatic planning. Actual padded-buffer, native
+operator and KV-scratch compatibility is checked at startup. Keep
+`serve.enforce_eager` false and tracing disabled; both modes use the same pinned
+prebuilt runtime without a new native build.
+
+Real provider limits still apply. The current V4 attention adapter uses the
+pinned A3 native backend, 64 query heads and 512 sparse selections for ratio-4
+layers; virtual kernel-block splitting is not supported. A context auto-fit
+change after private metadata preparation requires rebuilding and budgeting that
+metadata. These are startup compatibility checks, not presets for service
+capacity. Arbitrary Worker layouts, changed graph sizes and singleton V4 serving
+still require target-device qualification; generated YAML does not establish it.
+
+## Generate, build and start
 
 ```bash
 uv run --locked python dev/ascend/cli.py generate
@@ -108,14 +127,7 @@ dev/ascend/run-compose.sh image config -q
 dev/ascend/run-compose.sh control config -q
 dev/ascend/run-compose.sh attention config -q
 dev/ascend/run-compose.sh expert worker-pool1 config -q
-```
 
-## Build and start
-
-Build the four EK wheels from the checked-out source, then build the shared
-Frontend/Worker runtime image:
-
-```bash
 mkdir -p dist/attention-wheels
 for package in expertkit-proto expertkit-transport expertkit-worker expertkit-vllm; do
   uv build --wheel --package "$package" --out-dir dist/attention-wheels
@@ -125,40 +137,29 @@ dev/ascend/run-compose.sh control up -d controller
 dev/ascend/run-compose.sh expert worker-pool1 up -d
 ```
 
-After all Workers register, apply the exact expert intervals from the generated
-graph document and wait for loading:
+For additional pools start each bundle on its configured host. After Workers
+register, schedule through the existing Controller path:
 
 ```bash
 dev/ascend/run-compose.sh control run --rm admin \
-  ek-cli --config /etc/expert-kit/config.yaml schedule graph \
-  --graph-config /etc/expert-kit/ascend-decode-graph.json \
-  --wait-ready-seconds 1800
+  ek-cli --config /etc/expert-kit/config.yaml schedule rebalance
 ```
 
-This command is for startup with automatic assignment disabled. Keep the
-Frontend stopped and do not run another scheduling command concurrently. It
-validates the instance, model geometry, active Workers, capacity and complete
-expert partition, then atomically installs placement. The readiness wait checks
-the exact assignments. Frontend PREPARE additionally checks live Worker identity
-and acquires resident weights.
+The existing manual/static/duplicate commands remain available. Wait for complete
+READY expert coverage of the configured instance using Controller/Worker state
+and logs. Do not run `schedule graph`: it is retired and will reject the request
+without reading the old JSON or touching services. The generated graph JSON is
+Frontend options only and cannot be used as scheduling input.
 
-Start the Frontend after the placement command succeeds:
+Start the Frontend once the selected experts are READY. Bootstrap waits within
+its configured timeout and verifies process/weight identity before PREPARE:
 
 ```bash
 dev/ascend/run-compose.sh attention up -d attention
 dev/ascend/run-compose.sh attention logs -f attention
 ```
 
-In default decode mode, the generator selects synchronous `FULL_DECODE_ONLY`,
-disables prefix caching and passes the same graph configuration to all
-participants. The examples capture batch sizes 1, 2, 4, 8, 16, 32 and 64;
-intermediate sizes use padding.
-Keep `serve.enforce_eager` false and tracing disabled for this graph path.
-Prefill and mixed batches use ordinary EK execution in decode mode. Full mode
-captures them as well.
 ## Verify and stop
-
-Use the selected `model.name` and host address:
 
 ```bash
 curl -fsS http://<HOST_IP>:18000/v1/chat/completions \
@@ -166,12 +167,10 @@ curl -fsS http://<HOST_IP>:18000/v1/chat/completions \
   -d '{"model":"<MODEL_NAME>","messages":[{"role":"user","content":"你好，请自我介绍一下自己"}],"temperature":0,"max_tokens":64}'
 ```
 
-Retain both input and output. Confirm every declared Worker prepared its full
-layer range and participated in Decode replay. A successful HTTP response alone
-does not establish graph execution. In full mode, also verify Prefill and mixed
-replay with changing prompt lengths and subsequent Decode steps.
-
-Stop the deployment while retaining containers and caches:
+Retain input/output and actual capture/replay evidence. A successful HTTP request
+or generated YAML alone does not qualify graph execution. Full mode additionally
+needs changing prompt lengths, chunked Prefill/mixed steps and subsequent Decode
+checks. Changed graph configuration still requires target-device qualification.
 
 ```bash
 dev/ascend/run-compose.sh attention stop
@@ -179,24 +178,20 @@ dev/ascend/run-compose.sh expert worker-pool1 stop
 dev/ascend/run-compose.sh control stop
 ```
 
-Placement and weights stay fixed for a graph session. After a peer failure or
-session timeout, stop all participants and use a new `session_id` before
-restarting. A failed partially submitted graph step cannot fall back to ordinary
-RPC.
+Known issue: when multiple Workers stop together, the Controller may reassign
+experts to a shutting-down Worker, causing a nonzero exit. Retain containers and
+logs and verify that all owned processes have stopped. Online graph rebuilding
+remains unsupported.
 
-To compare ordinary EK with the same expert placement, retain a copy of the
-generated graph JSON before removing `ascend_decode_graph` from the local
-experiment. Set `serve.enforce_eager: true` for the ordinary comparison.
-Regenerate, start the control bundle and Workers, then apply that JSON only as
-placement input:
+Keep containers and caches. Before planned related placement/weight changes,
+stop incoming requests and drain the old session. Restart affected graph
+execution processes after the new assignment becomes READY; bootstrap creates
+new identities and captures. Unrelated topology changes do not require rebuild.
+A participating process failure or invalid weights stop the session; a partially
+submitted step cannot retry through eager execution. Online recapture/migration
+is not provided.
 
-```bash
-dev/ascend/run-compose.sh control run --rm \
-  --volume <ABSOLUTE_PLACEMENT_JSON>:/configs/placement.json:ro admin \
-  ek-cli --config /etc/expert-kit/config.yaml schedule graph \
-  --graph-config /configs/placement.json --wait-ready-seconds 1800
-```
-
-The ordinary Workers do not enable graph execution. Start the Frontend after
-placement succeeds. For ordinary deployments without fixed intervals, use
-`schedule rebalance` from the common deployment workflow.
+For ordinary EK with the same Controller placement, omit `ascend_decode_graph`
+and select the ordinary execution settings; no saved graph-placement JSON is
+needed. Compare paths only after independently verifying their actual placement
+and runtime settings.

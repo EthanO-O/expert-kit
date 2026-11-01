@@ -43,7 +43,6 @@ from expertkit_vllm.decode_graph import (
     active_graph_session,
     graph_config_from_environment,
     is_graph_profile,
-    validate_graph_model,
 )
 from expertkit_vllm.dummy_batch import is_dummy_forward
 from expertkit_vllm.experts.remote_routed_experts import RemoteRoutedExperts
@@ -237,8 +236,13 @@ class RemoteMoERunner(MoERunnerInterface):
             # Ascend passes the table only to the runner; the gate owns loading.
             object.__setattr__(routed_experts, "tid2eid", table)
             tid2eid = table
-            if self._layer_id < 3:
-                if table is None or table.shape != (129280, 6) or table.dtype != torch.int32:
+            hf = vllm_config.model_config.hf_text_config
+            if self._layer_id < hf.num_hash_layers:
+                if (
+                    table is None
+                    or table.shape != (hf.vocab_size, self.top_k)
+                    or table.dtype != torch.int32
+                ):
                     raise ValueError("V4 hash layers require the native checkpoint table")
                 if routed_experts.e_score_correction_bias is not None:
                     raise ValueError("V4 hash layers must not use a correction bias")
@@ -252,16 +256,14 @@ class RemoteMoERunner(MoERunnerInterface):
             tid2eid=tid2eid,
         )
         self.client_config = collect_ek_client_config()
-        self.graph_config = graph_config_from_environment()
-        if self.graph_config is not None:
-            validate_graph_model(vllm_config, self.graph_config)
+        self.graph_options = graph_config_from_environment()
 
         compilation = vllm_config.compilation_config
         if layer_name in compilation.static_forward_context:
             raise ValueError(f"duplicate Expert Kit MoE layer prefix {layer_name!r}")
         compilation.static_forward_context[layer_name] = self
         compilation.static_all_moe_layers.append(layer_name)
-        if self.graph_config is None:
+        if self.graph_options is None:
             if compilation.splitting_ops is None:
                 compilation.splitting_ops = []
             op_name = "vllm::expertkit_remote_moe"
@@ -384,7 +386,7 @@ class RemoteMoERunner(MoERunnerInterface):
             {"expertkit.layer_id": self.layer_id, "expertkit.token_count": hidden_states.shape[0]}
         )
         if (
-            (self.graph_config is not None or getattr(self, "_is_deepseek_v4", False))
+            (self.graph_options is not None or getattr(self, "_is_deepseek_v4", False))
             and self._requires_fp32_gate
             and not hasattr(self.gate, "weight_fp32")
         ):

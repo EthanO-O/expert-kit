@@ -5,6 +5,11 @@ port: {{ attention.vllm_port if transport.type == "transfer_engine" or ascend_de
 gpu-memory-utilization: {{ serve.gpu_memory_utilization }}
 max-model-len: {{ serve.max_model_len }}
 data-parallel-size: {{ attention.dp_size }}
+{% for field in ["max_num_seqs", "max_num_batched_tokens", "max_num_scheduled_tokens", "block_size", "num_gpu_blocks_override", "kv_cache_memory_bytes", "enable_chunked_prefill"] %}
+{% if serve[field] is not none %}
+{{ field | replace("_", "-") }}: {{ serve[field] | tojson }}
+{% endif %}
+{% endfor %}
 {% if serve.enforce_eager or tracing.enabled %}
 enforce-eager: true
 {% endif %}
@@ -25,8 +30,6 @@ trust-remote-code: false
 {% else %}
 trust-remote-code: true
 {% endif %}
-max-num-batched-tokens: 2048
-max-num-seqs: {{ 64 if ascend_decode_graph.mode == "full" else ascend_decode_graph.capture_sizes | max }}
 compilation-config:
 {% if model.expert_compute == "deepseek_v4" %}
   mode: VLLM_COMPILE

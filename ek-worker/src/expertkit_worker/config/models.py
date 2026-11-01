@@ -7,7 +7,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
 from pydantic import (
     AfterValidator,
     AnyHttpUrl,
@@ -181,6 +180,13 @@ class GgmlConfig(_StrictModel):
     cpu_threads: int = Field(gt=0)
 
 
+class AscendGraphWorkerConfig(_StrictModel):
+    """Bind local graph control without declaring model facts or expert ownership."""
+
+    control_listen: NetworkAddress
+    control_advertise: NetworkAddress
+
+
 class WorkerProcessConfig(_StrictModel):
     """Identity, Backend, device, admission, and shutdown settings."""
 
@@ -192,7 +198,7 @@ class WorkerProcessConfig(_StrictModel):
     device_memory_limit: PositiveByteSize
     shutdown_grace_secs: float = Field(default=30.0, gt=0)
     ggml: GgmlConfig | None = None
-    ascend_decode_graph: AscendGraphConfig | None = None
+    ascend_decode_graph: AscendGraphWorkerConfig | None = None
 
     @model_validator(mode="after")
     def validate_backend(self) -> WorkerProcessConfig:
@@ -444,49 +450,18 @@ class WorkerConfig(_StrictModel):
                     "activations and weights"
                 )
         graph = self.worker.ascend_decode_graph
-        if graph is not None:
-            if (
-                self.worker.backend not in {BackendName.TORCH, BackendName.ASCEND_FUSED}
-                or not self.worker.device.startswith("npu:")
-                or self.worker.max_active_batches_per_device != 1
-                or self.model.activation_dtype is not ActivationDType.BF16
-                or self.model.weight_dtype is not ActivationDType.BF16
-                or (
-                    self.model.quantization is not None
-                    and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
-                )
-            ):
-                raise ValueError(
-                    "Ascend Decode graphs require one active NPU Torch or Ascend fused BF16 slot"
-                )
-            rank = graph.worker_rank(self.worker.id)
-            if self.model.expert_compute == "deepseek_v4":
-                participant = graph.participants[rank - 1]
-                if (
-                    self.model.num_layers != 43
-                    or self.model.experts_per_layer != 256
-                    or self.model.hidden_dim != 4096
-                    or self.model.expert_intermediate_dim != 2048
-                    or self.model.top_k != 6
-                    or self.model.swiglu_limit != 10.0
-                    or self.model.quantization is None
-                    or participant.expert_end - participant.expert_start != 32
-                ):
-                    raise ValueError(
-                        "Ascend graphs require the exact V4 ModelSlim computation "
-                        "and 32 local experts"
-                    )
-            if graph.weight_version != self.model.weight_version:
-                raise ValueError("Ascend graph deployment identity does not match the Worker")
-            if self.model.instance_id is not None and graph.instance_id != self.model.instance_id:
-                raise ValueError("Ascend graph model instance does not match the Worker")
-            if graph.layer_ids[-1] >= self.model.num_layers:
-                raise ValueError("Ascend graph layer IDs exceed the configured model")
-            worker_model = self.model.model_dump(
-                mode="json", include=set(type(graph.model).model_fields)
+        if graph is not None and (
+            self.worker.backend not in {BackendName.TORCH, BackendName.ASCEND_FUSED}
+            or not self.worker.device.startswith("npu:")
+            or self.worker.max_active_batches_per_device != 1
+            or self.model.activation_dtype is not ActivationDType.BF16
+            or self.model.weight_dtype is not ActivationDType.BF16
+            or (
+                self.model.quantization is not None
+                and self.model.quantization.type is not QuantizationType.MODELSLIM_W8A8_DYNAMIC
             )
-            if graph.model.model_dump(mode="json") != worker_model:
-                raise ValueError("Ascend graph model declaration does not match the Worker model")
-            if graph.capture_sizes[-1] > self.worker.max_batch_tokens:
-                raise ValueError("Ascend graph capacity exceeds worker.max_batch_tokens")
+        ):
+            raise ValueError(
+                "Ascend Decode graphs require one active NPU Torch or Ascend fused BF16 slot"
+            )
         return self

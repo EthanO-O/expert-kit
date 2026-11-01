@@ -44,10 +44,10 @@ expert:
 pools:
   - id: worker-pool1
     node: node-a
-    # Each Worker retains 64 experts per layer; match the experiment's fixed intervals.
     devices: [1, 2]
     start_worker_port: 53234
     start_peer_port: 54234
+    start_graph_control_port: 18079
 # Replace every 192.0.2.10 address in both inputs with the host's routable IP.
 nodes:
   node-a:

@@ -78,3 +78,42 @@ def test_stale_explicit_id_is_a_nonretryable_startup_error() -> None:
         assert "stale instance ID" in captured.value.diagnostic
 
     asyncio.run(scenario())
+
+
+def test_sync_instance_resolution_owns_channel_and_absolute_deadline(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    from expertkit_transport.controller import instance
+
+    events = []
+    channel = SimpleNamespace(close=lambda: events.append("close"))
+    monkeypatch.setattr(instance.grpc, "insecure_channel", lambda *a, **k: channel)
+
+    def resolve(request, *, timeout, wait_for_ready):
+        events.append((request.requested_instance_id, timeout, wait_for_ready))
+        return lifecycle_pb2.ResolveDefaultInstanceResponse(
+            instance_id=7, model_name="native-name", instance_name="native-instance"
+        )
+
+    monkeypatch.setattr(
+        instance.lifecycle_pb2_grpc,
+        "InstanceServiceStub",
+        lambda _: SimpleNamespace(ResolveDefaultInstance=resolve),
+    )
+    result = instance.resolve_default_instance_sync(
+        "controller", requested_instance_id=None, monotonic_deadline=time.monotonic() + 1
+    )
+    assert result.instance_id == 7 and result.model_name == "native-name"
+    assert events[0][0] == 0 and 0 < events[0][1] <= 1 and events[0][2]
+    assert events[-1] == "close"
+    events.clear()
+    with pytest.raises(TransportError, match="another instance"):
+        instance.resolve_default_instance_sync(
+            "controller", requested_instance_id=8, monotonic_deadline=time.monotonic() + 1
+        )
+    assert events[-1] == "close"
+    with pytest.raises(TimeoutError, match="deadline"):
+        instance.resolve_default_instance_sync(
+            "controller", requested_instance_id=None, monotonic_deadline=time.monotonic()
+        )

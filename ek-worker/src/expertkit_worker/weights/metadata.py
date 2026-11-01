@@ -307,39 +307,10 @@ def _config_document(config: WorkerConfig | Mapping[str, Any]) -> dict[str, Any]
         document = config.model_dump()
         # Defaulted semantics are discoverable; only explicit fields are assertions.
         document["model"] = config.model.model_dump(exclude_unset=True)
-        graph = config.worker.ascend_decode_graph
-        if graph is not None and "model" not in graph.model_fields_set:
-            document["worker"]["ascend_decode_graph"].pop("model", None)
         return document
     if not isinstance(config, Mapping):
         raise TypeError("config must be a WorkerConfig or configuration mapping")
     return dict(config)
-
-
-def _resolve_graph_model(document: dict[str, Any], model: ModelConfig) -> None:
-    """Use the resolved Worker model for graph validation without profile defaults."""
-
-    worker = dict(document["worker"])
-    graph = worker.get("ascend_decode_graph")
-    if graph is None:
-        return
-    if not isinstance(graph, Mapping):
-        raise ValueError("worker.ascend_decode_graph must be a mapping")
-    graph = dict(graph)
-    supplied = graph.get("model", {})
-    if not isinstance(supplied, Mapping):
-        raise ValueError("worker.ascend_decode_graph.model must be a mapping")
-    # The existing graph model is a subset of ModelConfig, not an independent fact source.
-    from expertkit_transport.transports.ascend_graph.config import AscendGraphModel
-
-    canonical = model.model_dump(mode="json", include=set(AscendGraphModel.model_fields))
-    asserted = AscendGraphModel.model_validate(canonical | dict(supplied)).model_dump(mode="json")
-    for field in supplied:
-        if asserted[field] != canonical[field]:
-            raise ValueError(f"Worker graph model.{field} conflicts with resolved Worker model")
-    graph["model"] = canonical
-    worker["ascend_decode_graph"] = graph
-    document["worker"] = worker
 
 
 async def resolve_worker_config(
@@ -384,7 +355,6 @@ async def resolve_worker_config(
         raise ModelMetadataError("V4 graph metadata is missing required swiglu_limit")
     resolved_model = _resolve_model_fields(model, metadata, graph_enabled=graph_enabled)
     document["model"] = resolved_model
-    _resolve_graph_model(document, ModelConfig.model_validate(resolved_model))
     return ResolvedWorkerConfig(WorkerConfig.model_validate(document), metadata)
 
 

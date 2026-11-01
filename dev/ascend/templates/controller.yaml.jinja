@@ -1,6 +1,10 @@
 inference:
+{% if model.hidden_dim is not none %}
   hidden_dim: {{ model.hidden_dim }}
+{% endif %}
+{% if model.intermediate_dim is not none %}
   intermediate_dim: {{ model.intermediate_dim }}
+{% endif %}
   instance_name: {{ inference.instance_name }}
   model_name: {{ model.name }}
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
@@ -124,6 +125,29 @@ class WeightManagerFatalError(RuntimeError):
         self.diagnostic = error.diagnostic
 
 
+class GraphAssignmentGuard:
+    """Latch loss of selected executable targets until proved graph teardown."""
+
+    def __init__(self, manager: WeightManager, selected: frozenset[tuple[WeightKey, str]]) -> None:
+        self._manager = manager
+        self._selected = selected
+        self._invalidated = threading.Event()
+        self._closed = False
+
+    def require_current(self) -> None:
+        """Reject a removed target even if it was re-added between graph steps."""
+        with self._manager._graph_lock:
+            if self._closed or self._invalidated.is_set():
+                raise RuntimeError("selected graph assignments are no longer current")
+
+    def close(self) -> None:
+        """Detach only after the owner has proved all graph device work complete."""
+        with self._manager._graph_lock:
+            self._closed = True
+            if self._manager._graph_guard is self:
+                self._manager._graph_guard = None
+
+
 class WeightManager[CpuWeightT, ReadyWeightT]:
     """Apply complete placement generations and own the only ready-weight table."""
 
@@ -179,6 +203,9 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
         self._lock = asyncio.Lock()
         self._placement_generation = 0
         self._targets: dict[WeightKey, TargetExpert] = {}
+        self._graph_lock = threading.Lock()
+        self._graph_targets: frozenset[tuple[WeightKey, str]] = frozenset()
+        self._graph_guard: GraphAssignmentGuard | None = None
         self._states: dict[WeightKey, ExpertState] = {}
         self._load_tasks: dict[WeightKey, asyncio.Task[None]] = {}
         self._removal_lock = asyncio.Lock()
@@ -234,6 +261,29 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
         """Expose invalidation before ready-weight withdrawal waits for graphs."""
         return self._ready.revision
 
+    def guard_graph_assignments(
+        self, expert_ids_by_layer: Mapping[int, tuple[int, ...]], *, device: str
+    ) -> GraphAssignmentGuard:
+        """Freeze one graph's selected targets without loading or acquiring weights."""
+        keys = self._validate_weight_keys(
+            WeightKey(layer_id, expert_id)
+            for layer_id, expert_ids in expert_ids_by_layer.items()
+            for expert_id in expert_ids
+        )
+        if not keys:
+            raise ValueError("graph assignments must select at least one expert")
+        selected = frozenset((key, device) for key in keys)
+        with self._graph_lock:
+            if not self._started or self._closed or self._shutting_down:
+                raise RuntimeError("Weight Manager cannot bind graph assignments")
+            if self._graph_guard is not None:
+                raise RuntimeError("Weight Manager already owns a graph assignment guard")
+            if not selected.issubset(self._graph_targets):
+                raise RuntimeError("selected graph experts are not current Controller targets")
+            guard = GraphAssignmentGuard(self, selected)
+            self._graph_guard = guard
+            return guard
+
     async def apply_targets(
         self,
         placement_generation: int,
@@ -264,7 +314,15 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
 
             previous_targets = self._targets
             self._placement_generation = placement_generation
-            self._targets = resolved
+            with self._graph_lock:
+                self._targets = resolved
+                self._graph_targets = frozenset(
+                    (key, target.target_device) for key, target in resolved.items()
+                )
+                if self._graph_guard is not None and not self._graph_guard._selected.issubset(
+                    self._graph_targets
+                ):
+                    self._graph_guard._invalidated.set()
 
             for key in previous_targets.keys() - resolved.keys():
                 task = self._load_tasks.get(key)
@@ -340,7 +398,10 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
                 raise RuntimeError("Weight Manager is closed")
             if self._shutting_down:
                 return False
-            self._shutting_down = True
+            with self._graph_lock:
+                self._shutting_down = True
+                if self._graph_guard is not None:
+                    self._graph_guard._invalidated.set()
             for task in self._load_tasks.values():
                 task.cancel()
             return True
@@ -458,7 +519,10 @@ class WeightManager[CpuWeightT, ReadyWeightT]:
         async with self._lock:
             if self._closed:
                 return
-            self._closed = True
+            with self._graph_lock:
+                self._closed = True
+                if self._graph_guard is not None:
+                    self._graph_guard._invalidated.set()
             tasks = tuple(self._load_tasks.values())
             for task in tasks:
                 task.cancel()

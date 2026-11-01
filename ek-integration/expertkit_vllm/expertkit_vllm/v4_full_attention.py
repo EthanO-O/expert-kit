@@ -6,11 +6,16 @@ the native geometry; mixed attention uses bounded local packing and gathering.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,7 @@ class V4AttentionCapacity:
     prefill_tokens: int
     decode_requests: int
     prefill_requests: int
+    max_requests: int
 
     @property
     def tokens(self) -> int:
@@ -44,7 +50,8 @@ class V4AttentionCapacity:
         lengths = tuple(query_lengths)
         if (
             not lengths
-            or len(lengths) > 256
+            or len(lengths) > self.max_requests
+            or type(num_decodes) is not int
             or not 0 <= num_decodes <= len(lengths)
             or any(type(n) is not int or n <= 0 for n in lengths)
             or any(n != 1 for n in lengths[:num_decodes])
@@ -59,26 +66,23 @@ class V4AttentionCapacity:
             raise ValueError("pure Decode must retain the native Decode branch")
 
 
-def attention_capacity(token_bucket: int, *, mixed: bool) -> V4AttentionCapacity:
-    """Derive local capacities from a validated native capture bucket.
-
-    The mixed request bound uses the exact native threshold of one query per
-    Decode request. Other classifier policies must be rejected by installation.
-    """
-    if type(token_bucket) is not int or not 1 <= token_bucket <= 2048:
-        raise ValueError("V4 native token bucket must be within 1..2048")
+def attention_capacity(token_bucket: int, *, mixed: bool, max_requests: int) -> V4AttentionCapacity:
+    """Bound private slots by the native single-query Decode classifier."""
+    if any(type(n) is not int or n <= 0 for n in (token_bucket, max_requests)):
+        raise ValueError("V4 token and request capacities must be positive integers")
     if not mixed:
-        if token_bucket > 256:
-            raise ValueError("pure Decode cannot exceed the 256-request scheduler")
-        return V4AttentionCapacity(token_bucket, token_bucket, 0, token_bucket, 0)
+        if token_bucket > max_requests:
+            raise ValueError("pure Decode exceeds the native request allocation")
+        return V4AttentionCapacity(token_bucket, token_bucket, 0, token_bucket, 0, max_requests)
     if token_bucket < 2:
         raise ValueError("mixed attention requires a Prefill query of length at least two")
     return V4AttentionCapacity(
         token_bucket,
-        min(256, token_bucket),
+        min(max_requests, token_bucket),
         token_bucket,
-        min(256, token_bucket),
-        min(256, token_bucket // 2),
+        min(max_requests, token_bucket),
+        min(max_requests, token_bucket // 2),
+        max_requests,
     )
 
 
@@ -112,13 +116,13 @@ def local_builder_config(native_config: Any, capacity: V4AttentionCapacity) -> A
     The original compilation configuration contains live layer objects and must
     retain identity; deep-copying the full VllmConfig could duplicate weights.
     Scheduler and cache settings have separate ownership so native builder buffer
-    sizing cannot mutate the outer scheduler's 256 requests and 2048 tokens.
+    sizing cannot mutate the outer scheduler or its allocation capacities.
     """
     if (
-        native_config.scheduler_config.max_num_seqs != 256
-        or native_config.scheduler_config.max_num_batched_tokens != 2048
+        capacity.max_requests != native_config.scheduler_config.max_num_seqs
+        or capacity.outer_tokens > native_config.scheduler_config.max_num_batched_tokens
     ):
-        raise ValueError("V4 Full requires the qualified outer scheduler capacities")
+        raise ValueError("V4 private capacity exceeds the native outer allocations")
     local = copy(native_config)
     local.scheduler_config = copy(native_config.scheduler_config)
     local.cache_config = copy(native_config.cache_config)
@@ -196,55 +200,148 @@ def attention_population(
     )
 
 
-def independent_dummy_page(group: int, owner: int) -> int:
-    """Return an isolated zero-query scratch page outside logical N2048.
+@dataclass(frozen=True)
+class V4KVScratchLayout:
+    """Private page domains shared across native raw-allocation aliases."""
 
-    A page is not a ring buffer: this mapping is valid only for zero-query
-    requests with start position zero. Real requests retain their native table.
-    """
-    if type(group) is not int or not 0 <= group < 6:
-        raise ValueError("V4 cache group must be within 0..5")
-    if type(owner) is not int or not 0 <= owner < 512:
-        raise ValueError("V4 virtual owner must be within 0..511")
-    return 2048 + group * 512 + owner
+    owners: int
+    block_sizes: tuple[int, ...]
+    compress_ratios: tuple[int, ...]
+    carrier_pages: tuple[int, ...]
+
+    @property
+    def extra_pages(self) -> int:
+        """Return pages excluded from the logical scheduler pool."""
+        return len(self.block_sizes) * self.owners + sum(self.carrier_pages)
+
+    def carrier_start(self, logical_blocks: int, group: int) -> int:
+        """Return this group's positive-query carrier outside all dummy pages."""
+        if type(group) is not int or not 0 <= group < len(self.block_sizes):
+            raise ValueError("V4 cache group is outside the native layout")
+        return (
+            logical_blocks + len(self.block_sizes) * self.owners + sum(self.carrier_pages[:group])
+        )
 
 
-def physical_cache_config(logical: Any) -> Any:
-    """Clone only the native KV allocation plan, preserving logical capacity.
+def kv_scratch_layout(
+    groups: Sequence[Any], *, max_virtual_owners: int, mixed_capture_sizes: Sequence[int]
+) -> V4KVScratchLayout:
+    """Derive isolated scratch domains from native block and compression specs."""
+    if type(max_virtual_owners) is not int or max_virtual_owners < 0 or not groups:
+        raise ValueError("V4 scratch requires native groups and a nonnegative owner count")
+    sizes = tuple(mixed_capture_sizes)
+    if any(type(n) is not int or n < 2 for n in sizes) or bool(sizes) != bool(max_virtual_owners):
+        raise ValueError("V4 mixed scratch owners and capture sizes are inconsistent")
+    blocks, ratios, carriers = [], [], []
+    for group in groups:
+        specs = group.kv_cache_spec.kv_cache_specs
+        values = {spec.block_size for spec in specs.values()}
+        if len(values) != 1 or any(type(n) is not int or n <= 0 for n in values):
+            raise ValueError("V4 capture group has inconsistent block sizes")
+        block = next(iter(values))
+        ratio = capture_group_ratio(group.kv_cache_spec)
+        blocks.append(block)
+        ratios.append(ratio)
+        carriers.append(max((capture_carrier_pages(block, ratio, n) for n in sizes), default=0))
+    return V4KVScratchLayout(max_virtual_owners, tuple(blocks), tuple(ratios), tuple(carriers))
 
-    Every raw allocation retains its native shared-by aliases and byte stride.
-    The scheduler continues to receive the original N2048 object. The caller
-    must allocate this plan through the original native runner, never manually
-    reshape or bind role views.
-    """
-    from copy import deepcopy
 
-    if logical.num_blocks != 2048 or len(logical.kv_cache_groups) != 6:
-        raise ValueError("V4 Full requires the qualified N2048 six-group pool")
-    if len(logical.kv_cache_tensors) != 44:
-        raise ValueError("V4 Full requires all 44 native raw allocation slots")
-    roles: set[str] = set()
+def independent_dummy_page(
+    layout: V4KVScratchLayout, *, logical_blocks: int, group: int, owner: int
+) -> int:
+    """Address one zero-query-only page without aliasing logical KV or other owners."""
+    if type(logical_blocks) is not int or logical_blocks <= 0:
+        raise ValueError("V4 logical block count must be positive")
+    if type(group) is not int or not 0 <= group < len(layout.block_sizes):
+        raise ValueError("V4 cache group is outside the native layout")
+    if type(owner) is not int or not 0 <= owner < layout.owners:
+        raise ValueError("V4 virtual owner is outside the private capacity")
+    return logical_blocks + group * layout.owners + owner
+
+
+def _allocation_strides(logical: Any) -> tuple[int, ...]:
+    """Validate the native role join and the currently supported unpacked strides."""
+    if type(logical.num_blocks) is not int or logical.num_blocks <= 0:
+        raise ValueError("V4 logical block count must be positive")
+    roles = []
     for group in logical.kv_cache_groups:
+        if not group.layer_names:
+            raise ValueError("V4 native cache group must contain roles")
         for name in group.layer_names:
-            if name in roles or name not in group.kv_cache_spec.kv_cache_specs:
+            if name not in group.kv_cache_spec.kv_cache_specs:
                 raise ValueError("V4 native cache role join is ambiguous")
-            roles.add(name)
-    if len(roles) != 167:
-        raise ValueError("V4 Full requires all 167 native cache roles")
+            roles.append(name)
+    allocated = []
+    strides = []
     for raw in logical.kv_cache_tensors:
         if (
             raw.offset != 0
             or raw.block_stride != 0
+            or type(raw.size) is not int
             or raw.size <= 0
-            or raw.size % 2048
-            or any(role not in roles for role in raw.shared_by)
+            or raw.size % logical.num_blocks
         ):
-            raise ValueError("V4 native allocation layout differs from qualification")
+            raise ValueError("V4 native allocation layout has unsupported byte strides")
+        # Native empty padding slots still contribute to the planned byte budget.
+        allocated.extend(raw.shared_by)
+        strides.append(raw.size // logical.num_blocks)
+    if (
+        not roles
+        or any(n != 1 for n in Counter(roles).values())
+        or Counter(allocated) != Counter(roles)
+    ):
+        raise ValueError("V4 native allocation layout must cover every role exactly once")
+    return tuple(strides)
+
+
+def physical_cache_config(logical: Any, layout: V4KVScratchLayout) -> Any:
+    """Clone the native plan and aliases; never allocate or bind role views here."""
+    strides = _allocation_strides(logical)
+    if len(logical.kv_cache_groups) != len(layout.block_sizes):
+        raise ValueError("V4 scratch group count differs from the native plan")
     physical = deepcopy(logical)
-    physical.num_blocks = 5120
-    for raw in physical.kv_cache_tensors:
-        raw.size = raw.size // 2048 * physical.num_blocks
+    physical.num_blocks += layout.extra_pages
+    for raw, stride in zip(physical.kv_cache_tensors, strides, strict=True):
+        raw.size = stride * physical.num_blocks
     return physical
+
+
+def _same_native_plan(left: Any, right: Any) -> bool:
+    return (
+        left.kv_cache_groups == right.kv_cache_groups
+        and _allocation_strides(left) == _allocation_strides(right)
+        and tuple(tuple(raw.shared_by) for raw in left.kv_cache_tensors)
+        == tuple(tuple(raw.shared_by) for raw in right.kv_cache_tensors)
+    )
+
+
+def install_v4_memory_reservation() -> None:
+    """Reserve future private KV pages at the pinned native Worker budget boundary.
+
+    The frontend must prepare persistent metadata inside its profile_run hook.
+    Native manual-memory mode intentionally bypasses automatic non-KV accounting.
+    """
+    from functools import wraps
+
+    from vllm_ascend.worker.worker import NPUWorker
+
+    original = NPUWorker.determine_available_memory
+    if getattr(original, "_expertkit_v4_reservation", False):
+        return
+
+    @wraps(original)
+    def determine(worker: Any) -> int:
+        budget = original(worker)
+        adapter = getattr(worker.model_runner, "_expertkit_v4_full_attention", None)
+        if adapter is None:
+            return budget
+        logical_budget = adapter._reserve_kv_memory(budget)
+        if hasattr(worker, "available_kv_cache_memory_bytes"):
+            worker.available_kv_cache_memory_bytes = logical_budget
+        return logical_budget
+
+    determine._expertkit_v4_reservation = True
+    NPUWorker.determine_available_memory = determine
 
 
 def _clone_metadata(value: Any, immutable: dict[int, Any] | None = None) -> Any:
@@ -485,9 +582,32 @@ class V4FullAttention:
         self._wrapped_builders: set[int] = set()
         self._physical_config: Any = None
         self._group_roles: dict[str, int] = {}
+        self._max_requests = runner.max_num_reqs
+        self._max_tokens = runner.max_num_tokens
+        self._model_len = runner.max_model_len
+        self._profile_metadata_prepared = False
+        self._profile_preparing = False
+        self._profile_plan: Any = None
+        self._kv_budget: int | None = None
+        self._kv_extension_bytes: int | None = None
+        self._profile_table_widths: tuple[int, ...] = ()
+        self._builder_signatures: dict[tuple[int, str], tuple[Any, ...]] = {}
+        if (
+            any(
+                type(n) is not int or n <= 0
+                for n in (self._max_requests, self._max_tokens, self._model_len)
+            )
+            or max(graph_config.capture_sizes) > self._max_tokens
+            or tuple(graph_config.decode_capture_sizes)
+            != tuple(n for n in graph_config.capture_sizes if n <= self._max_requests)
+            or not graph_config.decode_capture_sizes
+        ):
+            raise ValueError("V4 capture sizes exceed the native padded allocations")
         try:
-            for tokens in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048):
-                capacity = attention_capacity(tokens, mixed=True)
+            for tokens in graph_config.capture_sizes:
+                if tokens < 2:
+                    continue
+                capacity = attention_capacity(tokens, mixed=True, max_requests=self._max_requests)
                 self._buckets[tokens] = {
                     "capacity": capacity,
                     "buffers": _AttentionBuffers(
@@ -504,6 +624,165 @@ class V4FullAttention:
             self._bindings.close()
             self._buckets.clear()
             raise
+
+    def _check_profile_geometry(self) -> None:
+        if (
+            self.runner.max_num_reqs != self._max_requests
+            or self.runner.max_num_tokens != self._max_tokens
+            or self.runner.max_model_len != self._model_len
+            or self.runner.model_config.max_model_len != self._model_len
+        ):
+            raise RuntimeError(
+                "V4 native allocation/context geometry changed after profiling; "
+                "context auto-fit requires rebuilding and budgeting private metadata"
+            )
+
+    def prepare_profile_metadata(self) -> None:
+        """Materialize persistent private builders and clones inside native profiling.
+
+        The frontend must call this from its profile_run wrapper, before the
+        original profile forward. No KV allocation or runner binding occurs.
+        Native context/table geometry must remain unchanged through allocation.
+        """
+        import torch
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups, get_kv_cache_groups
+        from vllm.v1.worker.utils import select_common_block_size
+        from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+        from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+        from vllm_ascend.ops.rope_dsv4 import _ROPE_STATE
+
+        self._check_profile_geometry()
+        if self._closed:
+            raise RuntimeError("V4 attention profile lifetime has ended")
+        if self._profile_metadata_prepared:
+            return
+        if self._profile_preparing or self._profile_plan is not None:
+            raise RuntimeError("V4 private metadata preparation cannot be retried after failure")
+        config = self.runner.vllm_config
+        specs = deepcopy(self.runner.get_kv_cache_spec())
+        groups = get_kv_cache_groups(config, specs)
+        probe_config = copy(config)
+        probe_config.cache_config = copy(config.cache_config)
+        probe_config.cache_config.num_gpu_blocks_override = 1
+        plan = get_kv_cache_config_from_groups(probe_config, groups, 0)
+        _allocation_strides(plan)
+        owners = max((bucket["capacity"].requests for bucket in self._buckets.values()), default=0)
+        self._layout = kv_scratch_layout(
+            groups, max_virtual_owners=owners, mixed_capture_sizes=tuple(self._buckets)
+        )
+        for pair in _ROPE_STATE.full_rope_cache.values():
+            for tensor in pair:
+                if self._buckets and tensor.shape[0] < 127 + max(self._buckets):
+                    raise ValueError("V4 start-127 capture carrier exceeds native RoPE storage")
+                self._immutable[id(tensor)] = tensor
+        builder_groups = []
+        widths = []
+        for group_id, group in enumerate(groups):
+            layers = get_layers_from_vllm_config(config, AttentionLayerBase, group.layer_names)
+            selected = {}
+            backends = {}
+            for role in group.layer_names:
+                spec = group.kv_cache_spec.kv_cache_specs[role]
+                backend = layers[role].get_attn_backend()
+                builder_cls = backend.get_builder_cls()
+                if not issubclass(builder_cls, AscendDSAMetadataBuilder):
+                    raise ValueError(
+                        "V4 profile encountered an unsupported native metadata builder"
+                    )
+                key = (backend.full_cls_name(), spec)
+                selected.setdefault(key, []).append(role)
+                backends[key] = backend
+            block = self._layout.block_sizes[group_id]
+            kernel_block = select_common_block_size(block, list(backends.values()))
+            if kernel_block != block:
+                raise ValueError(
+                    "V4 private carrier cannot map raw physical pages with "
+                    f"physical_block_size={block} and kernel_block_size={kernel_block}; "
+                    "virtual splitting requires expanded page IDs"
+                )
+            ratio = self._layout.compress_ratios[group_id]
+            model_len = max(self._model_len, self.runner.max_encoder_len)
+            width = max((((model_len + block - 1) // block) + ratio - 1) // ratio, 1)
+            if self._layout.carrier_pages[group_id] > width:
+                raise ValueError("V4 native table is too short for the start-127 capture carrier")
+            widths.append(width)
+            for key, names in selected.items():
+                builder_cls = backends[key].get_builder_cls()
+                names = tuple(names)
+                builder_groups.append((group_id, builder_cls, key[1], names))
+                self._builder_signatures[group_id, names[0]] = (builder_cls, key[1], names)
+        self._profile_table_widths = tuple(widths)
+        self._profile_plan = plan
+        previous = self._step, self._phase, self._capture_phase
+        self._profile_preparing = True
+        try:
+            for tokens, bucket in self._buckets.items():
+                self._pending_tokens = tokens
+                self._step = None
+                self._capture_phase = "mixed"
+                common = AscendCommonAttentionMetadata(
+                    query_start_loc=torch.zeros(2, dtype=torch.int32, device=self.runner.device),
+                    query_start_loc_cpu=torch.tensor([0, tokens], dtype=torch.int32),
+                    seq_lens=torch.zeros(1, dtype=torch.int32, device=self.runner.device),
+                    seq_lens_cpu=torch.tensor([127 + tokens], dtype=torch.int32),
+                    num_reqs=1,
+                    num_actual_tokens=tokens,
+                    max_query_len=tokens,
+                    max_seq_len=self._model_len,
+                    block_table_tensor=None,
+                    slot_mapping=None,
+                    causal=True,
+                    num_input_tokens=tokens,
+                )
+                self._prepare_step(common, 1)
+                for group_id, builder_cls, spec, names in builder_groups:
+                    builder = builder_cls(
+                        spec,
+                        list(names),
+                        local_builder_config(config, bucket["capacity"]),
+                        self.runner.device,
+                    )
+                    bucket["builders"][names[0]] = builder
+                    common.block_table_tensor = torch.zeros(
+                        (1, widths[group_id]), dtype=torch.int32, device=self.runner.device
+                    )
+                    self._build_local(builder, group_id, list(names), common)
+            if self.runner.device.type == "npu":
+                torch.npu.synchronize(self.runner.device)
+            self._profile_metadata_prepared = True
+        finally:
+            self._profile_preparing = False
+            self._step, self._phase, self._capture_phase = previous
+
+    def _reserve_kv_memory(self, budget: int) -> int:
+        self._check_profile_geometry()
+        if not self._profile_metadata_prepared:
+            raise RuntimeError("V4 private metadata must be prepared inside native profiling")
+        if type(budget) is not int or budget <= 0:
+            raise ValueError("V4 native KV memory budget must be positive")
+        extension = self._layout.extra_pages * sum(_allocation_strides(self._profile_plan))
+        if budget <= extension:
+            raise ValueError("V4 native KV budget cannot hold the mandatory private pages")
+        self._kv_budget = budget
+        self._kv_extension_bytes = extension
+        logger.info(
+            "v4_graph_kv_memory_reserved",
+            native_kv_budget_bytes=budget,
+            private_kv_bytes=extension,
+            logical_kv_budget_bytes=budget - extension,
+            manual_kv_memory=getattr(
+                self.runner.vllm_config.cache_config, "kv_cache_memory_bytes", None
+            )
+            is not None,
+            capture_sizes=self.graph_config.capture_sizes,
+            decode_capture_sizes=self.graph_config.decode_capture_sizes,
+            max_num_requests=self._max_requests,
+            max_num_tokens=self._max_tokens,
+            max_model_len=self._model_len,
+        )
+        return budget - extension
 
     @property
     def phase(self) -> str:
@@ -538,6 +817,9 @@ class V4FullAttention:
         self._buckets.clear()
         self._step = None
         self._physical_config = None
+        self._profile_plan = None
+        self._builder_signatures = {}
+        self._profile_metadata_prepared = False
         self._immutable.clear()
         self._closed = True
 
@@ -569,36 +851,29 @@ class V4FullAttention:
 
         @wraps(allocate)
         def allocate_pool(logical: Any) -> Any:
-            physical = physical_cache_config(logical)
+            self._check_profile_geometry()
+            if not self._profile_metadata_prepared or self._kv_budget is None:
+                raise RuntimeError(
+                    "V4 metadata and KV memory must be reserved before native allocation"
+                )
+            if not _same_native_plan(logical, self._profile_plan):
+                raise RuntimeError("V4 native KV layout changed after profile reservation")
+            override = runner.vllm_config.cache_config.num_gpu_blocks_override
+            if override is not None and logical.num_blocks != override:
+                raise RuntimeError("V4 native logical block override changed before allocation")
+            physical = physical_cache_config(logical, self._layout)
+            extension = sum(raw.size for raw in physical.kv_cache_tensors) - sum(
+                raw.size for raw in logical.kv_cache_tensors
+            )
+            if extension != self._kv_extension_bytes:
+                raise RuntimeError("V4 private KV byte reservation changed before allocation")
+            if sum(raw.size for raw in physical.kv_cache_tensors) > self._kv_budget:
+                raise ValueError(
+                    "V4 logical KV pool plus private pages exceeds the native memory budget"
+                )
             for group_id, group in enumerate(logical.kv_cache_groups):
                 for role in group.layer_names:
                     self._group_roles[role] = group_id
-            # One positive capture carrier per group; zero-query pages keep
-            # their separate N2048..N5120 domain and never serve long queries.
-            block_counts = []
-            self._capture_page_starts = []
-            self._capture_group_ratios = []
-            next_page = 5120
-            for group in logical.kv_cache_groups:
-                self._capture_group_ratios.append(capture_group_ratio(group.kv_cache_spec))
-                block_sizes = {
-                    spec.block_size for spec in group.kv_cache_spec.kv_cache_specs.values()
-                }
-                if len(block_sizes) != 1:
-                    raise ValueError("V4 capture group has inconsistent block sizes")
-                count = (127 + 2048 + next(iter(block_sizes)) - 1) // next(iter(block_sizes))
-                self._capture_page_starts.append(next_page)
-                next_page += count
-                block_counts.append(count)
-            if block_counts != [17, 17, 17, 17, 272, 68] or next_page != 5528:
-                raise ValueError("V4 native capture carrier differs from its source contract")
-            physical.num_blocks = next_page
-            for raw, original in zip(
-                physical.kv_cache_tensors, logical.kv_cache_tensors, strict=True
-            ):
-                raw.size = original.size // 2048 * next_page
-            from copy import deepcopy
-
             logical_identity = runner.kv_cache_config
             logical_before = deepcopy(logical)
             views = allocate(physical)
@@ -610,6 +885,13 @@ class V4FullAttention:
             if any(context[role].kv_cache[0] is not views[role] for role in views):
                 raise RuntimeError("V4 native allocator did not bind its original role views")
             self._physical_config = physical
+            logger.info(
+                "v4_graph_kv_pool_allocated",
+                logical_num_blocks=logical.num_blocks,
+                physical_num_blocks=physical.num_blocks,
+                physical_kv_bytes=sum(raw.size for raw in physical.kv_cache_tensors),
+                private_kv_bytes=extension,
+            )
             return views
 
         self._bindings.bind(runner, "initialize_kv_cache_tensors", allocate_pool)
@@ -658,9 +940,9 @@ class V4FullAttention:
             impl = getattr(owner, "impl", None)
             if isinstance(impl, AscendDSAImpl):
                 implementations[id(impl)] = impl
-        if len(implementations) != 43:
+        if len(implementations) != self.graph_config.model.num_layers:
             raise ValueError(
-                "V4 Full requires exactly 43 original native attention implementations"
+                "V4 Full requires one original native attention implementation per model layer"
             )
         for impl in implementations.values():
             if impl.skip_topk or not impl.multistream_dsv4_dsa_overlap:
@@ -732,7 +1014,8 @@ class V4FullAttention:
                 and cudagraph_runtime_mode == CUDAGraphMode.FULL
                 and type(num_reqs) is int
                 and type(num_tokens_padded) is int
-                and 1 <= num_reqs <= num_tokens_padded <= 256
+                and 1 <= num_reqs <= num_tokens_padded <= self._max_requests
+                and num_tokens_padded in self.graph_config.decode_capture_sizes
                 and (query_start_loc.np[: num_reqs + 1] == runner.arange_np[: num_reqs + 1]).all()
             ):
                 query_start_loc.np[num_reqs + 1 : num_tokens_padded + 1] = (
@@ -778,6 +1061,13 @@ class V4FullAttention:
                 self._wrapped_builders.add(id(builder))
 
     def _bind_builder(self, original_builder: Any, group_id: int, layer_names: list[str]) -> None:
+        signature = self._builder_signatures.get((group_id, layer_names[0]))
+        if signature != (
+            type(original_builder),
+            original_builder.kv_cache_spec,
+            tuple(layer_names),
+        ):
+            raise RuntimeError("V4 native metadata builder grouping changed after profiling")
         original = original_builder.build
 
         def build(
@@ -809,8 +1099,8 @@ class V4FullAttention:
 
         if self._pending_tokens not in self.graph_config.capture_sizes:
             raise ValueError("V4 token geometry is absent from the frozen native bucket list")
-        if type(num_requests) is not int or not 1 <= num_requests <= 256:
-            raise ValueError("V4 Full requires 1..256 actual native requests")
+        if type(num_requests) is not int or not 1 <= num_requests <= self._max_requests:
+            raise ValueError("V4 actual native request count exceeds its allocation")
         capturing_mixed = self._capture_phase == "mixed"
         if capturing_mixed:
             lengths = (self._pending_tokens,)
@@ -830,24 +1120,18 @@ class V4FullAttention:
         phase = self._capture_phase or ("decode" if decodes == len(lengths) else "mixed")
         self._phase = phase
         if phase == "decode":
-            if self._pending_tokens > 256 or any(length != 1 for length in lengths):
+            if self._pending_tokens not in self.graph_config.decode_capture_sizes or any(
+                length != 1 for length in lengths
+            ):
                 raise ValueError("V4 native Decode phase is not uniform single-query")
             self._step = {"phase": phase}
             return
-        capacity = attention_capacity(self._pending_tokens, mixed=True)
+        capacity = attention_capacity(
+            self._pending_tokens, mixed=True, max_requests=self._max_requests
+        )
         population = attention_population(capacity, lengths, decodes)
         if capacity.outer_tokens not in self._buckets:
-            self._buckets[capacity.outer_tokens] = {
-                "capacity": capacity,
-                "buffers": _AttentionBuffers(
-                    capacity,
-                    self.runner.model_config.get_hidden_size(),
-                    self.runner.model_config.dtype,
-                    self.runner.device,
-                ),
-                "metadata": _NativeMetadataStorage(self._immutable),
-                "builders": {},
-            }
+            raise RuntimeError("V4 private bucket was not allocated before profiling")
         bucket = self._buckets[capacity.outer_tokens]
         bucket["buffers"].update_population(population)
         if capturing_mixed:
@@ -906,38 +1190,47 @@ class V4FullAttention:
         capacity = bucket["capacity"]
         population = step["population"]
         key = layer_names[0]
-        if key not in bucket["builders"]:
-            bucket["builders"][key] = type(original_builder)(
-                original_builder.kv_cache_spec,
-                layer_names,
-                local_builder_config(self.runner.vllm_config, capacity),
-                self.runner.device,
-            )
+        if key not in bucket["builders"] or (
+            not self._profile_preparing and key not in bucket["metadata"].values
+        ):
+            raise RuntimeError("V4 private builder/metadata was not prepared before KV planning")
         builder = bucket["builders"][key]
         local = copy(common)
         positions = step["positions_cpu"].to(self.runner.device)
         query = step["query_cpu"].to(self.runner.device)
         sequences = step["seq_cpu"].to(self.runner.device)
         width = common.block_table_tensor.shape[1]
-        table = torch.empty(
+        if width != self._profile_table_widths[group_id]:
+            raise RuntimeError("V4 native table geometry changed after profiling")
+        table = torch.zeros(
             (capacity.requests, width),
             dtype=common.block_table_tensor.dtype,
             device=self.runner.device,
         )
-        for owner in range(capacity.requests):
-            table[owner].fill_(independent_dummy_page(group_id, owner))
+        if not self._profile_preparing:
+            for owner in range(capacity.requests):
+                table[owner].fill_(
+                    independent_dummy_page(
+                        self._layout,
+                        logical_blocks=self.runner.kv_cache_config.num_blocks,
+                        group=group_id,
+                        owner=owner,
+                    )
+                )
         real_rows = [
             (owner, source)
             for owner, source in enumerate(population.request_sources)
             if source is not None
         ]
-        if step["capturing_mixed"]:
+        ratio = self._layout.compress_ratios[group_id]
+        if self._profile_preparing:
+            pass
+        elif step["capturing_mixed"]:
             block_size = builder.kv_cache_spec.block_size
-            ratio = self._capture_group_ratios[group_id]
             if getattr(builder.kv_cache_spec, "compress_ratio", 1) != ratio:
                 raise ValueError("V4 builder compression differs from its native group")
             page_count = capture_carrier_pages(block_size, ratio, capacity.outer_tokens)
-            reserved = (127 + 2048 + block_size - 1) // block_size
+            reserved = self._layout.carrier_pages[group_id]
             if page_count > reserved:
                 raise ValueError("V4 capture carrier exceeds its reserved physical pages")
             if page_count > width:
@@ -946,8 +1239,9 @@ class V4FullAttention:
             table[owner].zero_()
             table[owner, :page_count].copy_(
                 torch.arange(
-                    self._capture_page_starts[group_id],
-                    self._capture_page_starts[group_id] + page_count,
+                    self._layout.carrier_start(self.runner.kv_cache_config.num_blocks, group_id),
+                    self._layout.carrier_start(self.runner.kv_cache_config.num_blocks, group_id)
+                    + page_count,
                     dtype=table.dtype,
                     device=table.device,
                 )
@@ -964,7 +1258,9 @@ class V4FullAttention:
         valid_rows = torch.tensor(
             population.valid_rows, dtype=torch.int64, device=self.runner.device
         )
-        if step["capturing_mixed"] and ratio > 1:
+        if self._profile_preparing:
+            pass
+        elif step["capturing_mixed"] and ratio > 1:
             # Native compressed Prefill ignores common slots and derives its
             # real scatter slots from compressor metadata. Decode owners have
             # zero query length in this synthetic population.
@@ -993,7 +1289,7 @@ class V4FullAttention:
         local.num_actual_tokens = capacity.tokens
         local.num_input_tokens = capacity.tokens
         local.max_query_len = capacity.prefill_tokens
-        local.max_seq_len = 8192
+        local.max_seq_len = self._model_len
         local.block_table_tensor = table
         local.slot_mapping = slots
         local.positions = positions
@@ -1023,7 +1319,7 @@ class V4FullAttention:
             common_ratio_to_sas_metadata=step["common_shared"],
         )
         value.prefill.max_query_len = capacity.prefill_tokens
-        value.prefill.max_seq_lens = 8192
+        value.prefill.max_seq_lens = self._model_len
         value.decode.max_seq_lens = None
         value.decode.max_seqlen_kv = None
         value.decode.max_seqlen_q = None
@@ -1039,10 +1335,9 @@ class V4FullAttention:
 
 
 def install_v4_full_attention(runner: Any, graph_config: Any) -> V4FullAttention:
-    """Install one exact-profile adapter before the original native profile run.
+    """Install the native V4 attention boundary before the original profile run.
 
-    The adapter admits no additional runtime options. The caller performs
-    the shared graph-profile validation before reaching this native boundary.
+    Shared model facts are resolved before this device/backend-specific check.
     """
     from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.utils import (
@@ -1061,18 +1356,30 @@ def install_v4_full_attention(runner: Any, graph_config: Any) -> V4FullAttention
         return existing
     config = runner.vllm_config
     hf = config.model_config.hf_text_config
-    expected_ratios = (0, 0) + (4, 128) * 20 + (4, 0, 0, 0)
+    if (
+        hf.model_type != "deepseek_v4"
+        or hf.num_hidden_layers != graph_config.model.num_layers
+        or hf.hidden_size != graph_config.model.hidden_dim
+    ):
+        raise ValueError("V4 native model geometry differs from the resolved graph model")
+    active_ratios = tuple(hf.compress_ratios[: hf.num_hidden_layers])
+    if len(active_ratios) != hf.num_hidden_layers or any(
+        type(ratio) is not int or ratio not in (0, 1, 4, 128) for ratio in active_ratios
+    ):
+        raise ValueError(
+            "V4 native metadata/forward supports uncompressed layers or compression ratios 4/128"
+        )
+    # Pinned SparseAttnSharedkv accepts 64 query heads; its sparse-index axis
+    # is 512 when the ratio-4 branch passes learned indexer selections.
+    if hf.num_attention_heads != 64:
+        raise ValueError("A3 npu_sparse_attn_sharedkv requires 64 query heads")
+    if 4 in active_ratios and hf.index_topk != 512:
+        raise ValueError("A3 npu_sparse_attn_sharedkv requires index_topk=512 for ratio-4 layers")
     if (
         get_ascend_device_type() is not AscendDeviceType.A3
         or not enable_custom_op()
-        or tuple(hf.compress_ratios) != expected_ratios
-        or hf.num_hidden_layers != 43
-        or hf.hidden_size != 4096
-        or hf.num_attention_heads != 64
-        or hf.index_topk != 512
         or getattr(hf, "use_index_cache", False)
         or graph_config.mode != "full"
-        or tuple(graph_config.capture_sizes) != (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
         or config.parallel_config.tensor_parallel_size != 1
         or config.parallel_config.pipeline_parallel_size != 1
         or config.parallel_config.data_parallel_size != 1

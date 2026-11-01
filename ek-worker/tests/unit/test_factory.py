@@ -7,7 +7,7 @@ import builtins
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -114,6 +114,7 @@ def test_factory_builds_and_closes_ggml_worker(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("layer_ids", [(0, 1), (1, 5)], ids=["continuous", "sparse"])
 @pytest.mark.parametrize("backend_name", ["torch", "ascend_fused"])
 @pytest.mark.parametrize(
     ("recipe", "expert_compute", "fail_after_graph"),
@@ -132,6 +133,7 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     expert_compute: str,
     fail_after_graph: bool,
     backend_name: str,
+    layer_ids: tuple[int, ...],
 ) -> None:
     import expertkit_transport.transports.ascend_graph.control as graph_control
 
@@ -147,6 +149,8 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     raw = _config(tmp_path).model_dump(mode="json")
     raw["worker"]["backend"] = backend_name
     raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
+    metadata_end = 7 if layer_ids == (1, 5) else 2
+    raw["model"]["num_layers"] = metadata_end
     if recipe is not None:
         raw["model"]["quantization"] = {
             "type": recipe,
@@ -165,48 +169,13 @@ def test_factory_selects_graph_resident_from_validated_recipe(
             expert_compute=expert_compute,
             swiglu_limit=10.0,
         )
-    shared_model = {
-        key: value
-        for key, value in raw["model"].items()
-        if key not in {"instance_id", "name", "weight_version"}
-    }
     raw["worker"].update(
         device="npu:0",
         ascend_decode_graph={
-            "session_id": "worker-graph-factory-0061",
-            "instance_id": 7,
-            "weight_version": "test",
-            "workers": [
-                {
-                    "worker_id": "other",
-                    "control_endpoint": "127.0.0.1:18078",
-                    "expert_start": 0,
-                    "expert_end": 2,
-                },
-                {
-                    "worker_id": "worker-0",
-                    "control_endpoint": "127.0.0.1:18079",
-                    "expert_start": 2,
-                    "expert_end": 4,
-                },
-            ],
-            "rendezvous_host": "127.0.0.1",
-            "rendezvous_port": 18080,
-            "layer_ids": [0, 1],
-            "capture_sizes": [1],
-            "model": shared_model,
+            "control_listen": "0.0.0.0:18079",
+            "control_advertise": "worker-0:18079",
         },
     )
-    if is_v4:
-        raw["worker"]["ascend_decode_graph"]["workers"] = [
-            {
-                "worker_id": "worker-0" if rank == 1 else f"other-{rank}",
-                "control_endpoint": f"127.0.0.1:{18100 + rank}",
-                "expert_start": rank * 32,
-                "expert_end": (rank + 1) * 32,
-            }
-            for rank in range(8)
-        ]
     config = WorkerConfig.model_validate(raw)
     runtime = Mock(device=torch.device("cpu"))
     runtime.memory_info.return_value = (2 << 30, 2 << 30)
@@ -224,7 +193,13 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     control_factory = Mock()
     monkeypatch.setattr(graph_control, "GraphControlServer", control_factory)
     monkeypatch.setattr(
-        factory, "resolve_worker_config", AsyncMock(return_value=ResolvedWorkerConfig(config, None))
+        factory,
+        "resolve_worker_config",
+        AsyncMock(
+            return_value=ResolvedWorkerConfig(
+                config, SimpleNamespace(moe_layer_start=0, moe_layer_end=metadata_end)
+            )
+        ),
     )
     monkeypatch.setattr(
         factory, "_create_device_wiring", lambda _device: Mock(runtime=runtime, create_slot=Mock())
@@ -266,7 +241,7 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     assert application._execution._graph is graph_factory.return_value
     assert application._execution._control is control_factory.return_value
     control_factory.assert_called_once_with(
-        "127.0.0.1:18101" if is_v4 else "127.0.0.1:18079",
+        "0.0.0.0:18079",
         begin=graph_factory.return_value.begin,
         finish=graph_factory.return_value.finish,
     )
@@ -274,23 +249,40 @@ def test_factory_selects_graph_resident_from_validated_recipe(
         resident.assert_not_called()
     options = graph_factory.call_args.kwargs
     assert options["worker_id"] == "worker-0"
+    assert options["moe_layer_range"] == (0, metadata_end)
     selected, other = resident_types if recipe is None else resident_types[::-1]
-    assert options["prepare_weights"]() is selected.return_value
+    from expertkit_transport.ascend_graph import AscendGraphWorker
+
+    assignment = AscendGraphWorker(
+        worker_id="worker-0",
+        expected_start_id="start",
+        device="npu:0",
+        control_endpoint="worker-0:18079",
+        experts_by_layer=((2, 3), (1, 3)),
+    )
+    assert options["guard_assignments"](assignment, layer_ids) is (
+        manager.guard_graph_assignments.return_value
+    )
+    manager.guard_graph_assignments.assert_called_once_with(
+        dict(zip(layer_ids, assignment.experts_by_layer, strict=True)), device="npu:0"
+    )
+    assert options["prepare_weights"](assignment, layer_ids) is selected.return_value
     other.assert_not_called()
     selected.assert_called_once()
     prepared = selected.call_args.kwargs
     assert prepared == {
-        "layer_ids": (0, 1),
+        "layer_ids": layer_ids,
         "experts_per_layer": config.model.experts_per_layer,
         "hidden_dim": config.model.hidden_dim,
         "intermediate_dim": config.model.expert_intermediate_dim,
         "top_k": config.model.top_k,
         "acquire_many": manager.acquire_many,
         "ready_revision": prepared["ready_revision"],
-        "expert_range": (32, 64) if is_v4 else (2, 4),
+        "expert_ids_by_layer": dict(zip(layer_ids, assignment.experts_by_layer, strict=True)),
         "expert_compute": expert_compute,
         "swiglu_limit": 10.0 if is_v4 else 0.0,
     }
+    assert prepared["layer_ids"] is layer_ids
     assert prepared["ready_revision"]() == 17
     manager.ready_revision = 18
     assert prepared["ready_revision"]() == 18

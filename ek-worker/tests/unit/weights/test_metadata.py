@@ -169,15 +169,8 @@ def _document(tmp_path: Path, *, complete: bool = False, graph: bool = False) ->
         document["model"].update({field: _payload()[field] for field in _GEOMETRY_FIELDS})
     if graph:
         document["worker"]["ascend_decode_graph"] = {
-            "session_id": "metadata-graph-startup",
-            "instance_id": 7,
-            "weight_version": "test",
-            "worker_id": "worker-0",
-            "control_endpoint": "worker:18079",
-            "rendezvous_host": "worker",
-            "rendezvous_port": 18080,
-            "layer_ids": [0, 1],
-            "capture_sizes": [1, 4],
+            "control_listen": "0.0.0.0:18079",
+            "control_advertise": "worker:18079",
         }
     return document
 
@@ -335,24 +328,22 @@ def test_explicit_null_recipe_conflicts_with_quantized_metadata(tmp_path, metada
         asyncio.run(resolve_worker_config(config))
 
 
-@pytest.mark.parametrize("supplied", [None, {}, {"hidden_dim": 4}])
-def test_graph_model_uses_same_resolved_facts(tmp_path, metadata_fetch, supplied):
+def test_graph_startup_resolves_worker_model_without_injecting_graph_facts(
+    tmp_path, metadata_fetch
+):
+    resolved = asyncio.run(resolve_worker_config(_document(tmp_path, graph=True)))
+    assert resolved.config.model.hidden_dim == 4
+    assert resolved.config.model.num_layers == 2
+    assert resolved.config.worker.ascend_decode_graph.model_dump() == {
+        "control_listen": "0.0.0.0:18079",
+        "control_advertise": "worker:18079",
+    }
 
-    document = _document(tmp_path, graph=True)
-    if supplied is not None:
-        document["worker"]["ascend_decode_graph"]["model"] = supplied
-    resolved = asyncio.run(resolve_worker_config(document))
-    graph = resolved.config.worker.ascend_decode_graph
-    assert graph.model.hidden_dim == resolved.config.model.hidden_dim == 4
-    assert graph.model.num_layers == 2
-    assert graph.capture_sizes == (1, 4)
 
-
-def test_graph_supplied_model_conflict_is_not_overwritten(tmp_path, metadata_fetch):
-
+def test_graph_supplied_model_is_rejected_as_a_second_authority(tmp_path, metadata_fetch):
     document = _document(tmp_path, graph=True)
     document["worker"]["ascend_decode_graph"]["model"] = {"hidden_dim": 2048}
-    with pytest.raises(ValueError, match=r"graph model\.hidden_dim"):
+    with pytest.raises(ValueError, match="Extra inputs"):
         asyncio.run(resolve_worker_config(document))
 
 
@@ -426,25 +417,15 @@ def test_quantization_parameters_cannot_override_server_recipe(tmp_path, metadat
         asyncio.run(resolve_worker_config(config))
 
 
-def test_graph_supplied_model_keeps_strict_field_validation(tmp_path, metadata_fetch):
+def test_graph_endpoint_configuration_remains_strict(tmp_path, metadata_fetch):
     document = _document(tmp_path, graph=True)
-    document["worker"]["ascend_decode_graph"]["model"] = {"hidden_dim": "4"}
-    with pytest.raises(ValueError, match="hidden_dim"):
+    document["worker"]["ascend_decode_graph"]["control_listen"] = "http://worker:18079"
+    with pytest.raises(ValueError, match="network address"):
         asyncio.run(resolve_worker_config(document))
 
 
-def test_typed_graph_configuration_resolves_matching_explicit_model(tmp_path, metadata_fetch):
-    document = _document(tmp_path, complete=True, graph=True)
-    from expertkit_transport.transports.ascend_graph.config import AscendGraphModel
-
-    from expertkit_worker.config.models import ModelConfig
-
-    document["worker"]["ascend_decode_graph"]["model"] = ModelConfig.model_validate(
-        document["model"]
-    ).model_dump(mode="json", include=set(AscendGraphModel.model_fields))
-    original = WorkerConfig.model_validate(document)
+def test_typed_graph_configuration_reuses_resolved_worker_facts(tmp_path, metadata_fetch):
+    original = WorkerConfig.model_validate(_document(tmp_path, complete=True, graph=True))
     resolved = asyncio.run(resolve_worker_config(original))
-    assert (
-        resolved.config.worker.ascend_decode_graph.model
-        == original.worker.ascend_decode_graph.model
-    )
+    assert resolved.config.worker.ascend_decode_graph == original.worker.ascend_decode_graph
+    assert resolved.config.model.hidden_dim == original.model.hidden_dim

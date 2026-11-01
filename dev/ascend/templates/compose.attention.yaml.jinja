@@ -53,7 +53,6 @@ services:
     environment:
       EK_ENABLE: "1"
 {% if ascend_decode_graph %}
-      EK_INSTANCE_ID: "{{ ascend_decode_graph.instance_id }}"
       EK_ASCEND_DECODE_GRAPH_CONFIG: /configs/ascend-decode-graph.json
       VLLM_USE_V2_MODEL_RUNNER: "0"
       VLLM_PLUGINS: ascend,ascend_model,register_expertkit

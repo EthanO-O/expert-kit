@@ -80,11 +80,11 @@ def register() -> None:
         install_decode_graph_wrapper,
     )
 
-    graph_config = graph_config_from_environment()
-    if graph_config is not None:
+    graph_options = graph_config_from_environment()
+    if graph_options is not None:
         if current_platform.device_type != "npu":
             raise ValueError("EK_ASCEND_DECODE_GRAPH_CONFIG requires the Ascend platform")
-        install_decode_graph_wrapper(graph_config)
+        install_decode_graph_wrapper(graph_options)
 
     from expertkit_vllm.dummy_batch import install_dummy_batch_guard
 

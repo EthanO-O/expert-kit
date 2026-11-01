@@ -106,72 +106,23 @@ def test_torch_backend_accepts_indexed_npu_device(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "updates",
     [
-        (None, None),
-        (
-            "matching_quantization",
-            {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": True},
-        ),
-        ("num_layers", 2),
-        ("experts_per_layer", 5),
-        ("hidden_dim", 32),
-        ("expert_intermediate_dim", 64),
-        ("top_k", 3),
-        ("activation_dtype", "fp16"),
-        ("weight_dtype", "fp16"),
-        ("expert_compute", "deepseek_v4"),
-        ("swiglu_limit", 1.0),
-        (
-            "quantization",
-            {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": True},
-        ),
-        ("quantization", {"type": "w8a8", "bits": 8, "group_size": None}),
-        ("quantization", {"type": "gptq", "bits": 4, "group_size": 128}),
-        ("quantization", {"type": "fp4", "bits": 4, "group_size": 32}),
-        ("quantization", {"type": "modelslim-w8a8-dynamic", "bits": 4, "group_size": None}),
-        ("quantization", {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": 128}),
-        (
-            "quantization",
-            {"type": "modelslim-w8a8-dynamic", "bits": 8, "group_size": None, "symmetric": False},
-        ),
+        {"activation_dtype": "fp16"},
+        {"weight_dtype": "fp16"},
+        {"quantization": {"type": "w8a8", "bits": 8, "group_size": None}},
     ],
 )
-def test_graph_worker_checks_complete_shared_model(tmp_path, field, value):
+def test_graph_worker_retains_local_computation_checks(tmp_path, updates):
     raw = _config(tmp_path, backend="torch", device="npu:0")
     raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
-    shared_model = {
-        key: value
-        for key, value in raw["model"].items()
-        if key not in {"instance_id", "name", "weight_version"}
+    raw["model"].update(updates)
+    raw["worker"]["ascend_decode_graph"] = {
+        "control_listen": "0.0.0.0:18079",
+        "control_advertise": "worker:18079",
     }
-    shared_model.update(
-        activation="silu", expert_compute="swiglu", swiglu_limit=0.0, quantization=None
-    )
-    raw["worker"].update(
-        max_active_batches_per_device=1,
-        ascend_decode_graph={
-            "session_id": "worker-graph-model-0061",
-            "instance_id": 1,
-            "weight_version": "v1",
-            "worker_id": "worker-0",
-            "control_endpoint": "127.0.0.1:18079",
-            "rendezvous_host": "127.0.0.1",
-            "rendezvous_port": 18080,
-            "layer_ids": [0],
-            "capture_sizes": [1],
-            "model": shared_model,
-        },
-    )
-    if field == "matching_quantization":
-        raw["model"]["quantization"] = value
-        shared_model["quantization"] = value
-    if field is None or field == "matching_quantization":
-        assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph is not None
-    else:
-        raw["model"][field] = value
-        with pytest.raises(ValidationError):
-            WorkerConfig.model_validate(raw)
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(raw)
 
 
 @pytest.mark.parametrize("device", ["npu", "npu:x", "cuda", "cuda:x"])
@@ -347,107 +298,38 @@ def test_ascend_transport_requires_npu_and_bounded_registered_capacity(
             WorkerConfig.model_validate(raw)
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [(None, None), ("quantization", None), ("swiglu_limit", 0.0), ("hidden_dim", 2048)],
-)
-def test_graph_worker_requires_exact_v4_computation(tmp_path, field, value):
+@pytest.mark.parametrize("hidden_dim", [16, 2048, 4096])
+def test_unassigned_graph_worker_has_only_local_endpoint_configuration(tmp_path, hidden_dim):
     raw = _config(tmp_path, backend="torch", device="npu:0")
-    raw["model"].update(
-        num_layers=43,
-        experts_per_layer=256,
-        hidden_dim=4096,
-        expert_intermediate_dim=2048,
-        top_k=6,
-        activation_dtype="bf16",
-        weight_dtype="bf16",
-        activation="silu",
-        expert_compute="deepseek_v4",
-        swiglu_limit=10.0,
-        quantization={
-            "type": "modelslim-w8a8-dynamic",
-            "bits": 8,
-            "group_size": None,
-            "symmetric": True,
-        },
-    )
-    shared_model = {
-        key: value
-        for key, value in raw["model"].items()
-        if key not in {"instance_id", "name", "weight_version"}
+    raw["model"].update(activation_dtype="bf16", weight_dtype="bf16", hidden_dim=hidden_dim)
+    raw["worker"]["ascend_decode_graph"] = {
+        "control_listen": "0.0.0.0:18079",
+        "control_advertise": "worker:18079",
     }
-    raw["worker"].update(
-        max_active_batches_per_device=1,
-        ascend_decode_graph={
-            "session_id": "worker-graph-v4-model",
-            "instance_id": 1,
-            "weight_version": "v1",
-            "workers": [
-                {
-                    "worker_id": f"worker-{rank}",
-                    "control_endpoint": f"127.0.0.1:{18100 + rank}",
-                    "expert_start": rank * 32,
-                    "expert_end": (rank + 1) * 32,
-                }
-                for rank in range(8)
-            ],
-            "rendezvous_host": "127.0.0.1",
-            "rendezvous_port": 18080,
-            "layer_ids": [0],
-            "capture_sizes": [1],
-            "model": shared_model,
-        },
-    )
-    if field is None:
-        assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph is not None
-    else:
-        raw["model"][field] = value
-        with pytest.raises(ValidationError, match="exact V4"):
-            WorkerConfig.model_validate(raw)
+    graph = WorkerConfig.model_validate(raw).worker.ascend_decode_graph
+    assert graph.control_advertise == "worker:18079"
+    assert set(type(graph).model_fields) == {"control_listen", "control_advertise"}
 
 
 @pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
-@pytest.mark.parametrize("worker_count", [2, 8])
-def test_full_graph_accepts_resident_backends(tmp_path, backend, worker_count):
+def test_local_graph_config_accepts_resident_backends(tmp_path, backend):
     raw = _config(tmp_path, backend=backend, device="npu:0")
-    raw["model"].update(
-        num_layers=48,
-        experts_per_layer=128,
-        hidden_dim=2048,
-        expert_intermediate_dim=768,
-        top_k=8,
-        activation_dtype="bf16",
-        weight_dtype="bf16",
-        activation="silu",
-        expert_compute="swiglu",
-        swiglu_limit=0.0,
-        quantization=dict(type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True),
-    )
-    raw["worker"].update(
-        max_active_batches_per_device=1,
-        ascend_decode_graph=dict(
-            mode="full",
-            session_id="qwen-full-worker-test",
-            instance_id=1,
-            weight_version="v1",
-            rendezvous_host="127.0.0.1",
-            rendezvous_port=18080,
-            layer_ids=list(range(48)),
-            capture_sizes=[2**power for power in range(12)],
-            model={
-                k: v
-                for k, v in raw["model"].items()
-                if k not in {"instance_id", "name", "weight_version"}
-            },
-            workers=[
-                dict(
-                    worker_id=f"worker-{i}",
-                    control_endpoint=f"127.0.0.1:{18100 + i}",
-                    expert_start=(128 // worker_count) * i,
-                    expert_end=(128 // worker_count) * (i + 1),
-                )
-                for i in range(worker_count)
-            ],
-        ),
-    )
-    assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph.mode == "full"
+    raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
+    raw["worker"]["ascend_decode_graph"] = {
+        "control_listen": "0.0.0.0:18079",
+        "control_advertise": "worker:18079",
+    }
+    assert WorkerConfig.model_validate(raw).worker.ascend_decode_graph is not None
+
+
+@pytest.mark.parametrize("extra", ["model", "workers", "layer_ids", "capture_sizes", "instance_id"])
+def test_local_graph_config_rejects_a_second_runtime_authority(tmp_path, extra):
+    raw = _config(tmp_path, backend="torch", device="npu:0")
+    raw["model"].update(activation_dtype="bf16", weight_dtype="bf16")
+    raw["worker"]["ascend_decode_graph"] = {
+        "control_listen": "worker:18079",
+        "control_advertise": "worker:18079",
+        extra: {},
+    }
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(raw)

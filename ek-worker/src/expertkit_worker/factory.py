@@ -163,7 +163,10 @@ async def build_worker_application(
         config = await resolve_worker_config(config)
     if not isinstance(config, ResolvedWorkerConfig):
         raise TypeError("config must be a WorkerConfig or ResolvedWorkerConfig")
+    metadata = config.metadata
     config = config.config
+    if config.worker.ascend_decode_graph is not None and metadata is None:
+        raise ValueError("Ascend graph Worker startup requires resolved Weight Server metadata")
     resolved_instance = await instance_resolver(
         config.controller.endpoint,
         requested_instance_id=config.model.instance_id,
@@ -341,6 +344,7 @@ async def build_worker_application(
         manager_holder[0] = manager
 
         if graph_config is not None:
+            from expertkit_transport.transports.ascend_graph.config import AscendGraphModel
             from expertkit_transport.transports.ascend_graph.control import GraphControlServer
 
             from expertkit_worker.execution.decode_graph import (
@@ -350,35 +354,41 @@ async def build_worker_application(
 
             resident_weights = graph_resident_type(config)
 
-            if graph_config.instance_id != instance_id:
-                raise ValueError(
-                    "Ascend graph instance does not match the resolved Controller instance"
-                )
-            assert device_admission is not None
-            participant = graph_config.participants[graph_config.worker_rank(config.worker.id) - 1]
+            assert device_admission is not None and metadata is not None
+            graph_model = AscendGraphModel.model_validate(
+                config.model.model_dump(mode="json", include=set(AscendGraphModel.model_fields))
+            )
             graph_execution = AscendDecodeGraphExecution(
-                graph_config,
+                instance_id=instance_id,
+                model_name=config.model.name,
+                weight_version=config.model.weight_version,
+                model=graph_model,
+                moe_layer_range=(metadata.moe_layer_start, metadata.moe_layer_end),
                 worker_start_id=worker_start_id,
                 worker_id=config.worker.id,
                 device=device,
-                hidden_dim=config.model.hidden_dim,
-                top_k=config.model.top_k,
+                device_name=config.worker.device,
+                max_batch_tokens=config.worker.max_batch_tokens,
+                shutdown_grace_secs=config.worker.shutdown_grace_secs,
                 admission=device_admission,
-                prepare_weights=lambda: resident_weights(
-                    layer_ids=graph_config.layer_ids,
+                guard_assignments=lambda assignment, layer_ids: manager.guard_graph_assignments(
+                    assignment.expert_ids_by_layer(layer_ids), device=config.worker.device
+                ),
+                prepare_weights=lambda assignment, layer_ids: resident_weights(
+                    layer_ids=layer_ids,
                     experts_per_layer=config.model.experts_per_layer,
                     hidden_dim=config.model.hidden_dim,
                     intermediate_dim=config.model.expert_intermediate_dim,
                     top_k=config.model.top_k,
                     acquire_many=manager.acquire_many,
                     ready_revision=lambda: manager.ready_revision,
-                    expert_range=(participant.expert_start, participant.expert_end),
+                    expert_ids_by_layer=assignment.expert_ids_by_layer(layer_ids),
                     expert_compute=config.model.expert_compute,
                     swiglu_limit=config.model.swiglu_limit,
                 ),
             )
             graph_control = GraphControlServer(
-                participant.control_endpoint,
+                graph_config.control_listen,
                 begin=graph_execution.begin,
                 finish=graph_execution.finish,
             )

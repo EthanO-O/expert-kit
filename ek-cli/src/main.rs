@@ -243,6 +243,15 @@ fn init_tokio_runtime(_command: &Command) -> Result<Runtime, std::io::Error> {
 
 fn main() {
     let cli = RootCli::parse();
+    if matches!(
+        &cli.command,
+        Command::Schedule {
+            command: schedule::ScheduleCommand::Graph { .. }
+        }
+    ) {
+        eprintln!("{}", schedule::RETIRED_GRAPH_SCHEDULE_MESSAGE);
+        std::process::exit(2);
+    }
     if cli.debug {
         unsafe { std::env::set_var("RUST_LOG", "debug") };
     }

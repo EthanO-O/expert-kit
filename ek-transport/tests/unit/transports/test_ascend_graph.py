@@ -9,7 +9,10 @@ import pytest
 import torch
 from pydantic import ValidationError
 
-from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.transports.ascend_graph.config import (
+    AscendGraphConfig,
+    AscendGraphOptions,
+)
 from expertkit_transport.transports.ascend_graph.contracts import GraphCompletionUnproven
 from expertkit_transport.transports.ascend_graph.control import (
     MAX_CONTROL_BYTES,
@@ -22,18 +25,42 @@ from expertkit_transport.transports.ascend_graph.control import (
 
 
 def config_for(port: int = 12345, **updates) -> AscendGraphConfig:
-    """Create a small fixed deployment shared by both control peers."""
+    """Create explicit resolved facts shared by the CPU control peers."""
     return AscendGraphConfig.model_validate(
         {
             "session_id": "cpu-graph-session-0001",
             "instance_id": 1,
-            "worker_id": "worker",
+            "model_name": "model",
             "weight_version": "model-revision",
-            "control_endpoint": f"127.0.0.1:{port}",
+            "source_topology_version": 7,
+            "mode": "decode",
+            "model": {
+                "num_layers": 27,
+                "experts_per_layer": 64,
+                "hidden_dim": 2048,
+                "expert_intermediate_dim": 1408,
+                "top_k": 6,
+                "activation_dtype": "bf16",
+                "weight_dtype": "bf16",
+                "activation": "silu",
+                "expert_compute": "swiglu",
+                "swiglu_limit": 0.0,
+                "quantization": None,
+            },
+            "workers": [
+                {
+                    "worker_id": "worker",
+                    "expected_start_id": "start-one",
+                    "device": "npu:0",
+                    "control_endpoint": f"127.0.0.1:{port}",
+                    "experts_by_layer": [list(range(64)), list(range(64))],
+                }
+            ],
             "rendezvous_host": "127.0.0.1",
             "rendezvous_port": 12346,
             "layer_ids": [1, 2],
             "capture_sizes": [1, 4],
+            "decode_capture_sizes": updates.get("capture_sizes", [1, 4]),
             "timeout_seconds": 2.0,
             **updates,
         }
@@ -113,6 +140,8 @@ def test_real_grpc_control_matches_steps_and_poison_after_restart() -> None:
     def begin(request, *, timeout):
         requests.append(request)
         return {
+            "version": 2,
+            "assignment_id": request["assignment_id"],
             "state": "ready",
             "sequence": request["sequence"],
             "worker_start_id": start_id[0],
@@ -120,8 +149,17 @@ def test_real_grpc_control_matches_steps_and_poison_after_restart() -> None:
         }
 
     def finish(request, *, timeout):
-        assert request == requests[-1]
-        return {"state": "complete", "sequence": request["sequence"]}
+        expected = {key: value for key, value in requests[-1].items() if key != "config"}
+        expected["ready_revision"] = 7
+        assert request == expected
+        return {
+            "version": 2,
+            "assignment_id": request["assignment_id"],
+            "state": "complete",
+            "sequence": request["sequence"],
+            "worker_start_id": start_id[0],
+            "ready_revision": 7,
+        }
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         server = grpc.server(executor)
@@ -154,75 +192,44 @@ def test_real_grpc_control_matches_steps_and_poison_after_restart() -> None:
 
 
 def two_worker_config(ports=(12344, 12345)):
-    """Use canonical rank order with disjoint contiguous ownership."""
-    data = config_for().model_dump(exclude={"worker_id", "control_endpoint"})
+    """Use canonical rank order with two exact-once expert owners."""
+    data = config_for().model_dump()
     data["workers"] = [
         {
             "worker_id": f"worker{rank}",
+            "expected_start_id": f"start-{rank}",
+            "device": f"npu:{rank}",
             "control_endpoint": f"127.0.0.1:{port}",
-            "expert_start": rank * 32,
-            "expert_end": (rank + 1) * 32,
+            "experts_by_layer": [
+                list(range(rank * 32, (rank + 1) * 32)) for _ in data["layer_ids"]
+            ],
         }
         for rank, port in enumerate(ports)
     ]
     return AscendGraphConfig.model_validate(data)
 
 
-def test_canonical_participants_preserve_legacy_identity_and_reject_partial_ownership():
-    legacy = config_for()
-    explicit = legacy.model_dump(exclude={"worker_id", "control_endpoint"})
-    explicit["workers"] = [legacy.participants[0].model_dump()]
-    assert AscendGraphConfig.model_validate(explicit).identity() == legacy.identity()
-    two = two_worker_config()
-    assert two.worker_rank("worker1") == 2
+def test_runtime_rank_order_and_exact_once_coverage():
+    config = two_worker_config()
+    assert config.worker_rank("worker1") == 2
     with pytest.raises(ValueError, match="absent"):
-        two.worker_rank("missing")
+        config.worker_rank("missing")
     for change in (
-        {"expert_start": 31},
+        {"experts_by_layer": [[31, *range(32, 64)], list(range(32, 64))]},
         {"worker_id": "worker0"},
-        {"control_endpoint": two.participants[0].control_endpoint},
+        {"control_endpoint": config.participants[0].control_endpoint},
     ):
-        invalid = two.model_dump()
+        invalid = config.model_dump()
         invalid["workers"][1].update(change)
         with pytest.raises(ValidationError):
             AscendGraphConfig.model_validate(invalid)
-    with pytest.raises(ValidationError):
-        AscendGraphConfig.model_validate({**two.model_dump(), "worker_id": "legacy"})
 
 
-def test_shared_model_normalizes_legacy_json_and_covers_qwen_intervals():
-    legacy = config_for()
-    assert legacy.model.model_dump() == {
-        "num_layers": 27,
-        "experts_per_layer": 64,
-        "hidden_dim": 2048,
-        "expert_intermediate_dim": 1408,
-        "top_k": 6,
-        "activation_dtype": "bf16",
-        "weight_dtype": "bf16",
-        "activation": "silu",
-        "expert_compute": "swiglu",
-        "swiglu_limit": 0.0,
-        "quantization": None,
-    }
-    assert (
-        AscendGraphConfig.model_validate_json(legacy.model_dump_json()).identity()
-        == legacy.identity()
-    )
-    two = two_worker_config()
-    old = two.model_dump(exclude={"model"})
-    assert AscendGraphConfig.model_validate(old).identity() == two.identity()
-    qwen = two.model_dump()
-    qwen["model"].update(num_layers=48, experts_per_layer=128, expert_intermediate_dim=768, top_k=8)
-    qwen["layer_ids"] = list(range(48))
-    for index, worker in enumerate(qwen["workers"]):
-        worker.update(expert_start=index * 64, expert_end=(index + 1) * 64)
-    parsed = AscendGraphConfig.model_validate(qwen)
-    assert parsed.participants[1].expert_end == 128
-    assert parsed.identity()["model"] == parsed.model.model_dump(mode="json")
-    qwen["workers"][1]["expert_end"] = 129
-    with pytest.raises(ValidationError, match="partition"):
-        AscendGraphConfig.model_validate(qwen)
+def test_runtime_model_is_required_and_json_round_trips():
+    config = config_for()
+    assert AscendGraphConfig.model_validate_json(config.model_dump_json()) == config
+    with pytest.raises(ValidationError, match="model"):
+        AscendGraphConfig.model_validate(config.model_dump(exclude={"model"}))
 
 
 @pytest.mark.parametrize(
@@ -307,6 +314,8 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
             requests[rank].append(request)
             begin_barrier.wait()
             return {
+                "version": 2,
+                "assignment_id": request["assignment_id"],
                 "state": "ready",
                 "sequence": request["sequence"],
                 "worker_start_id": f"start-{rank}",
@@ -322,7 +331,14 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
                 assert release_finish.wait(2)
                 if fail_finish[0]:
                     raise GraphCompletionUnproven("peer completion failed")
-            return {"state": "complete", "sequence": request["sequence"]}
+            return {
+                "version": 2,
+                "assignment_id": request["assignment_id"],
+                "state": "complete",
+                "sequence": request["sequence"],
+                "worker_start_id": f"start-{rank}",
+                "ready_revision": 7 + rank,
+            }
 
         return finish
 
@@ -337,7 +353,7 @@ def test_all_peer_begin_is_concurrent_and_partial_finish_preserves_poisoned_owne
             server.start()
             servers.append(server)
         if worker_count == 8:
-            data = qwen_config_data()
+            data = v4_config_data()
             for worker, port in zip(data["workers"], ports, strict=True):
                 worker["control_endpoint"] = f"127.0.0.1:{port}"
             config = AscendGraphConfig.model_validate(data)
@@ -411,7 +427,7 @@ def test_fp32_reduce_zeroes_frontend_each_layer_and_preserves_worker_partial():
 
 
 def v4_config_data():
-    """Declare the exact eight-shard V4 checkpoint geometry."""
+    """Declare explicit V4 geometry for existing buffer and control tests."""
     data = two_worker_config().model_dump()
     data["model"].update(
         num_layers=43,
@@ -431,33 +447,33 @@ def v4_config_data():
     data["workers"] = [
         {
             "worker_id": f"worker{rank}",
+            "expected_start_id": f"start-{rank}",
             "control_endpoint": f"127.0.0.1:{12344 + rank}",
-            "expert_start": rank * 32,
-            "expert_end": (rank + 1) * 32,
+            "device": f"npu:{rank}",
+            "experts_by_layer": [
+                list(range(rank * 32, (rank + 1) * 32)) for _ in data["layer_ids"]
+            ],
         }
         for rank in range(8)
     ]
     return data
 
 
-def test_exact_v4_requires_eight_ordered_32_expert_shards():
-    config = AscendGraphConfig.model_validate(v4_config_data())
-    assert len(config.participants) == 8
-    assert [config.worker_rank(f"worker{rank}") for rank in range(8)] == list(range(1, 9))
-    assert (
-        AscendGraphConfig.model_validate_json(config.model_dump_json()).identity()
-        == config.identity()
-    )
-    for workers in (
-        [{**v4_config_data()["workers"][0], "expert_end": 256}],
-        [
-            {**worker, "expert_start": rank * 128, "expert_end": (rank + 1) * 128}
-            for rank, worker in enumerate(v4_config_data()["workers"][:2])
-        ],
-        list(reversed(v4_config_data()["workers"])),
-    ):
-        with pytest.raises(ValidationError, match="partition"):
-            AscendGraphConfig.model_validate({**v4_config_data(), "workers": workers})
+@pytest.mark.parametrize("worker_count", [1, 3, 8])
+def test_runtime_allows_worker_counts_without_experiment_whitelists(worker_count):
+    data = v4_config_data()
+    data["workers"] = [
+        {
+            "worker_id": f"worker{rank}",
+            "expected_start_id": f"start-{rank}",
+            "control_endpoint": f"127.0.0.1:{12344 + rank}",
+            "device": f"npu:{rank}",
+            "experts_by_layer": [list(range(rank, 256, worker_count)) for _ in data["layer_ids"]],
+        }
+        for rank in range(worker_count)
+    ]
+    config = AscendGraphConfig.model_validate(data)
+    assert len(config.participants) == worker_count
 
 
 @pytest.mark.parametrize(
@@ -466,40 +482,28 @@ def test_exact_v4_requires_eight_ordered_32_expert_shards():
         {"num_layers": 42},
         {"hidden_dim": 2048},
         {"expert_intermediate_dim": 2047},
-        {"experts_per_layer": 255},
         {"top_k": 5},
         {"swiglu_limit": 9.0},
-        {"expert_compute": "swiglu", "swiglu_limit": 0.0},
         {"quantization": None},
-        {
-            "quantization": {
-                "type": "modelslim-w8a8-dynamic",
-                "bits": 4,
-                "group_size": None,
-                "symmetric": True,
-            }
-        },
     ],
 )
-def test_eight_workers_reject_near_v4_declarations(update):
+def test_runtime_geometry_has_no_experiment_whitelist(update):
     data = v4_config_data()
     data["model"].update(update)
-    with pytest.raises(ValidationError):
-        AscendGraphConfig.model_validate(data)
+    assert AscendGraphConfig.model_validate(data).model.model_dump().items() >= update.items()
 
 
 @pytest.mark.parametrize(
     "index,update",
     [
-        (0, {"expert_end": 31}),
-        (1, {"expert_start": 31}),
-        (1, {"expert_start": 33}),
-        (7, {"expert_end": 255}),
+        (0, {"experts_by_layer": [list(range(31)), list(range(32))]}),
+        (1, {"experts_by_layer": [list(range(31, 64)), list(range(32, 64))]}),
+        (7, {"experts_by_layer": [list(range(224, 255)), list(range(224, 256))]}),
         (1, {"worker_id": "worker0"}),
         (1, {"control_endpoint": "127.0.0.1:12344"}),
     ],
 )
-def test_v4_partition_preserves_ownership_and_identity_checks(index, update):
+def test_assignment_coverage_and_identity_are_checked(index, update):
     data = v4_config_data()
     data["workers"][index].update(update)
     with pytest.raises(ValidationError):
@@ -569,7 +573,7 @@ def test_real_buffer_allocation_selects_multiworker_fp32_reduction(workers):
 
 
 def qwen_config_data():
-    """Declare the exact Qwen checkpoint with eight contiguous resident shards."""
+    """Declare explicit Qwen checkpoint facts for existing control tests."""
     data = v4_config_data()
     data["model"].update(
         num_layers=48,
@@ -582,7 +586,9 @@ def qwen_config_data():
     )
     data["layer_ids"] = list(range(48))
     for rank, worker in enumerate(data["workers"]):
-        worker.update(expert_start=rank * 16, expert_end=(rank + 1) * 16)
+        worker["experts_by_layer"] = [
+            list(range(rank * 16, (rank + 1) * 16)) for _ in data["layer_ids"]
+        ]
     return data
 
 
@@ -599,10 +605,8 @@ def test_exact_qwen_accepts_eight_ordered_16_expert_shards(mode):
 
 
 @pytest.mark.parametrize("mode", ["decode", "full"])
-@pytest.mark.parametrize(
-    "change", ["missing", "reversed", "gap", "overlap", "layers", "geometry", "quantization"]
-)
-def test_eight_qwen_shards_reject_incomplete_or_inexact_declarations(mode, change):
+@pytest.mark.parametrize("change", ["missing", "reversed", "gap", "overlap", "layers"])
+def test_assignments_reject_incomplete_or_ambiguous_declarations(mode, change):
     data = qwen_config_data()
     data["mode"] = mode
     if change == "missing":
@@ -610,40 +614,27 @@ def test_eight_qwen_shards_reject_incomplete_or_inexact_declarations(mode, chang
     elif change == "reversed":
         data["workers"].reverse()
     elif change == "gap":
-        data["workers"][3]["expert_start"] += 1
+        data["workers"][3]["experts_by_layer"][0].pop(0)
     elif change == "overlap":
-        data["workers"][3]["expert_start"] -= 1
-    elif change == "layers":
-        data["layer_ids"].pop()
-    elif change == "geometry":
-        data["model"]["expert_intermediate_dim"] = 769
+        data["workers"][3]["experts_by_layer"][0].insert(0, 47)
     else:
-        data["model"]["quantization"] = None
-    with pytest.raises(ValidationError, match="partition"):
+        data["layer_ids"].pop()
+    with pytest.raises(ValidationError):
         AscendGraphConfig.model_validate(data)
 
 
-def test_eight_qwen_full_graph_keeps_token_capacity_limit():
+def test_runtime_capture_capacity_has_no_experiment_limit():
     data = qwen_config_data()
-    data.update(mode="full", capture_sizes=[4096])
-    with pytest.raises(ValidationError, match="capacity cannot exceed 2048"):
-        AscendGraphConfig.model_validate(data)
+    data.update(mode="full", capture_sizes=[4096, 3], decode_capture_sizes=[3])
+    assert AscendGraphConfig.model_validate(data).capture_sizes == (3, 4096)
 
 
-def test_v4_full_requires_complete_layers_and_exact_capture_profile():
+def test_v4_full_capture_profile_uses_only_requested_capacities():
     values = v4_config_data()
-    values.update(
-        mode="full",
-        layer_ids=tuple(range(43)),
-        capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
-    )
+    values.update(mode="full", capture_sizes=[257, 3, 257], decode_capture_sizes=[3])
     config = AscendGraphConfig.model_validate(values)
-    assert config.mode == "full"
-    equivalent = {**values, "capture_sizes": [*reversed(values["capture_sizes"]), 64]}
-    assert AscendGraphConfig.model_validate(equivalent).identity() == config.identity()
-    for update in ({"layer_ids": (0, 2, 3)}, {"capture_sizes": (1, 256, 2048)}):
-        with pytest.raises(ValidationError):
-            AscendGraphConfig.model_validate({**values, **update})
+    assert config.capture_sizes == (3, 257)
+    assert config.model.expert_compute == "deepseek_v4"
 
 
 def test_v4_control_phase_field_is_narrow_and_legacy_payload_unchanged(monkeypatch):
@@ -652,7 +643,10 @@ def test_v4_control_phase_field_is_narrow_and_legacy_payload_unchanged(monkeypat
         mode="full",
         layer_ids=tuple(range(43)),
         capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+        decode_capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256),
     )
+    for worker in values["workers"]:
+        worker["experts_by_layer"] = [worker["experts_by_layer"][0] for _ in values["layer_ids"]]
     control = GraphStepControl(AscendGraphConfig.model_validate(values))
     requests = []
 
@@ -661,14 +655,26 @@ def test_v4_control_phase_field_is_narrow_and_legacy_payload_unchanged(monkeypat
             requests.extend(dict(item) for item in control._requests)
             return [
                 dict(
+                    version=2,
+                    assignment_id=control._assignment_id,
                     sequence=control._sequence,
                     state="ready",
-                    worker_start_id="start",
+                    worker_start_id=peer.worker_start_id,
                     ready_revision=1,
                 )
-                for _ in control._peers
+                for peer in control._peers
             ]
-        return [dict(sequence=control._sequence, state="complete") for _ in control._peers]
+        return [
+            dict(
+                version=2,
+                assignment_id=control._assignment_id,
+                sequence=control._sequence,
+                state="complete",
+                worker_start_id=peer.worker_start_id,
+                ready_revision=peer.ready_revision,
+            )
+            for peer in control._peers
+        ]
 
     monkeypatch.setattr(control, "_fanout", fanout)
     try:
@@ -677,6 +683,9 @@ def test_v4_control_phase_field_is_narrow_and_legacy_payload_unchanged(monkeypat
                 control.begin("capture", 4, graph_phase=graph_phase)
         with pytest.raises(ValueError):
             control.begin("warmup", 4, graph_phase="decode")
+        control.begin("prepare")
+        control.finish()
+        requests.clear()
         for phase in ("decode", "mixed"):
             control.begin("capture", 4, graph_phase=phase)
             control.finish()
@@ -697,3 +706,410 @@ def test_legacy_control_rejects_graph_phase_before_any_rpc():
         assert control._sequence == 0 and control._active is None
     finally:
         control.close()
+
+
+@pytest.mark.parametrize("capture_sizes", [[9, 3, 9], [17], [256, 64, 128, 64]])
+def test_options_and_runtime_share_capacity_normalization(capture_sizes):
+    options = AscendGraphOptions(
+        rendezvous_host="127.0.0.1", rendezvous_port=12346, capture_sizes=capture_sizes
+    )
+    assert options.capture_sizes == config_for(capture_sizes=capture_sizes).capture_sizes
+
+
+@pytest.mark.parametrize("capture_sizes", [[], [0], [-1], [True], [1.0], ["4"]])
+def test_options_reject_invalid_capacities(capture_sizes):
+    with pytest.raises(ValidationError, match="capture_sizes"):
+        AscendGraphOptions(
+            rendezvous_host="127.0.0.1", rendezvous_port=12346, capture_sizes=capture_sizes
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"rendezvous_host": ""},
+        {"rendezvous_host": "bad host"},
+        {"rendezvous_host": "http://host"},
+        {"rendezvous_port": True},
+        {"rendezvous_port": 0},
+        {"rendezvous_port": 65536},
+        {"timeout_seconds": float("inf")},
+        {"timeout_seconds": 0.0},
+        {"unknown": 1},
+    ],
+)
+def test_options_and_runtime_reject_invalid_common_fields(updates):
+    options = {"rendezvous_host": "127.0.0.1", "rendezvous_port": 12346, **updates}
+    with pytest.raises(ValidationError):
+        AscendGraphOptions.model_validate(options)
+    with pytest.raises(ValidationError):
+        config_for(**updates)
+
+
+@pytest.mark.parametrize(
+    "legacy_field",
+    [
+        "session_id",
+        "workers",
+        "worker_id",
+        "control_endpoint",
+        "model",
+        "layer_ids",
+        "instance_id",
+        "weight_version",
+    ],
+)
+def test_options_file_explains_legacy_deployment_migration(tmp_path, legacy_field):
+    path = tmp_path / "graph.json"
+    path.write_text(
+        json.dumps(
+            {
+                "rendezvous_host": "127.0.0.1",
+                "rendezvous_port": 12346,
+                legacy_field: None,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match=r"ordinary ek-cli schedule.*READY"):
+        AscendGraphOptions.from_file(path)
+    with pytest.raises(ValueError, match="control_listen/control_advertise"):
+        AscendGraphConfig.from_file(path)
+
+
+def test_options_only_file_round_trip_and_public_exports(tmp_path):
+    from expertkit_transport.ascend_graph import AscendGraphOptions as PublicOptions
+    from expertkit_transport.ascend_graph import AscendGraphWorker
+
+    path = tmp_path / "options.json"
+    path.write_text('{"rendezvous_host":"worker-host","rendezvous_port":12346}')
+    options = PublicOptions.from_file(path)
+    assert options.capture_sizes == (1, 2, 4, 8, 16, 32, 64)
+    assert options.mode == "decode"
+    assert isinstance(config_for().participants[0], AscendGraphWorker)
+    assert set(type(options).model_fields) == {
+        "mode",
+        "capture_sizes",
+        "timeout_seconds",
+        "rendezvous_host",
+        "rendezvous_port",
+    }
+
+
+def test_noncontiguous_layer_dependent_assignments_include_empty_layers():
+    data = two_worker_config().model_dump(mode="json")
+    data["model"]["experts_per_layer"] = 6
+    data["workers"][0]["experts_by_layer"] = [[0, 2, 4], []]
+    data["workers"][1]["experts_by_layer"] = [[1, 3, 5], [0, 1, 2, 3, 4, 5]]
+    config = AscendGraphConfig.model_validate(data)
+    worker = config.participants[0]
+    mapped = worker.expert_ids_by_layer(config.layer_ids)
+    assert mapped == {1: (0, 2, 4), 2: ()}
+    mapped[1] = ()
+    assert worker.experts_by_layer == ((0, 2, 4), ())
+    with pytest.raises(ValidationError, match="frozen"):
+        worker.device = "npu:1"
+    with pytest.raises(ValidationError, match="frozen"):
+        config.model.hidden_dim = 4
+    with pytest.raises(ValidationError, match="frozen"):
+        config.weight_version = "other"
+    with pytest.raises(ValueError):
+        worker.expert_ids_by_layer((1,))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"expected_start_id": None},
+        {"expected_start_id": ""},
+        {"expected_start_id": "x" * 129},
+        {"device": "cuda:0"},
+        {"device": "npu"},
+        {"device": "npu:-1"},
+        {"control_endpoint": "http://host:1234"},
+        {"control_endpoint": "host:0"},
+        {"expert_start": 0},
+        {"experts_by_layer": [[], []]},
+        {"experts_by_layer": [[0, 0], []]},
+        {"experts_by_layer": [[2, 0], []]},
+        {"experts_by_layer": [[-1], []]},
+        {"experts_by_layer": [[True], []]},
+        {"experts_by_layer": [[1.0], []]},
+        {"experts_by_layer": [[64], []]},
+        {"experts_by_layer": [list(range(64))]},
+    ],
+)
+def test_runtime_rejects_invalid_worker_dependencies(change):
+    data = config_for().model_dump(mode="json")
+    data["workers"][0].update(change)
+    with pytest.raises(ValidationError):
+        AscendGraphConfig.model_validate(data)
+
+
+def test_expected_start_is_required_in_runtime_snapshot():
+    data = config_for().model_dump(mode="json")
+    data["workers"][0].pop("expected_start_id")
+    with pytest.raises(ValidationError, match="expected_start_id"):
+        AscendGraphConfig.model_validate(data)
+
+
+def test_assignment_digest_is_canonical_and_ignores_topology_provenance():
+    import hashlib
+
+    config = config_for()
+    encoded = json.dumps(config.identity(), sort_keys=True, separators=(",", ":")).encode()
+    assert config.assignment_id == hashlib.sha256(encoded).hexdigest()
+    assert len(config.assignment_id) == 64
+    assert config.identity()["version"] == 2
+    assert "source_topology_version" not in config.identity()
+    changed = config_for(source_topology_version=10000)
+    assert config.assignment_id == changed.assignment_id
+    reordered = dict(reversed(list(config.model_dump(mode="json").items())))
+    assert AscendGraphConfig.model_validate(reordered).assignment_id == config.assignment_id
+    assert (
+        AscendGraphConfig.model_validate_json(config.model_dump_json()).assignment_id
+        == config.assignment_id
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("session_id", "another-session-identity"),
+        ("instance_id", 2),
+        ("model_name", "other-model"),
+        ("weight_version", "other-version"),
+        ("layer_ids", [0, 2]),
+        ("mode", "full"),
+        ("capture_sizes", [1, 5]),
+        ("timeout_seconds", 3.0),
+        ("rendezvous_host", "other-host"),
+        ("rendezvous_port", 12347),
+    ],
+)
+def test_every_session_fact_changes_digest(field, value):
+    original = config_for()
+    changed = config_for(**{field: value})
+    assert changed.assignment_id != original.assignment_id
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worker_id", "other-worker"),
+        ("expected_start_id", "other-start"),
+        ("device", "npu:3"),
+        ("control_endpoint", "other-host:12345"),
+    ],
+)
+def test_selected_worker_identity_changes_digest(field, value):
+    original = config_for()
+    data = original.model_dump(mode="json")
+    data["workers"][0][field] = value
+    assert AscendGraphConfig.model_validate(data).assignment_id != original.assignment_id
+
+
+def test_selected_expert_owner_changes_digest():
+    original = two_worker_config()
+    data = original.model_dump(mode="json")
+    data["workers"][0]["experts_by_layer"][0] = [0, *range(32, 63)]
+    data["workers"][1]["experts_by_layer"][0] = [*range(1, 32), 63]
+    assert AscendGraphConfig.model_validate(data).assignment_id != original.assignment_id
+
+
+@pytest.mark.parametrize("version", ["", "x" * 257])
+def test_runtime_requires_bounded_nonempty_weight_version(version):
+    with pytest.raises(ValidationError, match="weight_version"):
+        config_for(weight_version=version)
+
+
+@pytest.mark.parametrize(
+    "decode_sizes,expected",
+    [
+        ([3], (3,)),
+        ([9, 3, 9], (3, 9)),
+        ([17, 9, 3], (3, 9, 17)),
+    ],
+)
+def test_derived_full_decode_capacities_are_a_normalized_prefix(decode_sizes, expected):
+    config = config_for(mode="full", capture_sizes=[17, 3, 9], decode_capture_sizes=decode_sizes)
+    assert config.decode_capture_sizes == expected
+    assert config.identity()["decode_capture_sizes"] == list(expected)
+    assert "decode_capture_sizes" not in AscendGraphOptions.model_fields
+
+
+@pytest.mark.parametrize("decode_sizes", [[], [0], [True], [3.0], ["3"], [9], [3, 17], [3, 9, 18]])
+def test_derived_decode_capacities_reject_empty_invalid_or_nonprefix_lists(decode_sizes):
+    with pytest.raises(ValidationError, match="decode_capture_sizes"):
+        config_for(mode="full", capture_sizes=[3, 9, 17], decode_capture_sizes=decode_sizes)
+
+
+def test_decode_mode_requires_the_complete_capture_list_and_no_default():
+    with pytest.raises(ValidationError, match="decode mode"):
+        config_for(capture_sizes=[3, 9], decode_capture_sizes=[3])
+    data = config_for().model_dump(mode="json")
+    data.pop("decode_capture_sizes")
+    with pytest.raises(ValidationError, match="decode_capture_sizes"):
+        AscendGraphConfig.model_validate(data)
+
+
+def test_derived_decode_capacities_change_assignment_digest():
+    complete = config_for(mode="full")
+    limited = config_for(mode="full", decode_capture_sizes=[1])
+    assert complete.assignment_id != limited.assignment_id
+
+
+@pytest.mark.parametrize("version", ["revision with spaces", " ", " revision "])
+def test_runtime_preserves_graph_weight_labels_without_stripping(version):
+    config = config_for(weight_version=version)
+    assert config.weight_version == version
+    assert config.identity()["weight_version"] == version
+    assert AscendGraphConfig.model_validate_json(config.model_dump_json()).weight_version == version
+
+
+def test_runtime_preserves_identifier_strings_without_invented_character_rules():
+    data = config_for(model_name="model with spaces").model_dump(mode="json")
+    data["workers"][0].update(worker_id="worker with spaces", expected_start_id="start with spaces")
+    config = AscendGraphConfig.model_validate(data)
+    assert config.model_name == "model with spaces"
+    assert config.worker_rank("worker with spaces") == 1
+    assert config.participants[0].expected_start_id == "start with spaces"
+
+
+def test_prepare_preflights_every_snapshot_before_any_rpc():
+    data = two_worker_config().model_dump(mode="json")
+    data["model"]["experts_per_layer"] = 160000
+    for rank, worker in enumerate(data["workers"]):
+        worker["experts_by_layer"] = [list(range(rank, 160000, 2)) for _ in data["layer_ids"]]
+    config = AscendGraphConfig.model_validate(data)
+    control = GraphStepControl(config)
+    try:
+        with pytest.raises(ValueError, match="exceeds its limit"):
+            control.begin("prepare")
+        assert control._sequence == 0 and control._active is None
+        assert control._requests == [] and not control._poisoned
+    finally:
+        control.close()
+
+
+def test_first_prepare_reply_must_match_controller_observed_start():
+    def begin(request, *, timeout):
+        return {
+            "version": 2,
+            "assignment_id": request["assignment_id"],
+            "sequence": request["sequence"],
+            "state": "ready",
+            "worker_start_id": "restarted-before-prepare",
+            "ready_revision": 1,
+        }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        server = grpc.server(executor)
+        server.add_generic_rpc_handlers((control_handler(begin, begin),))
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        control = GraphStepControl(config_for(port))
+        try:
+            with pytest.raises(RuntimeError, match="restarted"):
+                control.begin("prepare")
+            assert control._poisoned
+        finally:
+            control.close()
+            server.stop(0).wait(2)
+
+
+def test_control_sends_snapshot_only_once_and_keeps_digest_cached(monkeypatch):
+    seen = []
+
+    def respond(request, state):
+        seen.append(dict(request))
+        return {
+            "version": 2,
+            "assignment_id": request["assignment_id"],
+            "sequence": request["sequence"],
+            "state": state,
+            "worker_start_id": "start-one",
+            "ready_revision": 7,
+        }
+
+    def begin(request, *, timeout):
+        return respond(request, "ready")
+
+    def finish(request, *, timeout):
+        return respond(request, "complete")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        server = grpc.server(executor)
+        server.add_generic_rpc_handlers((control_handler(begin, finish),))
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        control = GraphStepControl(config_for(port))
+        try:
+            digest = control._assignment_id
+            control.begin("prepare")
+            control.finish()
+            monkeypatch.setattr(
+                AscendGraphConfig,
+                "assignment_id",
+                property(lambda _: pytest.fail("digest recomputed")),
+            )
+            control.begin("warmup", 4)
+            control.finish()
+            assert "config" in seen[0]
+            assert seen[0]["worker_start_id"] == "start-one"
+            assert seen[0]["ready_revision"] is None
+            assert all("config" not in request for request in seen[1:])
+            assert all(request["ready_revision"] == 7 for request in seen[1:])
+            assert all(request["assignment_id"] == digest for request in seen)
+            assert len(encode_message(seen[1])) < 512
+        finally:
+            control.close()
+            server.stop(0).wait(2)
+
+
+@pytest.mark.parametrize(
+    "mode,requests,tokens,scheduled,expected",
+    [
+        ("full", 8, 32, 24, ((3, 7), 7, 12, 24)),
+        ("full", 16, 32, 24, ((3, 7, 12), 12, 12, 24)),
+        ("decode", 16, 32, 24, ((3, 7, 12), 12, 12, 24)),
+    ],
+)
+def test_limits_separate_native_allocations_from_scheduling(
+    mode, requests, tokens, scheduled, expected
+):
+    from expertkit_transport.ascend_graph import resolve_graph_limits
+
+    options = AscendGraphOptions(
+        mode=mode, capture_sizes=(12, 3, 7), rendezvous_host="host", rendezvous_port=1234
+    )
+    limits = resolve_graph_limits(
+        options, allocated_requests=requests, allocated_tokens=tokens, scheduled_tokens=scheduled
+    )
+    assert limits.capture_sizes == (3, 7, 12)
+    assert (
+        limits.decode_capture_sizes,
+        limits.running_requests,
+        limits.graph_stage_tokens,
+        limits.ordinary_prefill_tokens,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "mode,requests,tokens,reason",
+    [
+        ("full", 2, 32, "no configured Decode graph"),
+        ("full", 8, 8, "allocated token buffers"),
+        ("decode", 8, 32, "allocated request buffers"),
+        ("full", True, 32, "positive integer"),
+    ],
+)
+def test_limits_report_actual_buffer_conflict(mode, requests, tokens, reason):
+    from expertkit_transport.ascend_graph import resolve_graph_limits
+
+    options = AscendGraphOptions(
+        mode=mode, capture_sizes=(3, 7, 12), rendezvous_host="host", rendezvous_port=1234
+    )
+    with pytest.raises(ValueError, match=reason):
+        resolve_graph_limits(
+            options, allocated_requests=requests, allocated_tokens=tokens, scheduled_tokens=24
+        )

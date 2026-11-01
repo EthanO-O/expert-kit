@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import grpc
@@ -41,18 +42,7 @@ async def resolve_default_instance(
         TransportError: The Controller rejects or cannot complete resolution.
     """
 
-    if not isinstance(controller_endpoint, str) or not controller_endpoint.strip():
-        raise ValueError("controller_endpoint must not be empty")
-    if requested_instance_id is not None and (
-        isinstance(requested_instance_id, bool)
-        or not isinstance(requested_instance_id, int)
-        or not 0 < requested_instance_id <= _UINT64_MAX
-    ):
-        raise ValueError("requested_instance_id must be a positive uint64 or None")
-    if not isinstance(timeout_seconds, int | float) or isinstance(timeout_seconds, bool):
-        raise ValueError("timeout_seconds must be finite and positive")
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be finite and positive")
+    _validate_resolution_arguments(controller_endpoint, requested_instance_id, timeout_seconds)
 
     channel = grpc.aio.insecure_channel(
         controller_endpoint,
@@ -75,33 +65,10 @@ async def resolve_default_instance(
     finally:
         await channel.close()
 
-    instance_id = int(response.instance_id)
-    if instance_id <= 0 or instance_id > _UINT64_MAX:
-        raise TransportError(
-            TransportErrorCode.PROTOCOL,
-            retryable=False,
-            diagnostic="Controller returned an invalid default instance ID",
-        )
-    if not response.model_name.strip() or not response.instance_name.strip():
-        raise TransportError(
-            TransportErrorCode.PROTOCOL,
-            retryable=False,
-            diagnostic="Controller returned incomplete default instance metadata",
-        )
-    if requested_instance_id is not None and requested_instance_id != instance_id:
-        raise TransportError(
-            TransportErrorCode.PROTOCOL,
-            retryable=False,
-            diagnostic="Controller accepted an explicit ID but returned another instance",
-        )
-    return ResolvedDefaultInstance(
-        instance_id=instance_id,
-        model_name=response.model_name,
-        instance_name=response.instance_name,
-    )
+    return _validated_response(response, requested_instance_id)
 
 
-def _resolution_error(error: grpc.aio.AioRpcError) -> TransportError:
+def _resolution_error(error: grpc.RpcError) -> TransportError:
     code = error.code()
     diagnostic = f"default instance resolution failed: {error.details() or code.name}"
     if code is grpc.StatusCode.DEADLINE_EXCEEDED:
@@ -131,3 +98,90 @@ def _resolution_error(error: grpc.aio.AioRpcError) -> TransportError:
         retryable=True,
         diagnostic=diagnostic,
     )
+
+
+def _validate_resolution_arguments(
+    controller_endpoint: str, requested_instance_id: int | None, timeout_seconds: float
+) -> None:
+    if not isinstance(controller_endpoint, str) or not controller_endpoint.strip():
+        raise ValueError("controller_endpoint must not be empty")
+    if requested_instance_id is not None and (
+        isinstance(requested_instance_id, bool)
+        or not isinstance(requested_instance_id, int)
+        or not 0 < requested_instance_id <= _UINT64_MAX
+    ):
+        raise ValueError("requested_instance_id must be a positive uint64 or None")
+    if not isinstance(timeout_seconds, int | float) or isinstance(timeout_seconds, bool):
+        raise ValueError("timeout_seconds must be finite and positive")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be finite and positive")
+
+
+def _validated_response(
+    response: lifecycle_pb2.ResolveDefaultInstanceResponse, requested_instance_id: int | None
+) -> ResolvedDefaultInstance:
+    instance_id = int(response.instance_id)
+    if instance_id <= 0 or instance_id > _UINT64_MAX:
+        raise TransportError(
+            TransportErrorCode.PROTOCOL,
+            retryable=False,
+            diagnostic="Controller returned an invalid default instance ID",
+        )
+    if not response.model_name.strip() or not response.instance_name.strip():
+        raise TransportError(
+            TransportErrorCode.PROTOCOL,
+            retryable=False,
+            diagnostic="Controller returned incomplete default instance metadata",
+        )
+    if requested_instance_id is not None and requested_instance_id != instance_id:
+        raise TransportError(
+            TransportErrorCode.PROTOCOL,
+            retryable=False,
+            diagnostic="Controller accepted an explicit ID but returned another instance",
+        )
+    return ResolvedDefaultInstance(
+        instance_id=instance_id,
+        model_name=response.model_name,
+        instance_name=response.instance_name,
+    )
+
+
+def resolve_default_instance_sync(
+    controller_endpoint: str,
+    *,
+    requested_instance_id: int | None,
+    monotonic_deadline: float,
+) -> ResolvedDefaultInstance:
+    """Resolve the existing default instance within an absolute startup deadline.
+
+    The synchronous startup caller owns the deadline across resolution and READY
+    discovery. The channel is always closed before returning or raising.
+    """
+    remaining = monotonic_deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("graph startup deadline expired before instance resolution")
+    _validate_resolution_arguments(controller_endpoint, requested_instance_id, remaining)
+    channel = grpc.insecure_channel(
+        controller_endpoint,
+        options=(
+            ("grpc.max_send_message_length", _CONTROL_MESSAGE_BYTES),
+            ("grpc.max_receive_message_length", _CONTROL_MESSAGE_BYTES),
+        ),
+    )
+    try:
+        stub = lifecycle_pb2_grpc.InstanceServiceStub(channel)
+        remaining = monotonic_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("graph startup deadline expired before instance resolution")
+        response = stub.ResolveDefaultInstance(
+            lifecycle_pb2.ResolveDefaultInstanceRequest(
+                requested_instance_id=requested_instance_id or 0,
+            ),
+            timeout=remaining,
+            wait_for_ready=True,
+        )
+        return _validated_response(response, requested_instance_id)
+    except grpc.RpcError as error:
+        raise _resolution_error(error) from error
+    finally:
+        channel.close()

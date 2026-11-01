@@ -1,387 +1,356 @@
-"""Validate the public fixed Worker graph deployment materialization."""
+"""Check generated graph choices, endpoint ownership and optional native settings."""
 
+from __future__ import annotations
+
+import asyncio
+import copy
 import json
 import os
-import runpy
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parents[3]
 ASCEND = ROOT / "dev/ascend"
+SHAPES = ("num_layers", "experts_per_layer", "hidden_dim", "intermediate_dim", "topk")
 
 
-def _inputs(tmp_path):
-    examples = ASCEND / "configs/qwen3-30b-a3b"
-    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
-    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
-    cluster["nodes"]["node-a"]["address"] = "192.0.2.10"
-    cluster["attention"]["devices"] = [0]
-    cluster["pools"] = [{**cluster["pools"][0], "node": "node-a", "devices": [1]}]
-    cluster["expert"]["runtime"]["max_active_batches_per_device"] = 1
-    experiment["model"].update(
-        name="DeepSeek-V2-Lite-Chat",
-        weight_version="85864749",
-        num_layers=27,
-        experts_per_layer=64,
-        hidden_dim=2048,
-        intermediate_dim=1408,
-        topk=6,
-        weight_dtype="bf16",
-        activation_dtype="bf16",
+def _inputs(profile="qwen3-30b-a3b-w8a8"):
+    example = ASCEND / "configs" / profile
+    return tuple(
+        yaml.safe_load((example / f"{kind}.example.yaml").read_text())
+        for kind in ("cluster", "experiment")
     )
-    experiment["ascend_decode_graph"] = {
-        "session_id": "deepseek-resident-v1",
-        "instance_id": 7,
-        "worker_id": "worker-pool1-worker-00",
-        "weight_version": "85864749",
-        "control_endpoint": "192.0.2.10:18079",
-        "rendezvous_host": "192.0.2.10",
-        "rendezvous_port": 18080,
-        "layer_ids": list(range(1, 27)),
-        "capture_sizes": [1, 32, 64],
-    }
-    return cluster, experiment
 
 
-def _generate(tmp_path, cluster, experiment):
-    cluster_path, experiment_path = tmp_path / "cluster.yaml", tmp_path / "experiment.yaml"
-    cluster_path.write_text(yaml.safe_dump(cluster))
-    experiment_path.write_text(yaml.safe_dump(experiment))
-    return subprocess.run(
+@pytest.fixture
+def generator(monkeypatch):
+    monkeypatch.syspath_prepend(str(ASCEND))
+    from generate import TEMPLATE_DIR, generate_pools_config, generate_root_config
+    from renderer import Renderer
+    from schemas.cluster import ClusterConfig
+    from schemas.context import TemplateContext
+    from schemas.experiment import ExperimentConfig
+
+    def render(output, cluster, experiment):
+        context = TemplateContext.from_config(
+            ClusterConfig.model_validate(cluster), ExperimentConfig.model_validate(experiment)
+        )
+        renderer = Renderer(TEMPLATE_DIR)
+        generate_root_config(renderer, context, output)
+        generate_pools_config(renderer, context, output)
+        return context
+
+    return render
+
+
+def _read(output, name):
+    return yaml.safe_load((output / name).read_text())
+
+
+@pytest.mark.parametrize(
+    "profile,count", (("qwen3-30b-a3b-w8a8", 2), ("deepseek-v4-flash-w8a8", 8))
+)
+def test_checked_in_examples_generate_frontend_options_and_local_worker_endpoints(
+    tmp_path, profile, count
+):
+    from expertkit_transport.ascend_graph import AscendGraphOptions
+
+    examples = ASCEND / "configs" / profile
+    result = subprocess.run(
         [
             sys.executable,
             str(ASCEND / "cli.py"),
             "generate",
             "--cluster",
-            str(cluster_path),
+            str(examples / "cluster.example.yaml"),
             "--experiment",
-            str(experiment_path),
+            str(examples / "experiment.example.yaml"),
             "--output",
             str(tmp_path / "generated"),
         ],
-        env={
-            **os.environ,
-            "PYTHONPATH": os.pathsep.join(
-                (str(ASCEND), str(ROOT / "ek-transport/src"), os.environ.get("PYTHONPATH", ""))
-            ),
-        },
+        env={**os.environ, "PYTHONPATH": str(ASCEND)},
         text=True,
         capture_output=True,
         timeout=30,
     )
-
-
-def _v4_inputs(tmp_path):
-    cluster, experiment = _inputs(tmp_path)
-    cluster["pools"][0]["devices"] = list(range(1, 9))
-    experiment["model"].update(
-        name="DeepSeek-V4-Flash-0731-w8a8",
-        weight_version="0731",
-        num_layers=43,
-        experts_per_layer=256,
-        hidden_dim=4096,
-        intermediate_dim=2048,
-        topk=6,
-        expert_compute="deepseek_v4",
-        swiglu_limit=10.0,
-        quantization={
-            "type": "modelslim-w8a8-dynamic",
-            "bits": 8,
-            "group_size": None,
-            "symmetric": True,
-        },
-    )
-    graph = experiment["ascend_decode_graph"]
-    del graph["worker_id"], graph["control_endpoint"]
-    graph.update(
-        weight_version="0731",
-        layer_ids=list(range(43)),
-        rendezvous_port=18090,
-        workers=[
-            {
-                "worker_id": f"worker-pool1-worker-{index:02d}",
-                "control_endpoint": f"192.0.2.10:{18079 + index}",
-                "expert_start": index * 32,
-                "expert_end": (index + 1) * 32,
-            }
-            for index in range(8)
-        ],
-    )
-    return cluster, experiment
-
-
-@pytest.mark.parametrize(
-    ("profile", "worker_count", "expert_count"),
-    [("qwen3-30b-a3b-w8a8", 2, 6144), ("deepseek-v4-flash-w8a8", 8, 11008)],
-)
-def test_checked_in_modelslim_graph_examples_generate_complete_deployments(
-    tmp_path, profile, worker_count, expert_count
-):
-    from expertkit_worker.config import WorkerConfig
-
-    examples = ASCEND / "configs" / profile
-    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
-    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
-    result = _generate(tmp_path, cluster, experiment)
     assert result.returncode == 0, result.stderr
     output = tmp_path / "generated"
     graph = json.loads((output / "ascend-decode-graph.json").read_text())
-    worker_paths = sorted((output / "worker-pool1/workers").glob("*.yaml"))
-    assert len(worker_paths) == worker_count == len(graph["workers"])
-    assert len(graph["layer_ids"]) * graph["model"]["experts_per_layer"] == expert_count
-    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
-    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
-    assert "enforce-eager" not in serve
-    attention = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
-        "attention"
-    ]
-    assert "TORCHINDUCTOR_AUTOGRAD_CACHE" not in attention["environment"]
-    assert "VLLM_USE_AOT_COMPILE" not in attention["environment"]
-    for worker_path, participant in zip(worker_paths, graph["workers"], strict=True):
-        worker = WorkerConfig.model_validate(yaml.safe_load(worker_path.read_text()))
-        assert worker.worker.id == participant["worker_id"]
-        assert worker.worker.backend.value == "ascend_fused"
-        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == graph
-        assert worker.model.quantization.model_dump(mode="json") == graph["model"]["quantization"]
-
-
-@pytest.mark.parametrize("capacity", [256, 2048])
-@pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
-def test_qwen_full_generation_keeps_request_limit_separate_from_token_capacity(
-    tmp_path, capacity, backend
-):
-    from expertkit_worker.config import WorkerConfig
-
-    examples = ASCEND / "configs/qwen3-30b-a3b-w8a8"
-    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
-    cluster["expert"]["backend"] = backend
-    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
-    experiment["ascend_decode_graph"].update(
-        mode="full", capture_sizes=[2**power for power in range(capacity.bit_length())]
-    )
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    output = tmp_path / "generated"
-    shared = json.loads((output / "ascend-decode-graph.json").read_text())
-    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
-    assert shared["mode"] == "full"
-    assert serve["compilation-config"]["cudagraph_mode"] == "FULL"
-    assert serve["compilation-config"]["cudagraph_capture_sizes"] == shared["capture_sizes"]
-    assert serve["max-num-seqs"] == 64
-    assert serve["max-num-batched-tokens"] == 2048
-    for path in (output / "worker-pool1/workers").glob("*.yaml"):
-        worker = WorkerConfig.model_validate(yaml.safe_load(path.read_text()))
-        assert worker.worker.backend.value == backend
-        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
-
-
-@pytest.mark.parametrize("mode", ["decode", "full"])
-@pytest.mark.parametrize("backend", ["torch", "ascend_fused"])
-def test_qwen_generation_supports_eight_contiguous_resident_workers(tmp_path, mode, backend):
-    from expertkit_worker.config import WorkerConfig
-
-    examples = ASCEND / "configs/qwen3-30b-a3b-w8a8"
-    cluster = yaml.safe_load((examples / "cluster.example.yaml").read_text())
-    cluster["expert"]["backend"] = backend
-    cluster["pools"][0]["devices"] = list(range(1, 9))
-    experiment = yaml.safe_load((examples / "experiment.example.yaml").read_text())
-    graph = experiment["ascend_decode_graph"]
-    graph["mode"] = mode
-    graph["workers"] = [
-        dict(
-            worker_id=f"worker-pool1-worker-{rank:02d}",
-            control_endpoint=f"192.0.2.10:{18079 + rank}",
-            expert_start=rank * 16,
-            expert_end=(rank + 1) * 16,
-        )
-        for rank in range(8)
-    ]
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    output = tmp_path / "generated"
-    shared = json.loads((output / "ascend-decode-graph.json").read_text())
-    assert shared["mode"] == mode
-    configs = sorted((output / "worker-pool1/workers").glob("*.yaml"))
-    assert len(configs) == 8
-    for rank, path in enumerate(configs, 1):
-        worker = WorkerConfig.model_validate(yaml.safe_load(path.read_text()))
-        assert worker.worker.backend.value == backend
-        assert worker.worker.ascend_decode_graph.worker_rank(worker.worker.id) == rank
-        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
-
-
-def test_v4_generation_produces_shared_manifest_and_eight_valid_workers(tmp_path):
-    from expertkit_worker.config import WorkerConfig
-
-    cluster, experiment = _v4_inputs(tmp_path)
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    output = tmp_path / "generated"
-    shared = json.loads((output / "ascend-decode-graph.json").read_text())
-    assert shared["model"]["expert_compute"] == "deepseek_v4"
-    assert shared["model"]["swiglu_limit"] == 10.0
-    assert shared["model"]["quantization"] == experiment["model"]["quantization"]
-    assert shared["layer_ids"] == list(range(43))
-    configs = sorted((output / "worker-pool1/workers").glob("*.yaml"))
-    assert len(configs) == 8
-    for index, path in enumerate(configs):
-        worker = WorkerConfig.model_validate(yaml.safe_load(path.read_text()))
-        assert worker.model.weight_version == "0731"
-        assert worker.model.expert_compute == "deepseek_v4"
-        assert worker.model.swiglu_limit == 10.0
-        assert worker.model.quantization.model_dump(mode="json") == shared["model"]["quantization"]
-        assert worker.worker.ascend_decode_graph.model_dump(mode="json") == shared
-        assert worker.worker.id == shared["workers"][index]["worker_id"]
-        assert (
-            shared["workers"][index]["expert_start"],
-            shared["workers"][index]["expert_end"],
-        ) == (
-            index * 32,
-            (index + 1) * 32,
-        )
-    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
-    assert serve["data-parallel-size"] == 1
-    assert serve["quantization"] == "ascend"
-    assert serve["dtype"] == "bfloat16"
-    assert serve["trust-remote-code"] is False
-    assert serve["load-format"] == "safetensors"
-    assert serve["safetensors-load-strategy"] == "lazy"
-    assert serve["distributed-executor-backend"] == "mp"
-    assert serve["max-model-len"] == experiment["serve"]["max_model_len"]
-    assert serve["max-num-seqs"] == 64
-    assert serve["max-num-batched-tokens"] == 2048
-    assert serve["compilation-config"]["mode"] == "VLLM_COMPILE"
-    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
-    assert serve["compilation-config"]["cudagraph_capture_sizes"] == [1, 32, 64]
-    attention = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
-        "attention"
-    ]
-    assert {"ascend", "ascend_model", "register_expertkit"} <= set(
-        attention["environment"]["VLLM_PLUGINS"].split(",")
-    )
-
-
-@pytest.mark.parametrize("case", ["wrong-limit", "missing-quantization", "partition-gap"])
-def test_v4_generation_rejects_unsupported_computation_or_partition(tmp_path, case):
-    cluster, experiment = _v4_inputs(tmp_path)
-    if case == "wrong-limit":
-        experiment["model"]["swiglu_limit"] = 9.0
-    elif case == "missing-quantization":
-        del experiment["model"]["quantization"]
-    else:
-        experiment["ascend_decode_graph"]["workers"][1]["expert_start"] = 33
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode != 0
-    assert not (tmp_path / "generated").exists()
-
-
-def test_v4_ordinary_generation_keeps_native_modelslim_loader(tmp_path):
-    cluster, experiment = _v4_inputs(tmp_path)
-    del experiment["ascend_decode_graph"]
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    output = tmp_path / "generated"
-    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
-    assert serve["quantization"] == "ascend"
-    assert serve["load-format"] == "safetensors"
-    assert serve["safetensors-load-strategy"] == "lazy"
-    assert serve["distributed-executor-backend"] == "mp"
-    assert "compilation-config" not in serve
-    worker = yaml.safe_load((output / "worker-pool1/workers/worker-00.yaml").read_text())
-    assert worker["model"]["quantization"] == experiment["model"]["quantization"]
-    assert "ascend_decode_graph" not in worker["worker"]
-    compose = yaml.safe_load((output / "worker-pool1/compose.expert.yaml").read_text())
-    assert compose["services"]["worker-00"]["entrypoint"] == ["ek-worker"]
-
-
-def test_graph_generation_reports_missing_model_as_validation_error(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(ASCEND))
-    from schemas.experiment import ExperimentConfig
-
-    _, experiment = _inputs(tmp_path)
-    del experiment["model"]
-    with pytest.raises(ValidationError) as error:
-        ExperimentConfig.model_validate(experiment)
-    assert any(
-        row["loc"] == ("model",) and row["type"] == "missing" for row in error.value.errors()
-    )
-
-
-def test_graph_generation_connects_native_full_and_worker(tmp_path):
-    cluster, experiment = _inputs(tmp_path)
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    output = tmp_path / "generated"
-    graph = json.loads((output / "ascend-decode-graph.json").read_text())
-    worker = yaml.safe_load((output / "worker-pool1/workers/worker-00.yaml").read_text())
-    assert worker["worker"]["ascend_decode_graph"] == graph
-    assert worker["model"]["instance_id"] == graph["instance_id"] == 7
-    assert worker["transport"]["listen"] == "0.0.0.0:53234"
-    assert worker["weight_manager"]["peer"]["listen"] == "0.0.0.0:54234"
-    attention = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
-        "attention"
-    ]
-    assert attention["network_mode"] == "host" and "networks" not in attention
-    assert attention["environment"]["EK_INSTANCE_ID"] == "7"
-    assert attention["command"][-2:] == ["--no-async-scheduling", "--no-enable-prefix-caching"]
+    AscendGraphOptions.model_validate(graph)
+    assert set(graph) == {
+        "mode",
+        "capture_sizes",
+        "timeout_seconds",
+        "rendezvous_host",
+        "rendezvous_port",
+    }
+    workers = sorted((output / "worker-pool1/workers").glob("*.yaml"))
+    assert len(workers) == count
+    for index, path in enumerate(workers):
+        worker = yaml.safe_load(path.read_text())
+        assert not set(SHAPES).intersection(worker["model"])
+        assert "expert_intermediate_dim" not in worker["model"] and "top_k" not in worker["model"]
+        assert "instance_id" not in worker["model"]
+        assert worker["worker"]["device"] == "npu:0"
+        assert worker["worker"]["ascend_decode_graph"] == {
+            "control_listen": f"0.0.0.0:{18079 + index}",
+            "control_advertise": f"192.0.2.10:{18079 + index}",
+        }
+    attention = _read(output, "compose.attention.yaml")["services"]["attention"]
+    assert "EK_INSTANCE_ID" not in attention["environment"]
     assert (
         attention["environment"]["EK_ASCEND_DECODE_GRAPH_CONFIG"]
         == "/configs/ascend-decode-graph.json"
     )
-    assert "EK_TRANSPORT_CONFIG" not in attention["environment"]
+    assert attention["network_mode"] == "host"
+    assert attention["command"][-2:] == ["--no-async-scheduling", "--no-enable-prefix-caching"]
     assert "./ascend-decode-graph.json:/configs/ascend-decode-graph.json:ro" in attention["volumes"]
-    expert = yaml.safe_load((output / "worker-pool1/compose.expert.yaml").read_text())["services"][
-        "worker-00"
-    ]
-    assert expert["network_mode"] == "host" and "networks" not in expert
-    assert expert["entrypoint"] == ["ek-worker"]
-    assert expert["image"] == attention["image"]
-    builds = yaml.safe_load((output / "compose.build.yaml").read_text())["services"]
-    for service in ("worker-image", "attention-image"):
-        assert builds[service]["image"] == attention["image"]
-        assert builds[service]["build"]["target"] == "ek-ascend-runtime"
-        assert builds[service]["build"]["args"] == {
+    admin = _read(output, "compose.control.yaml")["services"]["admin"]
+    assert all("ascend-decode-graph" not in volume for volume in admin["volumes"])
+    controller = _read(output, "controller.yaml")["inference"]
+    assert "hidden_dim" not in controller and "intermediate_dim" not in controller
+    serve = _read(output, "vllm-serve.yaml")
+    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+    assert serve["quantization"] == "ascend"
+    assert "max-num-seqs" not in serve and "max-num-batched-tokens" not in serve
+    assert "block-size" not in serve and "num-gpu-blocks-override" not in serve
+    if profile.startswith("deepseek"):
+        assert serve["distributed-executor-backend"] == "mp"
+        assert serve["load-format"] == "safetensors"
+
+
+@pytest.mark.parametrize("mode", ("decode", "full"))
+def test_exact_captures_and_optional_native_flags_are_not_derived_from_graphs(
+    tmp_path, generator, mode
+):
+    cluster, experiment = _inputs()
+    experiment["ascend_decode_graph"].update(mode=mode, capture_sizes=[7, 3, 7])
+    values = dict(
+        max_num_seqs=13,
+        max_num_batched_tokens=96,
+        max_num_scheduled_tokens=23,
+        block_size=32,
+        num_gpu_blocks_override=113,
+        kv_cache_memory_bytes=123456789,
+        enable_chunked_prefill=False,
+    )
+    experiment["serve"].update(values)
+    generator(tmp_path, cluster, experiment)
+    graph = json.loads((tmp_path / "ascend-decode-graph.json").read_text())
+    assert graph["capture_sizes"] == [3, 7]
+    serve = _read(tmp_path, "vllm-serve.yaml")
+    assert serve["compilation-config"]["cudagraph_capture_sizes"] == [3, 7]
+    assert serve["compilation-config"]["cudagraph_mode"] == (
+        "FULL" if mode == "full" else "FULL_DECODE_ONLY"
+    )
+    for field, value in values.items():
+        assert serve[field.replace("_", "-")] == value
+    assert serve["enable-chunked-prefill"] is False
+
+
+@pytest.mark.parametrize("explicit", (False, True))
+def test_generated_model_facts_are_optional_assertions_resolved_by_weight_server(
+    tmp_path, generator, monkeypatch, explicit
+):
+    from expertkit_worker.weights import metadata as module
+    from expertkit_worker.weights.metadata import (
+        ModelMetadata,
+        QuantizationMetadata,
+        resolve_worker_config,
+    )
+
+    cluster, experiment = _inputs()
+    for field in ("expert_compute", "swiglu_limit", "quantization"):
+        experiment["model"].pop(field, None)
+    if explicit:
+        experiment["model"].update(
+            num_layers=48,
+            experts_per_layer=128,
+            hidden_dim=2048,
+            intermediate_dim=768,
+            topk=8,
+            expert_compute="swiglu",
+            swiglu_limit=0.0,
+        )
+    generator(tmp_path, cluster, experiment)
+    document = _read(tmp_path, "worker-pool1/workers/worker-00.yaml")
+    for field in ("expert_compute", "swiglu_limit"):
+        assert (field in document["model"]) == explicit
+    assert ("hidden_dim" in document["model"]) == explicit
+    controller = _read(tmp_path, "controller.yaml")["inference"]
+    assert ("hidden_dim" in controller) == explicit
+
+    async def fetch(endpoint, name):
+        assert (
+            endpoint.rstrip("/") == "http://192.0.2.10:16543"
+            and name == experiment["model"]["name"]
+        )
+        return ModelMetadata(
+            schema_version=1,
+            model_type="qwen3_moe",
+            num_layers=48,
+            moe_layer_start=0,
+            moe_layer_end=48,
+            experts_per_layer=128,
+            hidden_dim=2048,
+            expert_intermediate_dim=768,
+            top_k=8,
+            activation_dtype="bf16",
+            quantization=QuantizationMetadata("modelslim-w8a8-dynamic", 8, None, True, None),
+        )
+
+    monkeypatch.setattr(module, "fetch_model_metadata", fetch)
+    resolved = asyncio.run(resolve_worker_config(document))
+    assert resolved.config.model.hidden_dim == 2048
+    assert resolved.config.model.top_k == 8
+    document["model"]["hidden_dim"] = 4096
+    with pytest.raises(ValueError, match="hidden_dim conflicts"):
+        asyncio.run(resolve_worker_config(document))
+
+
+@pytest.mark.parametrize("cross_host", (False, True))
+def test_multiple_user_selected_pools_do_not_declare_or_restrict_placement(
+    tmp_path, generator, cross_host
+):
+    cluster, experiment = _inputs()
+    first = cluster["pools"][0]
+    first["devices"] = [1]
+    other = copy.deepcopy(first)
+    other.update(id="second-pool", devices=[1] if cross_host else [2])
+    if cross_host:
+        cluster["nodes"]["remote"] = {"address": "192.0.2.11"}
+        other["node"] = "remote"
+        experiment["ascend_decode_graph"]["rendezvous_host"] = "192.0.2.11"
+    else:
+        for field in ("start_worker_port", "start_peer_port", "start_graph_control_port"):
+            other[field] += 10
+    cluster["pools"].append(other)
+    generator(tmp_path, cluster, experiment)
+    worker = _read(tmp_path, "second-pool/workers/worker-00.yaml")
+    address = "192.0.2.11" if cross_host else "192.0.2.10"
+    assert (
+        worker["worker"]["ascend_decode_graph"]["control_advertise"]
+        == f"{address}:{other['start_graph_control_port']}"
+    )
+    assert set(worker["worker"]["ascend_decode_graph"]) == {"control_listen", "control_advertise"}
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "legacy",
+        "missing-port",
+        "graph-transport",
+        "peer-transport",
+        "rendezvous",
+        "device",
+        "two-frontends",
+        "eager",
+        "tracing",
+        "active",
+        "capacity",
+        "port-overflow",
+    ),
+)
+def test_known_deployment_conflicts_fail_before_rendering(tmp_path, generator, case):
+    cluster, experiment = _inputs()
+    pool = cluster["pools"][0]
+    if case == "legacy":
+        experiment["ascend_decode_graph"]["workers"] = []
+    elif case == "missing-port":
+        pool.pop("start_graph_control_port")
+    elif case == "graph-transport":
+        pool["start_graph_control_port"] = pool["start_worker_port"]
+    elif case == "peer-transport":
+        pool["start_peer_port"] = pool["start_worker_port"]
+    elif case == "rendezvous":
+        experiment["ascend_decode_graph"]["rendezvous_port"] = pool["start_graph_control_port"]
+    elif case == "device":
+        pool["devices"] = [1, 1]
+    elif case == "two-frontends":
+        cluster["attention"]["devices"] = [0, 3]
+    elif case == "eager":
+        experiment["serve"]["enforce_eager"] = True
+    elif case == "tracing":
+        experiment["tracing"] = {"enabled": True, "endpoint": "http://192.0.2.10:4317"}
+    elif case == "active":
+        cluster["expert"]["runtime"]["max_active_batches_per_device"] = 2
+    elif case == "capacity":
+        experiment["ascend_decode_graph"]["capture_sizes"] = [8192]
+    else:
+        pool["start_graph_control_port"] = 65535
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="Legacy Ascend" if case == "legacy" else None):
+        generator(output, cluster, experiment)
+    assert not output.exists()
+
+
+def test_explicit_rendezvous_host_is_not_reassigned_or_rejected_offline(tmp_path, generator):
+    cluster, experiment = _inputs()
+    experiment["ascend_decode_graph"]["rendezvous_host"] = "192.0.2.99"
+    generator(tmp_path, cluster, experiment)
+    options = json.loads((tmp_path / "ascend-decode-graph.json").read_text())
+    assert options["rendezvous_host"] == "192.0.2.99"
+
+
+def test_same_host_pool_collisions_are_checked_beyond_the_first_pool(tmp_path, generator):
+    cluster, experiment = _inputs()
+    second = copy.deepcopy(cluster["pools"][0])
+    second.update(id="second", devices=[3])
+    cluster["pools"].append(second)
+    with pytest.raises(ValueError, match="Ports"):
+        generator(tmp_path / "output", cluster, experiment)
+
+
+def test_ordinary_generation_has_no_graph_document_or_endpoint(tmp_path, generator):
+    cluster, experiment = _inputs()
+    experiment.pop("ascend_decode_graph")
+    generator(tmp_path, cluster, experiment)
+    assert not (tmp_path / "ascend-decode-graph.json").exists()
+    worker = _read(tmp_path, "worker-pool1/workers/worker-00.yaml")
+    assert "ascend_decode_graph" not in worker["worker"]
+    assert "compilation-config" not in _read(tmp_path, "vllm-serve.yaml")
+
+
+def test_graph_compose_preserves_native_image_network_and_separate_data_ports(tmp_path, generator):
+    cluster, experiment = _inputs()
+    generator(tmp_path, cluster, experiment)
+    attention = _read(tmp_path, "compose.attention.yaml")["services"]
+    expert = _read(tmp_path, "worker-pool1/compose.expert.yaml")["services"]["worker-00"]
+    assert expert["image"] == attention["attention"]["image"]
+    assert expert["entrypoint"] == ["ek-worker"] and expert["network_mode"] == "host"
+    assert attention["benchmark"]["network_mode"] == "host"
+    assert _read(tmp_path, "compose.attention.dev.yaml")["services"]["attention"] == {
+        "network_mode": "host"
+    }
+    builds = _read(tmp_path, "compose.build.yaml")["services"]
+    for name in ("worker-image", "attention-image"):
+        assert builds[name]["build"]["target"] == "ek-ascend-runtime"
+        assert builds[name]["build"]["args"] == {
             "VLLM_ASCEND_IMAGE": cluster["images"]["vllm_ascend"]
         }
-    benchmark = yaml.safe_load((output / "compose.attention.yaml").read_text())["services"][
-        "benchmark"
-    ]
-    assert benchmark["network_mode"] == "host" and "networks" not in benchmark
-    admin = yaml.safe_load((output / "compose.control.yaml").read_text())["services"]["admin"]
-    assert (
-        "./ascend-decode-graph.json:/etc/expert-kit/ascend-decode-graph.json:ro" in admin["volumes"]
-    )
-    bench = yaml.safe_load((output / "vllm-bench.yaml").read_text())
-    assert "save-detailed" not in bench
-    assert "metric-percentiles" not in bench
-    serve = yaml.safe_load((output / "vllm-serve.yaml").read_text())
-    assert serve["async-scheduling"] is False
-    assert serve["max-num-seqs"] == 64
-    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
-    assert serve["compilation-config"]["cudagraph_capture_sizes"] == [1, 32, 64]
-    assert "enforce-eager" not in serve
-    assert yaml.safe_load((output / "compose.attention.dev.yaml").read_text())["services"][
-        "attention"
-    ] == {"network_mode": "host"}
+    worker = _read(tmp_path, "worker-pool1/workers/worker-00.yaml")
+    assert worker["transport"]["listen"] == "0.0.0.0:53234"
+    assert worker["weight_manager"]["peer"]["listen"] == "0.0.0.0:54234"
 
 
-def test_graph_benchmark_options_reach_native_cli(tmp_path):
-    cluster, experiment = _inputs(tmp_path)
+def test_graph_benchmark_options_still_reach_native_cli(tmp_path, generator):
+    import runpy
+
+    cluster, experiment = _inputs()
     experiment["run"].update(
         save_detailed=True,
         percentile_metrics="ttft,tpot,itl,e2el",
         metric_percentiles="50,99",
         ready_check_timeout_sec=0,
     )
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
+    generator(tmp_path, cluster, experiment)
     to_cmd = runpy.run_path(str(ASCEND / "bench_launcher.py"))["to_cmd"]
-    command = to_cmd(tmp_path / "generated/vllm-bench.yaml")
+    command = to_cmd(tmp_path / "vllm-bench.yaml")
     assert "--save-detailed" in command
     for flag, value in (
         ("--percentile-metrics", "ttft,tpot,itl,e2el"),
@@ -391,163 +360,30 @@ def test_graph_benchmark_options_reach_native_cli(tmp_path):
         assert command[command.index(flag) + 1] == value
 
 
+def test_v4_omitted_clipping_assertion_is_not_rendered_as_zero(tmp_path, generator):
+    cluster, experiment = _inputs("deepseek-v4-flash-w8a8")
+    experiment["model"].pop("swiglu_limit")
+    generator(tmp_path, cluster, experiment)
+    model = _read(tmp_path, "worker-pool1/workers/worker-00.yaml")["model"]
+    assert model["expert_compute"] == "deepseek_v4"
+    assert "swiglu_limit" not in model
+
+
 @pytest.mark.parametrize(
-    "case",
-    [
-        "two-frontends",
-        "two-workers",
-        "cross-host",
-        "wrong-model",
-        "dense-layer",
-        "wrong-worker",
-        "wrong-host",
-        "port-collision",
-        "eager",
-        "active-two",
-    ],
+    "field,value",
+    (
+        ("max_num_seqs", True),
+        ("max_num_batched_tokens", 1.5),
+        ("max_num_scheduled_tokens", "23"),
+        ("block_size", False),
+        ("num_gpu_blocks_override", 13.0),
+        ("kv_cache_memory_bytes", "1G"),
+        ("enable_chunked_prefill", 1),
+    ),
 )
-def test_graph_generation_rejects_unsupported_deployments(tmp_path, case):
-    cluster, experiment = _inputs(tmp_path)
-    graph = experiment["ascend_decode_graph"]
-    if case == "two-frontends":
-        cluster["attention"]["devices"] = [0, 2]
-    elif case == "two-workers":
-        cluster["pools"][0]["devices"] = [1, 2]
-    elif case == "cross-host":
-        cluster["pools"][0]["node"] = "node-b"
-    elif case == "wrong-model":
-        experiment["model"]["topk"] = 8
-    elif case == "dense-layer":
-        graph["layer_ids"] = list(range(27))
-    elif case == "wrong-worker":
-        graph["worker_id"] = "another-worker"
-    elif case == "wrong-host":
-        graph["rendezvous_host"] = "192.0.2.11"
-    elif case == "port-collision":
-        graph["rendezvous_port"] = 53234
-    elif case == "eager":
-        experiment["serve"]["enforce_eager"] = True
-    else:
-        cluster["expert"]["runtime"]["max_active_batches_per_device"] = 2
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode != 0
-    assert not (tmp_path / "generated").exists()
-
-
-def test_two_worker_generation_shares_rank_manifest_and_checks_all_ports(tmp_path):
-    cluster, experiment = _inputs(tmp_path)
-    cluster["pools"][0]["devices"] = [1, 2]
-    graph = experiment["ascend_decode_graph"]
-    del graph["worker_id"], graph["control_endpoint"]
-    graph["workers"] = [
-        {
-            "worker_id": f"worker-pool1-worker-{index:02d}",
-            "control_endpoint": f"192.0.2.10:{18079 + index}",
-            "expert_start": index * 32,
-            "expert_end": (index + 1) * 32,
-        }
-        for index in range(2)
-    ]
-    graph["rendezvous_port"] = 18081
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    output = tmp_path / "generated"
-    shared = json.loads((output / "ascend-decode-graph.json").read_text())
-    for index in range(2):
-        worker = yaml.safe_load(
-            (output / f"worker-pool1/workers/worker-{index:02d}.yaml").read_text()
-        )
-        assert worker["worker"]["ascend_decode_graph"] == shared
-        assert worker["worker"]["device"] == "npu:0"
-        assert worker["worker"]["id"] == shared["workers"][index]["worker_id"]
-    graph["workers"][1]["control_endpoint"] = "192.0.2.10:53235"
-    # A fresh output directory makes the rejected render independent of the first.
-    other = tmp_path / "collision"
-    other.mkdir()
-    rejected = _generate(other, cluster, experiment)
-    assert rejected.returncode != 0
-    assert not (other / "generated").exists()
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-def test_qwen_generation_derives_model_before_expert_interval_validation(tmp_path, explicit):
-    cluster, experiment = _inputs(tmp_path)
-    experiment["model"].update(
-        name="Qwen3-30B-A3B-Instruct-2507",
-        num_layers=48,
-        experts_per_layer=128,
-        intermediate_dim=768,
-        topk=8,
-    )
-    cluster["pools"][0]["devices"] = [1, 2]
-    graph = experiment["ascend_decode_graph"]
-    del graph["worker_id"], graph["control_endpoint"]
-    graph["layer_ids"] = list(range(48))
-    graph["rendezvous_port"] = 18081
-    graph["workers"] = [
-        {
-            "worker_id": f"worker-pool1-worker-{index:02d}",
-            "control_endpoint": f"192.0.2.10:{18079 + index}",
-            "expert_start": index * 64,
-            "expert_end": (index + 1) * 64,
-        }
-        for index in range(2)
-    ]
-    declaration = {
-        "num_layers": 48,
-        "experts_per_layer": 128,
-        "hidden_dim": 2048,
-        "expert_intermediate_dim": 768,
-        "top_k": 8,
-        "activation_dtype": "bf16",
-        "weight_dtype": "bf16",
-        "activation": "silu",
-        "expert_compute": "swiglu",
-        "swiglu_limit": 0.0,
-        "quantization": None,
-    }
-    if explicit:
-        graph["model"] = declaration.copy()
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode == 0, result.stderr
-    shared = json.loads((tmp_path / "generated/ascend-decode-graph.json").read_text())
-    assert shared["model"] == declaration
-    serve = yaml.safe_load((tmp_path / "generated/vllm-serve.yaml").read_text())
-    assert "distributed-executor-backend" not in serve
-    for index in range(2):
-        worker = yaml.safe_load(
-            (tmp_path / f"generated/worker-pool1/workers/worker-{index:02d}.yaml").read_text()
-        )
-        assert worker["worker"]["ascend_decode_graph"] == shared
-        assert worker["model"]["top_k"] == 8
-    conflicting = tmp_path / "conflicting"
-    conflicting.mkdir()
-    graph["model"] = {**declaration, "hidden_dim": 4096}
-    rejected = _generate(conflicting, cluster, experiment)
-    assert rejected.returncode != 0
-    assert "model declaration" in rejected.stderr
-
-
-@pytest.mark.parametrize("case", ["duplicate-workers", "multiple-pools"])
-def test_graph_generation_rejects_shared_worker_devices_and_multiple_pools(tmp_path, case):
-    cluster, experiment = _inputs(tmp_path)
-    cluster["pools"][0]["devices"] = [1, 1]
-    graph = experiment["ascend_decode_graph"]
-    del graph["worker_id"], graph["control_endpoint"]
-    graph["workers"] = [
-        {
-            "worker_id": f"worker-pool1-worker-{index:02d}",
-            "control_endpoint": f"192.0.2.10:{18079 + index}",
-            "expert_start": index * 32,
-            "expert_end": (index + 1) * 32,
-        }
-        for index in range(2)
-    ]
-    graph["rendezvous_port"] = 18081
-    if case == "multiple-pools":
-        cluster["pools"][0]["devices"] = [1]
-        cluster["pools"].append({**cluster["pools"][0], "id": "worker-pool2", "devices": [2]})
-        graph["workers"][1]["worker_id"] = "worker-pool2-worker-00"
-    result = _generate(tmp_path, cluster, experiment)
-    assert result.returncode != 0
-    assert not (tmp_path / "generated").exists()
+def test_native_optional_settings_reject_types_without_coercion(tmp_path, generator, field, value):
+    cluster, experiment = _inputs()
+    experiment["serve"][field] = value
+    with pytest.raises(ValueError):
+        generator(tmp_path / "output", cluster, experiment)
+    assert not (tmp_path / "output").exists()

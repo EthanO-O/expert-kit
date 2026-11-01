@@ -11,8 +11,12 @@ use serde::Deserialize;
 pub struct InferenceSettings {
     pub instance_name: String,
     pub model_name: String,
-    pub hidden_dim: usize,
-    pub intermediate_dim: usize,
+    /// Legacy input retained for compatibility; model dimensions come from Weight Server.
+    #[serde(default)]
+    pub hidden_dim: Option<usize>,
+    /// Legacy input retained for compatibility; scheduling does not consume this dimension.
+    #[serde(default)]
+    pub intermediate_dim: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -182,7 +186,7 @@ mod test {
 
     use crate::config::env_source;
 
-    use super::Settings;
+    use super::{InferenceSettings, Settings};
 
     fn get_example_config() -> &'static str {
         r#"
@@ -220,8 +224,29 @@ controller:
             .build()
             .unwrap();
         let res = config.try_deserialize::<Settings>().unwrap();
-        assert_eq!(res.inference.hidden_dim, 2048);
+        assert_eq!(res.inference.hidden_dim, Some(2048));
         assert_eq!(res.controller.ports.intra, 5001);
+    }
+
+    #[test]
+    fn legacy_inference_dimensions_are_optional() {
+        for fields in ["", "hidden_dim: 16", "intermediate_dim: 8"] {
+            let yaml = format!("instance_name: example\nmodel_name: example\n{fields}\n");
+            let settings: InferenceSettings = config::Config::builder()
+                .add_source(File::from_str(&yaml, FileFormat::Yaml))
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap();
+            assert_eq!(
+                settings.hidden_dim,
+                fields.starts_with("hidden").then_some(16)
+            );
+            assert_eq!(
+                settings.intermediate_dim,
+                fields.starts_with("intermediate").then_some(8)
+            );
+        }
     }
 
     #[test]

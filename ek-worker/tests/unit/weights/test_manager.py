@@ -680,3 +680,55 @@ def test_conversion_capacity_remains_bounded_after_cancellation(fail_conversion:
             await manager.close()
 
     run(scenario())
+
+
+def test_graph_assignment_guard_is_scoped_and_removal_is_sticky() -> None:
+    async def scenario():
+        loader = _FakeLoader()
+        loader.block = True
+        manager, _ = _make_manager(loader)
+        manager.start()
+        try:
+            await manager.apply_targets(1, [_target(0, 0, "http://first:80")])
+            guard = manager.guard_graph_assignments({0: (0,), 1: ()}, device="cuda:0")
+            guard.require_current()
+            with pytest.raises(RuntimeError, match="already owns"):
+                manager.guard_graph_assignments({0: (0,)}, device="cuda:0")
+            await manager.apply_targets(2, [_target(0, 0, "http://other:80"), _target(1, 2)])
+            guard.require_current()
+            await manager.apply_targets(3, [_target(0, 0)])
+            guard.require_current()
+            await manager.apply_targets(4, [])
+            await manager.apply_targets(5, [_target(0, 0)])
+            with pytest.raises(RuntimeError, match="no longer current"):
+                guard.require_current()
+            guard.close()
+            replacement = manager.guard_graph_assignments({0: (0,)}, device="cuda:0")
+            replacement.require_current()
+            replacement.close()
+        finally:
+            await manager.close()
+
+    run(scenario())
+
+
+def test_graph_assignment_guard_rejects_missing_wrong_device_and_shutdown() -> None:
+    async def scenario():
+        manager, _ = _make_manager(_FakeLoader())
+        manager.start()
+        try:
+            await manager.apply_targets(1, [_target(0, 0)])
+            for mapping, device in [({0: (1,)}, "cuda:0"), ({0: (0,)}, "npu:0")]:
+                with pytest.raises(RuntimeError, match="not current Controller targets"):
+                    manager.guard_graph_assignments(mapping, device=device)
+            guard = manager.guard_graph_assignments({0: (0,)}, device="cuda:0")
+            await manager.begin_shutdown()
+            with pytest.raises(RuntimeError, match="no longer current"):
+                guard.require_current()
+            guard.close()
+            with pytest.raises(RuntimeError, match="cannot bind"):
+                manager.guard_graph_assignments({0: (0,)}, device="cuda:0")
+        finally:
+            await manager.close()
+
+    run(scenario())

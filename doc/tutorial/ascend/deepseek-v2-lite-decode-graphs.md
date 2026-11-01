@@ -9,14 +9,16 @@ use different model geometry and expert counts from DeepSeek-V2-Lite.
 The official `deepseek-ai/DeepSeek-V2-Lite-Chat` checkpoint revision
 `85864749cd611b4353ce1decdb286193298f64c7` has 27 layers, 64 routed experts per
 MoE layer, hidden size 2048, expert intermediate size 1408 and top-k 6.
-Layer 0 is dense; `layer_ids` must contain exactly 1 through 26. Use BF16
-weights and activations without a quantization declaration.
+Layer 0 is dense. Current startup obtains routed layers and geometry from native
+Frontend and Weight Server facts; do not put layer IDs or shapes in the graph
+options document. Explicit Worker model values are optional assertions.
 
-A single Worker owns all 64 experts on each routed layer. For two Workers,
-declare ordered intervals `[0,32)` and `[32,64)`. Both arrangements require
-1,664 routed experts READY before Frontend PREPARE. Reserve at least 26.81 GiB
-of routed weights for one Worker, or 13.41 GiB per Worker for two, plus graph
-buffers and runtime memory.
+Choose Worker count/devices in the cluster pools and use ordinary Controller
+scheduling. Graph startup consumes READY assignments, including noncontinuous
+IDs and different per-layer ownership; no ordered interval manifest is required.
+The model has 1,664 routed experts in total. Reserve routed weights plus graph
+buffers/runtime memory according to actual ownership; the historical one-Worker
+weight estimate was 26.81 GiB and two equal shards 13.41 GiB each.
 
 ## Historical qualification
 

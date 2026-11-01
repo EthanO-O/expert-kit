@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -19,7 +20,7 @@ from expertkit_transport.transports.ascend_graph.contracts import (
 )
 
 SERVICE = "expertkit.internal.AscendGraphControl"
-MAX_CONTROL_BYTES = 16 * 1024
+MAX_CONTROL_BYTES = 1024 * 1024
 
 
 def encode_message(message: dict[str, object]) -> bytes:
@@ -125,8 +126,12 @@ class GraphStepControl:
     and collectives can require all ranks to join before any one finishes.
     """
 
-    def __init__(self, config: AscendGraphConfig) -> None:
+    def __init__(
+        self, config: AscendGraphConfig, *, require_current: Callable[[], None] | None = None
+    ) -> None:
         self.config = config
+        self._assignment_id = config.assignment_id
+        self._require_current = require_current or (lambda: None)
         self._peers: list[_PeerControl] = []
         for worker in config.participants:
             channel = grpc.insecure_channel(
@@ -144,7 +149,7 @@ class GraphStepControl:
                 )
                 for name in ("Begin", "Finish")
             ]
-            self._peers.append(_PeerControl(channel, *methods))
+            self._peers.append(_PeerControl(channel, *methods, worker.expected_start_id))
         self._sequence = 0
         self._active: dict[str, object] | None = None
         self._requests: list[dict[str, object]] = []
@@ -187,6 +192,8 @@ class GraphStepControl:
         """
         if self._poisoned or self._active is not None:
             raise RuntimeError("graph control is poisoned or already executing a step")
+        if not isinstance(phase, str):
+            raise ValueError("unsupported graph control phase")
         paired = (
             self.config.mode == "full"
             and self.config.model.expert_compute == "deepseek_v4"
@@ -197,13 +204,31 @@ class GraphStepControl:
                 raise ValueError("V4 full capture/replay requires a graph phase")
         elif graph_phase is not None:
             raise ValueError("graph phase is only valid for V4 full capture/replay")
-        self._sequence += 1
-        self._deadline = time.monotonic() + self.config.timeout_seconds
-        self._requests = [
+        if phase not in {"prepare", "warmup", "capture", "replay", "close"}:
+            raise ValueError("unsupported graph control phase")
+        if type(capacity) is not int or (
+            capacity not in self.config.capture_sizes
+            if phase in {"warmup", "capture", "replay"}
+            else capacity != 0
+        ):
+            raise ValueError("invalid graph control capacity")
+        if paired and (
+            (graph_phase == "decode" and capacity not in self.config.decode_capture_sizes)
+            or (graph_phase == "mixed" and capacity < 2)
+        ):
+            raise ValueError("capacity does not belong to the V4 full graph phase")
+        if phase == "prepare" and any(peer.ready_revision is not None for peer in self._peers):
+            raise RuntimeError("graph session is already prepared")
+        if phase != "prepare" and any(peer.ready_revision is None for peer in self._peers):
+            raise RuntimeError("graph session has not been prepared")
+        if phase != "close":
+            self._require_current()
+        sequence = self._sequence + 1
+        requests = [
             {
-                "version": 1,
-                "identity": self.config.identity(),
-                "sequence": self._sequence,
+                "version": 2,
+                "assignment_id": self._assignment_id,
+                "sequence": sequence,
                 "phase": phase,
                 "capacity": capacity,
                 "worker_start_id": peer.worker_start_id,
@@ -211,37 +236,69 @@ class GraphStepControl:
             }
             for peer in self._peers
         ]
+        if phase == "prepare":
+            snapshot = self.config.model_dump(mode="json")
+            for request in requests:
+                request["config"] = snapshot
         if paired:
-            for request in self._requests:
+            for request in requests:
                 request["graph_phase"] = graph_phase
-        self._active = self._requests[0]
+        # Validate every complete payload before any rank can acquire device resources.
+        for request in requests:
+            encode_message(request)
+        self._sequence = sequence
+        self._deadline = time.monotonic() + self.config.timeout_seconds
+        self._requests = requests
+        self._active = requests[0]
         try:
             replies = self._fanout("begin")
             for peer, reply in zip(self._peers, replies, strict=True):
-                if reply.get("sequence") != self._sequence or reply.get("state") != "ready":
-                    raise RuntimeError("Worker acknowledged the wrong graph step")
-                start_id = reply.get("worker_start_id")
-                revision = reply.get("ready_revision")
-                if not isinstance(start_id, str) or type(revision) is not int:
-                    raise RuntimeError("Worker graph identity is invalid")
-                if peer.worker_start_id is not None and start_id != peer.worker_start_id:
-                    raise RuntimeError("Worker restarted during graph execution")
-                if peer.ready_revision is not None and revision != peer.ready_revision:
-                    raise RuntimeError("Worker weights changed during graph execution")
-                peer.worker_start_id = start_id
-                peer.ready_revision = revision
+                self._validate_reply(peer, reply, state="ready", preparing=phase == "prepare")
+                peer.ready_revision = reply["ready_revision"]
+            if phase == "prepare":
+                for peer, request in zip(self._peers, self._requests, strict=True):
+                    request.pop("config")
+                    request["ready_revision"] = peer.ready_revision
         except BaseException:
             self._poisoned = True
             raise
+
+    def _validate_reply(
+        self, peer: _PeerControl, reply: dict[str, Any], *, state: str, preparing: bool = False
+    ) -> None:
+        if set(reply) != {
+            "version",
+            "assignment_id",
+            "sequence",
+            "state",
+            "worker_start_id",
+            "ready_revision",
+        }:
+            raise RuntimeError("invalid graph control reply fields")
+        if (
+            type(reply["version"]) is not int
+            or reply["version"] != 2
+            or reply["assignment_id"] != self._assignment_id
+            or type(reply["sequence"]) is not int
+            or reply["sequence"] != self._sequence
+            or reply["state"] != state
+        ):
+            raise RuntimeError("Worker acknowledged the wrong graph step")
+        if reply["worker_start_id"] != peer.worker_start_id:
+            raise RuntimeError("Worker restarted during graph execution")
+        revision = reply["ready_revision"]
+        if type(revision) is not int or revision < 0:
+            raise RuntimeError("Worker graph identity is invalid")
+        if not preparing and revision != peer.ready_revision:
+            raise RuntimeError("Worker weights changed during graph execution")
 
     def finish(self) -> None:
         """Prove every Worker's completion before admitting another step."""
         if self._poisoned or self._active is None:
             raise RuntimeError("graph control has no healthy active step")
         try:
-            for reply in self._fanout("finish"):
-                if reply.get("sequence") != self._sequence or reply.get("state") != "complete":
-                    raise RuntimeError("Worker did not complete the matching graph step")
+            for peer, reply in zip(self._peers, self._fanout("finish"), strict=True):
+                self._validate_reply(peer, reply, state="complete")
         except BaseException:
             self._poisoned = True
             raise

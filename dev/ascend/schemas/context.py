@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self
 
-from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.ascend_graph import AscendGraphOptions
 from expertkit_worker.config import BackendName
 from pydantic import BaseModel, computed_field, model_serializer, model_validator
 
@@ -59,7 +59,7 @@ class TemplateContext(BaseModel):
     serve: ServeConfig
     run: RunConfig
     tracing: TracingConfig
-    ascend_decode_graph: AscendGraphConfig | None = None
+    ascend_decode_graph: AscendGraphOptions | None = None
     results_path: Path
 
     @classmethod
@@ -113,137 +113,74 @@ class TemplateContext(BaseModel):
 
     @model_validator(mode="after")
     def validate_device_placement(self) -> Self:
-        node = self.attention.config.node
-        pool = self.expert.get_pool_by_node(node)
-
-        if pool is None:
-            return self
-
-        # Expert and attention are on a same node
-        attention_devices = set(self.attention.config.devices)
-        pool_devices = set(pool.devices)
-        duplicates = attention_devices & pool_devices
-        if duplicates:
-            raise DuplicateDeviceError(f"Devices {duplicates} have been used.")
+        """Require distinct physical devices on each actual deployment host."""
+        occupied: dict[str, set[int]] = {}
+        roles = [(self.attention.node, self.attention.config.devices)] + [
+            (pool.node, pool.config.devices) for pool in self.expert.pools
+        ]
+        for node, devices in roles:
+            address = str(node.address)
+            used = occupied.setdefault(address, set())
+            if len(devices) != len(set(devices)) or used.intersection(devices):
+                raise DuplicateDeviceError(
+                    f"Devices {devices} are already used on {address}"
+                )
+            used.update(devices)
         return self
 
     @model_validator(mode="after")
     def validate_port_placement(self) -> Self:
-        def check_duplicate_ports(p1: set[int], p2: set[int]) -> None:
-            duplicates = p1 & p2
-            if duplicates:
-                raise DuplicatePortError(f"Ports {duplicates} have been used.")
+        """Check actual service ports per host without inferring graph placement."""
+        occupied: dict[str, set[int]] = {}
 
-        def check_duplicate_ports_with_expert(
-            src_node: str,
-            src_ports: set[int],
-        ) -> None:
-            pool = self.expert.get_pool_by_node(src_node)
-            if pool is None:
-                return
+        def claim(address: str, ports: list[int]) -> None:
+            used = occupied.setdefault(address, set())
+            if (
+                any(not 1 <= port <= 65535 for port in ports)
+                or len(ports) != len(set(ports))
+                or used.intersection(ports)
+            ):
+                raise DuplicatePortError(
+                    f"Ports {ports} conflict or are out of range on {address}"
+                )
+            used.update(ports)
 
-            pool_ports = pool.allocated_ports
-            check_duplicate_ports(src_ports, pool_ports)
-
-        attention_node = self.attention.config.node
-        attention_ports = self.attention.config.allocated_ports
-        check_duplicate_ports_with_expert(attention_node, attention_ports)
-
-        control_node = self.control.config.node
-        control_ports = self.control.config.allocated_ports
-        check_duplicate_ports_with_expert(control_node, control_ports)
-
-        if attention_node == control_node:
-            # Same node, check if attention and control shares any port
-            check_duplicate_ports(attention_ports, control_ports)
-
+        claim(str(self.attention.node.address), [self.attention.config.vllm_port])
+        control = self.control.config
+        claim(
+            str(self.control.node.address),
+            [
+                control.postgres_port,
+                control.worker_control_port,
+                control.frontend_control_port,
+                control.weight_server_port,
+            ],
+        )
+        for pool in self.expert.pools:
+            ports = []
+            for worker in pool.config.workers:
+                ports.extend([worker.port, worker.peer_port])
+                if self.ascend_decode_graph is not None:
+                    if worker.graph_control_port is None:
+                        raise ValueError(
+                            "graph generation requires pools.start_graph_control_port"
+                        )
+                    ports.append(worker.graph_control_port)
+            claim(str(pool.node.address), ports)
+        if self.ascend_decode_graph is not None:
+            graph = self.ascend_decode_graph
+            claim(graph.rendezvous_host, [graph.rendezvous_port])
         return self
 
     @model_validator(mode="after")
     def validate_decode_graph(self) -> Self:
-        """Restrict graph deployment to qualified resident experts on one host."""
+        """Check known deployment conflicts while runtime resolves model/READY facts."""
         graph = self.ascend_decode_graph
         if graph is None:
             return self
-        if len(self.attention.config.devices) != 1 or self.expert.total_workers != len(
-            graph.participants
-        ):
+        if len(self.attention.config.devices) != 1 or self.expert.total_workers == 0:
             raise ValueError(
-                "ascend_decode_graph requires one Frontend and matching Workers"
-            )
-        if len(self.expert.pools) != 1:
-            raise ValueError("ascend_decode_graph currently requires one expert pool")
-        pool = self.expert.pools[0].config
-        if pool.node != self.attention.config.node:
-            raise ValueError("ascend_decode_graph currently requires one host")
-        devices = [*self.attention.config.devices, *pool.devices]
-        if len(set(devices)) != len(devices):
-            raise DuplicateDeviceError(
-                "ascend_decode_graph requires a distinct physical device for every role"
-            )
-        model = self.model.config
-        if graph.model != model.graph_model():
-            raise ValueError(
-                "ascend_decode_graph model declaration must match model configuration"
-            )
-        geometry = (
-            model.num_layers,
-            model.experts_per_layer,
-            model.hidden_dim,
-            model.intermediate_dim,
-            model.topk,
-        )
-        if geometry == (27, 64, 2048, 1408, 6) and model.expert_compute == "swiglu":
-            routed_layers = tuple(range(1, 27))
-        elif geometry == (48, 128, 2048, 768, 8) and model.expert_compute == "swiglu":
-            routed_layers = tuple(range(48))
-        elif (
-            geometry == (43, 256, 4096, 2048, 6)
-            and model.expert_compute == "deepseek_v4"
-            and model.swiglu_limit == 10.0
-            and model.quantization is not None
-        ):
-            routed_layers = tuple(range(43))
-        else:
-            raise ValueError(
-                "ascend_decode_graph requires qualified V2-Lite, Qwen3 or ModelSlim V4 computation"
-            )
-        if graph.layer_ids != routed_layers:
-            raise ValueError(
-                "ascend_decode_graph layer order must match all routed model layers"
-            )
-        generated_workers = {
-            f"{pool.config.id}-{worker.id}": pool
-            for pool in self.expert.pools
-            for worker in pool.config.workers
-        }
-        if {
-            worker.worker_id for worker in graph.participants
-        } != generated_workers.keys() or graph.weight_version != model.weight_version:
-            raise ValueError(
-                "ascend_decode_graph identity must match Workers and model weights"
-            )
-        graph_ports = {graph.rendezvous_port}
-        occupied = self.attention.config.allocated_ports.copy()
-        for pool in self.expert.pools:
-            occupied |= pool.config.allocated_ports
-        address = str(self.attention.node.address)
-        if graph.rendezvous_host != address:
-            raise ValueError(
-                "ascend_decode_graph endpoints must use the Worker host address"
-            )
-        for worker in graph.participants:
-            host, _, port_text = worker.control_endpoint.rpartition(":")
-            if host != address:
-                raise ValueError(
-                    "ascend_decode_graph endpoints must use the Worker host address"
-                )
-            graph_ports.add(int(port_text))
-        if self.control.config.node == self.attention.config.node:
-            occupied |= self.control.config.allocated_ports
-        if len(graph_ports) != len(graph.participants) + 1 or graph_ports & occupied:
-            raise DuplicatePortError(
-                "ascend_decode_graph ports must be distinct and unallocated"
+                "ascend_decode_graph requires one Frontend and at least one Worker"
             )
         if self.serve.enforce_eager or self.tracing.enabled:
             raise ValueError(

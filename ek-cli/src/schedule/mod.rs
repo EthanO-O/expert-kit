@@ -25,14 +25,14 @@ use tonic::transport::Endpoint;
 
 mod graph;
 
+/// Explain how legacy graph-placement commands migrate to ordinary scheduling.
+pub const RETIRED_GRAPH_SCHEDULE_MESSAGE: &str = "schedule graph has been retired; use ordinary schedule rebalance/manual/static/duplicate, wait for READY experts, then start the graph Frontend. Graph options do not declare expert placement.";
+
 #[derive(Subcommand, Debug)]
 pub enum ScheduleCommand {
-    /// Install exact graph placement for a cold start without concurrent scheduling.
+    /// Retired: use ordinary scheduling before starting the graph Frontend.
     Graph {
-        #[arg(
-            long,
-            help = "Ascend decode graph JSON containing workers and expert ranges"
-        )]
+        #[arg(long, help = "Legacy graph JSON path (this command is retired)")]
         graph_config: PathBuf,
         #[arg(
             long,

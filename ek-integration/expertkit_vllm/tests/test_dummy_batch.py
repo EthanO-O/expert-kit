@@ -60,7 +60,7 @@ def _remote_layer(monkeypatch, *, shared: bool, scaling: float):
     layer._layer_id = 0
     layer.num_experts = 2
     layer.gate = None
-    layer.graph_config = None
+    layer.graph_options = None
     layer._requires_fp32_gate = False
     layer.expert_selector = Selector()
     layer._shared_experts_module = Shared() if shared else None

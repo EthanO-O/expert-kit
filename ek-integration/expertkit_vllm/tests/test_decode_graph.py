@@ -7,10 +7,68 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig
+from expertkit_transport.transports.ascend_graph.config import AscendGraphConfig, AscendGraphOptions
 from vllm.config import CUDAGraphMode
 
 from expertkit_vllm import decode_graph as graph
+
+
+def _workers(layers, experts, count=1):
+    return tuple(
+        dict(
+            worker_id=f"worker-{rank}",
+            expected_start_id=f"start-{rank}",
+            control_endpoint=f"127.0.0.1:{18100 + rank}",
+            device=f"npu:{rank}",
+            experts_by_layer=tuple(
+                tuple(range(rank * experts // count, (rank + 1) * experts // count)) for _ in layers
+            ),
+        )
+        for rank in range(count)
+    )
+
+
+def _graph_config(**values):
+    layers = values.get("layer_ids", tuple(range(1, 27)))
+    model = values.get(
+        "model",
+        dict(
+            num_layers=27,
+            experts_per_layer=64,
+            hidden_dim=2048,
+            expert_intermediate_dim=1408,
+            top_k=6,
+            activation_dtype="bf16",
+            weight_dtype="bf16",
+            activation="silu",
+            expert_compute="swiglu",
+            swiglu_limit=0.0,
+            quantization=None,
+        ),
+    )
+    captures = values.get("capture_sizes", (1, 2, 4, 8, 16, 32, 64))
+    return AscendGraphConfig(
+        mode="decode",
+        model_name="native-model",
+        source_topology_version=1,
+        model=model,
+        workers=_workers(layers, model["experts_per_layer"]),
+        decode_capture_sizes=captures,
+        capture_sizes=captures,
+        timeout_seconds=values.get("timeout_seconds", 120.0),
+        **{
+            key: value
+            for key, value in values.items()
+            if key
+            not in {"worker_id", "control_endpoint", "model", "timeout_seconds", "capture_sizes"}
+        },
+    )
+
+
+def _options(config):
+    return AscendGraphOptions.model_validate(
+        config.model_dump(include=set(AscendGraphOptions.model_fields))
+    )
 
 
 @pytest.fixture
@@ -33,10 +91,13 @@ def graph_runtime(monkeypatch, request):
     )
 
     class Control:
-        def __init__(self, config):
-            pass
+        def __init__(self, config, *, require_current=None):
+            self.config = config
+            self.require_current = require_current or (lambda: None)
 
         def begin(self, phase, capacity=0, *, graph_phase=None):
+            if phase != "close":
+                self.require_current()
             events.append(("begin", phase, capacity))
             if graph_phase is not None:
                 events.append(("graph-phase", graph_phase))
@@ -52,6 +113,7 @@ def graph_runtime(monkeypatch, request):
 
     class Data:
         def __init__(self, config, **options):
+            self.config = config
             self.profiles = {}
 
         def buffers(self, capacity):
@@ -144,7 +206,15 @@ def graph_runtime(monkeypatch, request):
             assert graph.is_graph_profile()
             return self.model()
 
+        def _dummy_run(self, num_tokens, is_profile=False):
+            return self.model()
+
+        def execute_model(self, scheduler_output):
+            return self._model_forward()
+
         def _capture_cudagraphs(self, descriptors, mode, profiler=None):
+            if hasattr(self, "capture_callback"):
+                return self.capture_callback()
             events.append(("capture-descriptors", tuple(descriptors), mode, profiler))
 
     for name, attribute, value in (
@@ -154,7 +224,11 @@ def graph_runtime(monkeypatch, request):
         module = ModuleType(name)
         setattr(module, attribute, value)
         monkeypatch.setitem(sys.modules, name, module)
-    config = AscendGraphConfig(
+    module = ModuleType("expertkit_vllm.v4_full_attention")
+    module.install_v4_memory_reservation = lambda: None
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(graph, "install_graph_scheduler", lambda _: None)
+    config = _graph_config(
         session_id="frontend-test-session-001",
         instance_id=1,
         worker_id="worker",
@@ -182,15 +256,8 @@ def graph_runtime(monkeypatch, request):
         values.update(
             layer_ids=tuple(range(43)),
             capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048),
-            workers=tuple(
-                dict(
-                    worker_id=f"worker-{rank}",
-                    control_endpoint=f"127.0.0.1:{18100 + rank}",
-                    expert_start=32 * rank,
-                    expert_end=32 * (rank + 1),
-                )
-                for rank in range(8)
-            ),
+            decode_capture_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256),
+            workers=_workers(tuple(range(43)), 256, 8),
         )
         config = AscendGraphConfig.model_validate(values)
 
@@ -206,6 +273,9 @@ def graph_runtime(monkeypatch, request):
                 finally:
                     self.phase = previous
 
+            def prepare_profile_metadata(self):
+                events.append("profile-metadata")
+
             def close(self):
                 assert all(not entries for entries in wrapper._expertkit_v4_phase_entries.values())
                 events.append("adapter-close")
@@ -216,11 +286,22 @@ def graph_runtime(monkeypatch, request):
         def install(runner, _config):
             events.append("adapter-install")
             runner._expertkit_v4_full_attention = adapter
+            adapter.graph_config = _config
             return adapter
 
+        module.install_v4_memory_reservation = lambda: None
         module.install_v4_full_attention = install
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    graph.install_decode_graph_wrapper(config)
+    topology = SimpleNamespace(
+        require_current=lambda _: None, close=lambda: events.append("topology-close")
+    )
+
+    def resolve(*args):
+        events.append("resolve-runtime")
+        return config, topology, None
+
+    monkeypatch.setattr(graph, "_resolve_graph_config", resolve)
+    graph.install_decode_graph_wrapper(_options(config))
     wrapper = Wrapper()
     try:
         yield events, context, Runner(wrapper), wrapper
@@ -259,15 +340,7 @@ def _full_qwen_config(config):
                 },
             },
             "layer_ids": list(range(48)),
-            "workers": [
-                dict(
-                    worker_id=f"worker-{i}",
-                    control_endpoint=f"127.0.0.1:{18100 + i}",
-                    expert_start=i * 64,
-                    expert_end=(i + 1) * 64,
-                )
-                for i in range(2)
-            ],
+            "workers": _workers(tuple(range(48)), 128, 2),
         }
     )
 
@@ -355,8 +428,6 @@ def test_native_post_forward_failure_poisoned_before_finish(graph_runtime):
     [
         {"uniform": False},
         {"num_reqs": 1, "num_tokens": 4},
-        {"num_reqs": 3, "num_tokens": 3},
-        {"has_lora": True},
         {"num_reqs": 0, "num_tokens": 0},
     ],
 )
@@ -431,7 +502,7 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
     )
     monkeypatch.setattr(torch, "__version__", "2.10.0+cpu")
     monkeypatch.setenv("EK_INSTANCE_ID", "7")
-    config = AscendGraphConfig(
+    config = _graph_config(
         session_id="qualified-session-v1",
         instance_id=7,
         worker_id="worker-0",
@@ -478,6 +549,7 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
                 **config.model_dump(),
                 "model": declaration,
                 "layer_ids": list(range(48)),
+                "workers": _workers(tuple(range(48)), 128),
             }
         )
     runtime = SimpleNamespace(
@@ -492,7 +564,14 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
             enable_eplb=False,
             enable_expert_parallel=False,
         ),
-        scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=max_sequences),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=False,
+            max_num_seqs=max_sequences,
+            max_num_batched_tokens=2048,
+            max_num_scheduled_tokens=None,
+            scheduler_cls=None,
+            enable_chunked_prefill=True,
+        ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY, cudagraph_capture_sizes=[1, 32, 64]
@@ -501,7 +580,7 @@ def test_qualified_model_requires_every_capture_profile(monkeypatch, max_sequenc
         lora_config=None,
     )
     if max_sequences < 64:
-        with pytest.raises(ValueError, match="max_num_seqs"):
+        with pytest.raises(ValueError, match="allocated request buffers"):
             graph.validate_graph_model(runtime, config)
     else:
         graph.validate_graph_model(runtime, config)
@@ -568,7 +647,7 @@ def modelslim_graph_deployment(monkeypatch):
     module = ModuleType(module_name)
     module.AscendModelSlimConfig = NativeModelSlimConfig
     monkeypatch.setitem(sys.modules, module_name, module)
-    config = AscendGraphConfig(
+    config = _graph_config(
         session_id="modelslim-native-v1",
         instance_id=7,
         worker_id="worker-0",
@@ -610,7 +689,14 @@ def modelslim_graph_deployment(monkeypatch):
             enable_eplb=False,
             enable_expert_parallel=False,
         ),
-        scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=64),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=False,
+            max_num_seqs=64,
+            max_num_batched_tokens=2048,
+            max_num_scheduled_tokens=None,
+            scheduler_cls=None,
+            enable_chunked_prefill=True,
+        ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
@@ -640,33 +726,32 @@ def test_modelslim_native_recipe_matches_complete_shared_declaration(modelslim_g
 
 def test_full_graph_token_capacity_is_independent_of_sequence_limit(modelslim_graph_deployment):
     runtime, config = modelslim_graph_deployment
-    config = _full_qwen_config(config).model_copy(update={"capture_sizes": (1, 64, 128, 256)})
+    config = _full_qwen_config(config).model_copy(
+        update={"capture_sizes": (1, 64, 128, 256), "decode_capture_sizes": (1, 64)}
+    )
     runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     runtime.compilation_config.cudagraph_capture_sizes = list(config.capture_sizes)
     runtime.scheduler_config.max_num_batched_tokens = 2048
     graph.validate_graph_model(runtime, config)
     runtime.scheduler_config.max_num_batched_tokens = 128
-    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+    with pytest.raises(ValueError, match="allocated token buffers"):
         graph.validate_graph_model(runtime, config)
+    runtime.scheduler_config.max_num_batched_tokens = 2048
     runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
     with pytest.raises(ValueError, match="configured native graph mode"):
         graph.validate_graph_model(runtime, config)
 
 
-@pytest.mark.parametrize("change", ["bf16", "one_worker", "layers", "capacity"])
-def test_full_graph_rejects_unqualified_model_or_profile(modelslim_graph_deployment, change):
-    _, previous = modelslim_graph_deployment
-    values = _full_qwen_config(previous).model_dump()
-    if change == "bf16":
-        values["model"]["quantization"] = None
-    elif change == "one_worker":
-        values["workers"] = [{**values["workers"][0], "expert_end": 128}]
-    elif change == "layers":
-        values["layer_ids"] = [0]
-    else:
-        values["capture_sizes"] = [1, 4096]
-    with pytest.raises(ValueError, match="full graph"):
-        AscendGraphConfig.model_validate(values)
+def test_full_graph_has_no_experimental_geometry_or_participant_whitelist(
+    modelslim_graph_deployment,
+):
+    runtime, previous = modelslim_graph_deployment
+    config = _full_qwen_config(previous)
+    config = AscendGraphConfig.model_validate(
+        {**config.model_dump(), "workers": _workers(config.layer_ids, 128)}
+    )
+    runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    graph.validate_graph_model(runtime, config)
 
 
 @pytest.mark.parametrize(
@@ -796,15 +881,7 @@ def v4_graph_deployment(modelslim_graph_deployment, monkeypatch):
             **previous.model_dump(exclude={"worker_id", "control_endpoint"}),
             "model": declaration,
             "layer_ids": tuple(range(43)),
-            "workers": tuple(
-                dict(
-                    worker_id=f"worker-{rank}",
-                    control_endpoint=f"127.0.0.1:{18100 + rank}",
-                    expert_start=32 * rank,
-                    expert_end=32 * (rank + 1),
-                )
-                for rank in range(8)
-            ),
+            "workers": _workers(tuple(range(43)), 256, 8),
         }
     )
     return runtime, config
@@ -858,13 +935,13 @@ def test_v4_graph_rejects_unqualified_native_semantics(v4_graph_deployment, chan
             mix_placement=True
         )
     else:
-        runtime.model_config.hf_text_config.routed_scaling_factor = 1.0
+        runtime.model_config.hf_text_config.scoring_func = "softmax"
     with pytest.raises(ValueError):
         graph.validate_graph_model(runtime, config)
 
 
 def test_exchange_uses_shared_hidden_and_top_k_without_device_reads():
-    config = AscendGraphConfig(
+    config = _graph_config(
         session_id="frontend-buffer-0061",
         instance_id=1,
         worker_id="worker",
@@ -988,14 +1065,14 @@ def test_v4_capture_scope_failure_poisons_session_without_releasing_adapter(grap
     assert "adapter-close" not in events
 
 
-@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
-def test_v4_capture_failure_traceback_holds_unpublished_native_graph(graph_runtime):
+@pytest.mark.parametrize("graph_runtime", ["decode", "full", "v4-full"], indirect=True)
+def test_capture_failure_traceback_holds_unpublished_native_graph(graph_runtime):
     import gc
     import weakref
 
     events, context, runner, wrapper = graph_runtime
     runner.profile_run()
-    context.batch_descriptor = descriptor(uniform=False, num_reqs=4, num_tokens=4)
+    context.batch_descriptor = descriptor(num_reqs=4, num_tokens=4)
     references = []
 
     class PartialGraph:
@@ -1014,11 +1091,454 @@ def test_v4_capture_failure_traceback_holds_unpublished_native_graph(graph_runti
     else:
         pytest.fail("capture must fail before publishing its native graph")
     session = wrapper._expertkit_decode_session
-    assert session._poisoned and session._v4_capture_failure is not None
-    assert not any(session._v4_phase_entries.values())
+    assert session._poisoned and session._native_capture_failure is not None
+    assert not wrapper.concrete_aclgraph_entries
+    if session._v4_phase_entries is not None:
+        assert not any(session._v4_phase_entries.values())
     gc.collect()
     assert references[0]() is not None
     session.close()
     gc.collect()
     assert references[0]() is not None
     assert "adapter-close" not in events and "data-close" not in events
+
+
+@pytest.mark.parametrize("graph_runtime", ["decode", "full"], indirect=True)
+@pytest.mark.parametrize("change", ["none", "descriptor", "capacity", "lora", "wrapper"])
+def test_real_graph_required_steps_reject_before_worker_or_model_submission(graph_runtime, change):
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    context.batch_descriptor = descriptor()
+    if change == "none":
+        context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+    elif change == "descriptor":
+        context.batch_descriptor = None
+    elif change == "capacity":
+        context.batch_descriptor = descriptor(num_tokens=3, num_reqs=3)
+    elif change == "lora":
+        context.batch_descriptor = descriptor(has_lora=True)
+    else:
+        wrapper.runtime_mode = CUDAGraphMode.NONE
+    events.clear()
+    with pytest.raises(ValueError, match="no eligible native FULL graph"):
+        runner.execute_model(SimpleNamespace(num_scheduled_tokens={"request": 1}))
+    assert events == []
+    assert graph._REAL_STEP.get() is None
+
+
+def test_decode_prefill_classification_uses_host_scheduling_metadata(graph_runtime):
+    events, context, runner, _wrapper = graph_runtime
+    runner.profile_run()
+    # The native descriptor can look uniform after padding; Host query counts
+    # still identify this as an ordinary Decode-only mixed/Prefill step.
+    context.batch_descriptor = descriptor(num_tokens=4, num_reqs=4)
+    context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+    events.clear()
+    assert (
+        runner.execute_model(SimpleNamespace(num_scheduled_tokens={"prefill": 3, "decode": 1}))
+        == "eager"
+    )
+    assert events == [("eager", False), "native-attention-update"]
+
+
+@pytest.mark.parametrize("graph_runtime", ["decode", "full"], indirect=True)
+def test_native_compile_dummy_endpoint_is_not_a_real_request(graph_runtime):
+    events, context, runner, _wrapper = graph_runtime
+    runner.profile_run()
+    context.batch_descriptor = descriptor(num_tokens=3, num_reqs=3)
+    events.clear()
+    assert runner._dummy_run(3, False) == "eager"
+    assert events == [("eager", False)]
+    assert not graph._SYNTHETIC.get()
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_v4_profile_metadata_prepared_inside_native_profile_window(graph_runtime):
+    events, _context, runner, _wrapper = graph_runtime
+    runner.profile_run()
+    assert events.index("adapter-install") < events.index(("begin", "prepare", 0))
+    assert events.index("profile-metadata") < events.index(("eager", True))
+
+
+def test_session_checks_topology_before_coarse_begin_and_retains_failed_owners(graph_runtime):
+    events, context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    session = wrapper._expertkit_decode_session
+    context.batch_descriptor = descriptor()
+    events.clear()
+
+    def changed():
+        raise RuntimeError("selected dependency changed")
+
+    session._control.require_current = changed
+    with pytest.raises(RuntimeError, match="dependency changed"):
+        runner.execute_model(SimpleNamespace(num_scheduled_tokens={"request": 1}))
+    assert "native-capture" not in events and "warmup-input" not in events
+    assert session._poisoned
+    session.close()
+    assert "data-close" not in events
+    assert "topology-close" in events and "control-close" in events
+    assert not session._watchdog.is_alive()
+
+
+def test_startup_prepare_failure_keeps_attention_and_closes_host_owners(graph_runtime, monkeypatch):
+    events, _context, runner, _wrapper = graph_runtime
+    retained = []
+    monkeypatch.setattr(graph, "retain_until_process_exit", retained.append)
+    original_control = graph.GraphStepControl
+
+    class FailingControl(original_control):
+        def begin(self, *args, **kwargs):
+            raise RuntimeError("partial PREPARE")
+
+    monkeypatch.setattr(graph, "GraphStepControl", FailingControl)
+    attention = object()
+    topology = SimpleNamespace(
+        require_current=lambda _: None, close=lambda: events.append("topology-close")
+    )
+    runtime = graph._resolve_graph_config(None, None)[0]
+    with pytest.raises(RuntimeError, match="partial PREPARE"):
+        graph.DecodeGraphSession(runtime, runner.device, topology=topology, attention=attention)
+    assert len(retained) == 1
+    session = retained[0]
+    assert session._v4_attention is attention and session._poisoned and session._closed
+    assert not session._watchdog.is_alive()
+    assert "topology-close" in events and "control-close" in events
+    assert "data-close" not in events
+
+
+@pytest.mark.parametrize("mode,expected_tokens", [("full", 12), ("decode", 24)])
+def test_scheduler_hook_changes_runtime_fields_without_mutating_allocations(
+    monkeypatch, mode, expected_tokens
+):
+    import vllm.config
+    import vllm.v1.core.sched.scheduler as native
+
+    class Scheduler:
+        def __init__(self, vllm_config):
+            self.max_num_running_reqs = vllm_config.scheduler_config.max_num_seqs
+            self.max_num_scheduled_tokens = vllm_config.scheduler_config.max_num_scheduled_tokens
+
+    class SchedulerConfig:
+        def get_scheduler_cls(self):
+            return Scheduler
+
+    monkeypatch.setattr(native, "Scheduler", Scheduler)
+    monkeypatch.setattr(vllm.config, "SchedulerConfig", SchedulerConfig)
+    options = AscendGraphOptions(
+        mode=mode, capture_sizes=(3, 7, 12), rendezvous_host="host", rendezvous_port=1234
+    )
+    graph.install_graph_scheduler(options)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=8 if mode == "full" else 16,
+            max_num_batched_tokens=32,
+            max_num_scheduled_tokens=24,
+            scheduler_cls=None,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[12, 3, 7, 3]),
+    )
+    before = vars(config.scheduler_config).copy()
+    scheduler = Scheduler(vllm_config=config)
+    assert scheduler.max_num_running_reqs == (7 if mode == "full" else 12)
+    assert scheduler.max_num_scheduled_tokens == expected_tokens
+    assert vars(config.scheduler_config) == before
+    assert SchedulerConfig().get_scheduler_cls() is Scheduler
+    config.compilation_config.cudagraph_capture_sizes = [3, 7]
+    with pytest.raises(ValueError, match="capture sizes must match"):
+        Scheduler(config)
+
+
+def test_explicit_custom_scheduler_cannot_silently_miss_graph_limits(monkeypatch):
+    import vllm.config
+    import vllm.v1.core.sched.scheduler as native
+
+    class CustomScheduler:
+        pass
+
+    class SchedulerConfig:
+        def get_scheduler_cls(self):
+            return CustomScheduler
+
+    class Scheduler:
+        def __init__(self, vllm_config):
+            pass
+
+    monkeypatch.setattr(native, "Scheduler", Scheduler)
+    monkeypatch.setattr(vllm.config, "SchedulerConfig", SchedulerConfig)
+    options = AscendGraphOptions(rendezvous_host="host", rendezvous_port=1234)
+    graph.install_graph_scheduler(options)
+    with pytest.raises(ValueError, match="default native Scheduler"):
+        SchedulerConfig().get_scheduler_cls()
+
+
+def test_options_environment_rejects_old_placement_document(tmp_path, monkeypatch):
+    path = tmp_path / "options.json"
+    path.write_text('{"capture_sizes":[12,3,7,3],"rendezvous_host":"host","rendezvous_port":1234}')
+    monkeypatch.setenv("EK_ASCEND_DECODE_GRAPH_CONFIG", str(path))
+    options = graph.graph_config_from_environment()
+    assert isinstance(options, AscendGraphOptions) and options.capture_sizes == (3, 7, 12)
+    path.write_text('{"workers":[]}')
+    with pytest.raises(ValueError, match="ek-cli schedule"):
+        graph.graph_config_from_environment()
+
+
+def test_startup_resolves_native_facts_and_ready_assignments_once(
+    modelslim_graph_deployment, monkeypatch
+):
+    runtime, existing = modelslim_graph_deployment
+    calls = []
+    runtime.scheduler_config.max_num_seqs = 8
+    runtime.scheduler_config.max_num_scheduled_tokens = 24
+    runtime.compilation_config.cudagraph_capture_sizes = [3, 7, 12]
+    runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    options = AscendGraphOptions(
+        mode="full", capture_sizes=(3, 7, 12), rendezvous_host="host", rendezvous_port=1234
+    )
+
+    def resolve(endpoint, *, requested_instance_id, monotonic_deadline):
+        calls.append(("instance", endpoint, requested_instance_id, monotonic_deadline))
+        return SimpleNamespace(instance_id=7, model_name="controller-model")
+
+    class Topology:
+        def __init__(self, endpoint, **kwargs):
+            calls.append(("topology", endpoint, kwargs))
+
+        def start(self, **kwargs):
+            calls.append(("start", kwargs))
+            return 9, "ready-version", existing.workers
+
+        def require_current(self, config):
+            calls.append(("current", config))
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(graph, "resolve_default_instance_sync", resolve)
+    monkeypatch.setattr(graph, "GraphTopologySubscription", Topology)
+    monkeypatch.setenv("EK_ADDR", "controller:5002")
+    runner = SimpleNamespace(vllm_config=runtime, max_num_reqs=8, max_num_tokens=32)
+    config, topology, deadline = graph._resolve_graph_config(runner, options)
+    assert config.model == existing.model and config.layer_ids == existing.layer_ids
+    assert config.instance_id == 7 and config.model_name == "controller-model"
+    assert config.weight_version == "ready-version" and config.source_topology_version == 9
+    assert config.decode_capture_sizes == (3, 7)
+    assert len(config.session_id) == 32
+    assert calls[0] == ("instance", "controller:5002", 7, deadline)
+    assert calls[2][1] == {
+        "layer_ids": config.layer_ids,
+        "max_capture_size": 12,
+        "monotonic_deadline": deadline,
+    }
+    assert calls[-1] == ("current", config)
+    topology.close()
+
+
+def test_native_hf_geometry_and_sparse_layers_are_not_experimental_constants(
+    modelslim_graph_deployment,
+):
+    runtime, _ = modelslim_graph_deployment
+    runtime.model_config.quantization = None
+    runtime.quant_config = None
+    hf = runtime.model_config.hf_text_config
+    hf.num_hidden_layers, hf.hidden_size, hf.moe_intermediate_size = 7, 1536, 640
+    hf.num_experts, hf.num_experts_per_tok = 11, 3
+    hf.decoder_sparse_step, hf.mlp_only_layers = 2, [3]
+    model, layers = graph.resolve_graph_model(runtime)
+    assert (model.num_layers, model.hidden_dim, model.experts_per_layer, model.top_k) == (
+        7,
+        1536,
+        11,
+        3,
+    )
+    assert layers == (1, 5)
+
+
+def test_installed_native_scheduler_chunks_300_tokens_and_dispatches_smallest_capture(monkeypatch):
+    """Exercise installed CPU policy; this is not pinned Ascend 0.26 qualification."""
+    from vllm import SamplingParams
+    from vllm.config import CacheConfig, SchedulerConfig
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.request import Request
+
+    monkeypatch.setattr(Scheduler, "__init__", Scheduler.__init__)
+    monkeypatch.setattr(SchedulerConfig, "get_scheduler_cls", SchedulerConfig.get_scheduler_cls)
+    options = AscendGraphOptions(
+        mode="full", capture_sizes=(64, 128, 256), rendezvous_host="host", rendezvous_port=1234
+    )
+    graph.install_graph_scheduler(options)
+    cache = CacheConfig(enable_prefix_caching=False)
+    cache.num_gpu_blocks = 128
+    scheduling = SchedulerConfig(
+        max_model_len=4096,
+        is_encoder_decoder=False,
+        max_num_seqs=128,
+        max_num_batched_tokens=2048,
+        max_num_scheduled_tokens=2048,
+        async_scheduling=False,
+    )
+    config = SimpleNamespace(
+        scheduler_config=scheduling,
+        cache_config=cache,
+        lora_config=None,
+        kv_events_config=None,
+        parallel_config=SimpleNamespace(
+            data_parallel_index=0,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        observability_config=SimpleNamespace(kv_cache_metrics=False, enable_mfu_metrics=False),
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False,
+            max_model_len=4096,
+            is_diffusion=False,
+            enable_return_routed_experts=False,
+        ),
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+        speculative_config=None,
+        num_speculative_tokens=0,
+        use_v2_model_runner=False,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_capture_sizes=[64, 128, 256],
+            max_cudagraph_capture_size=256,
+            compile_sizes=[],
+        ),
+    )
+    kv = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["layer"],
+                kv_cache_spec=FullAttentionSpec(
+                    16, num_kv_heads=1, head_size=16, dtype=torch.bfloat16
+                ),
+            )
+        ],
+    )
+    scheduler = Scheduler(
+        config,
+        kv,
+        SimpleNamespace(),
+        16,
+        mm_registry=SimpleNamespace(supports_multimodal_inputs=lambda _: False),
+    )
+    scheduler.add_request(Request("request", [1] * 300, SamplingParams(max_tokens=1), None))
+    first, second = scheduler.schedule(), scheduler.schedule()
+    assert first.num_scheduled_tokens == {"request": 256}
+    assert second.num_scheduled_tokens == {"request": 44}
+    assert scheduling.max_num_batched_tokens == 2048
+    dispatcher = CudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL)
+    mode, batch = dispatcher.dispatch(second.total_num_scheduled_tokens)
+    assert mode == CUDAGraphMode.FULL and batch.num_tokens == 64
+    assert config.compilation_config.cudagraph_capture_sizes == [64, 128, 256]
+
+
+def test_native_dummy_positional_profile_flag_does_not_admit_workers(graph_runtime):
+    events, context, runner, _wrapper = graph_runtime
+    runner.profile_run()
+    context.batch_descriptor = descriptor()
+    events.clear()
+    assert runner._dummy_run(1, True) == "eager"
+    assert events == [("eager", True)]
+    assert not graph.is_graph_profile() and not graph._SYNTHETIC.get()
+
+
+@pytest.mark.parametrize("native_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_capture_scope_allows_native_eager_warmup_but_rejects_invalid_full_capture(
+    graph_runtime, native_mode
+):
+    events, context, runner, _wrapper = graph_runtime
+    runner.profile_run()
+    context.batch_descriptor = descriptor(num_tokens=3, num_reqs=3)
+    context.cudagraph_runtime_mode = native_mode
+    runner.capture_callback = lambda: runner._dummy_run(3)
+    events.clear()
+    if native_mode == CUDAGraphMode.FULL:
+        with pytest.raises(ValueError, match="no eligible native FULL graph"):
+            runner._capture_cudagraphs([context.batch_descriptor], CUDAGraphMode.FULL)
+        assert ("eager", False) not in events
+    else:
+        assert runner._capture_cudagraphs([context.batch_descriptor], CUDAGraphMode.FULL) == "eager"
+        assert events == [("eager", False)]
+    assert not graph._CAPTURE.get() and not graph._SYNTHETIC.get()
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_profile_metadata_failure_poisons_without_releasing_attention(graph_runtime):
+    events, _context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    session = wrapper._expertkit_decode_session
+
+    def fail_metadata():
+        raise RuntimeError("metadata allocation failed")
+
+    session._v4_attention.prepare_profile_metadata = fail_metadata
+    with pytest.raises(RuntimeError, match="metadata allocation failed"):
+        runner.profile_run()
+    assert session._poisoned
+    session.close()
+    assert "adapter-close" not in events and "data-close" not in events
+
+
+def test_failed_hccl_constructor_retains_unpublished_resources(graph_runtime, monkeypatch):
+    import gc
+    import weakref
+
+    _events, _context, runner, _wrapper = graph_runtime
+    retained, references = [], []
+    monkeypatch.setattr(graph, "retain_until_process_exit", retained.append)
+
+    class Resource:
+        pass
+
+    class FailedData:
+        def __init__(self, *args, **kwargs):
+            self.resource = Resource()
+            references.append(weakref.ref(self.resource))
+            raise RuntimeError("partially created HCCL")
+
+    monkeypatch.setattr(graph, "HcclGraphSession", FailedData)
+    config, topology, _deadline = graph._resolve_graph_config(None, None)
+
+    def fail():
+        with pytest.raises(RuntimeError, match="partially created HCCL"):
+            graph.DecodeGraphSession(config, runner.device, topology=topology)
+
+    fail()
+    gc.collect()
+    assert references[0]() is not None
+    assert retained[0]._startup_failure is not None and retained[0]._closed
+    assert not retained[0]._watchdog.is_alive()
+
+
+@pytest.mark.parametrize("graph_runtime", ["decode", "v4-full"], indirect=True)
+def test_profile_consumers_share_one_resolved_runtime_for_entire_lifetime(graph_runtime):
+    events, _context, runner, wrapper = graph_runtime
+    runner.profile_run()
+    session = wrapper._expertkit_decode_session
+    runner.profile_run()
+    assert events.count("resolve-runtime") == 1
+    assert session.config is session._control.config is session._data.config
+    if session._v4_attention is not None:
+        assert session._v4_attention.graph_config is session.config
+
+
+@pytest.mark.parametrize("change", ["decode_descriptor", "padded_total"])
+def test_host_phase_does_not_bypass_native_descriptor_eligibility(graph_runtime, change):
+    events, context, runner, _wrapper = graph_runtime
+    runner.profile_run()
+    context.batch_descriptor = descriptor(uniform=change != "decode_descriptor")
+    scheduled = {"request": 1 if change == "decode_descriptor" else 3}
+    events.clear()
+    with pytest.raises(
+        ValueError, match=r"no eligible native FULL graph|Host scheduled token total"
+    ):
+        runner.execute_model(SimpleNamespace(num_scheduled_tokens=scheduled))
+    assert events == []

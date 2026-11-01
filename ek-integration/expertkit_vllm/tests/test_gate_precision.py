@@ -99,7 +99,7 @@ def test_ordinary_and_graph_gate_logits_share_native_precision(monkeypatch, prec
         gate.weight_fp32 if precast else gate.weight,
     )
     for graph in (False, True):
-        runner.graph_config = object() if graph else None
+        runner.graph_options = object() if graph else None
         runner._forward_impl(hidden, hidden, None)
         assert router.logits[-1].dtype == expected.dtype
         torch.testing.assert_close(router.logits[-1], expected, rtol=0, atol=0)
@@ -110,7 +110,7 @@ def test_ascend_unquantized_gate_requires_post_load_parameter_before_graph(monke
     method = type("AscendUnquantizedLinearMethod", (), {"__module__": "vllm_ascend.ops.linear"})
     gate.quant_method = method()
     runner, router = _runner(monkeypatch, gate)
-    runner.graph_config = object()
+    runner.graph_options = object()
     hidden = torch.ones((1, 4), dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="post-load FP32 weights before capture"):
         runner._forward_impl(hidden, hidden, None)
@@ -127,7 +127,7 @@ def test_v4_internal_gate_promotes_native_bf16_input_before_projection(monkeypat
     hidden = original.to(torch.bfloat16)
     assert not torch.equal(original, hidden.float())
     for graph in (False, True):
-        runner.graph_config = object() if graph else None
+        runner.graph_options = object() if graph else None
         runner._forward_impl(hidden, hidden, None)
         torch.testing.assert_close(
             router.logits[-1], hidden.float() @ gate.weight_fp32.T, rtol=0, atol=0
@@ -136,6 +136,6 @@ def test_v4_internal_gate_promotes_native_bf16_input_before_projection(monkeypat
         with pytest.raises(ValueError, match="native BF16"):
             runner._forward_impl(hidden, invalid, None)
     del gate.weight_fp32
-    runner.graph_config = None
+    runner.graph_options = None
     with pytest.raises(RuntimeError, match="post-load FP32"):
         runner._forward_impl(hidden, hidden, None)

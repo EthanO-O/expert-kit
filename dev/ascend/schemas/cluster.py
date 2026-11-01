@@ -173,6 +173,7 @@ class PoolConfig(ConfigModel):
     devices: list[int]
     start_worker_port: int
     start_peer_port: int
+    start_graph_control_port: int | None = Field(default=None, ge=1, le=65535)
 
     @property
     def worker_count(self) -> int:
@@ -189,6 +190,11 @@ class PoolConfig(ConfigModel):
                     device=device,
                     port=self.start_worker_port + idx,
                     peer_port=self.start_peer_port + idx,
+                    graph_control_port=(
+                        None
+                        if self.start_graph_control_port is None
+                        else self.start_graph_control_port + idx
+                    ),
                 )
             )
         return workers
@@ -210,6 +216,7 @@ class WorkerConfig(ConfigModel):
     device: int
     port: int
     peer_port: int
+    graph_control_port: int | None = None
 
     @computed_field
     @property

@@ -89,10 +89,11 @@ async def _callsite_scenario(graph_first):
     release = {name: threading.Event() for name in ("graph", "ordinary")}
     attempts = {name: threading.Event() for name in ("graph", "ordinary")}
 
-    def prepare():
+    def prepare(assignment, layer_ids):
+        assert layer_ids == (1,)
         entered["graph"].set()
         assert release["graph"].wait(3)
-        return object()
+        return SimpleNamespace(require_current=lambda: None)
 
     class Slot:
         def execute(self, *args, **kwargs):
@@ -101,12 +102,14 @@ async def _callsite_scenario(graph_first):
             return Result()
 
     graph = AscendDecodeGraphExecution.__new__(AscendDecodeGraphExecution)
-    graph.config = SimpleNamespace(capture_sizes=(1,))
+    graph.config = SimpleNamespace(capture_sizes=(1,), layer_ids=(1,))
     graph._admission = admission
     graph._device = torch.device("cpu")
     graph._rank = 1
     graph._stream = None
     graph._prepare_weights = prepare
+    graph._assignment = object()
+    graph._assignment_guard = SimpleNamespace(require_current=lambda: None)
     graph._hidden_dim = 4
     graph._top_k = 2
     graph._poisoned = False
