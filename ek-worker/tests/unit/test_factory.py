@@ -28,8 +28,10 @@ from expertkit_worker.weights import DirectIOWeightDiskCache
 from expertkit_worker.weights.metadata import (
     ModelMetadata,
     QuantizationMetadata,
+    ResolvedWorkerConfig,
     _quantization_from_metadata,
     resolve_model_metadata,
+    resolve_worker_config,
 )
 
 
@@ -221,7 +223,9 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     graph_factory.return_value.close = AsyncMock(side_effect=RuntimeError("graph close failed"))
     control_factory = Mock()
     monkeypatch.setattr(graph_control, "GraphControlServer", control_factory)
-    monkeypatch.setattr(factory, "resolve_model_metadata", AsyncMock(return_value=config))
+    monkeypatch.setattr(
+        factory, "resolve_worker_config", AsyncMock(return_value=ResolvedWorkerConfig(config, None))
+    )
     monkeypatch.setattr(
         factory, "_create_device_wiring", lambda _device: Mock(runtime=runtime, create_slot=Mock())
     )
@@ -244,9 +248,7 @@ def test_factory_selects_graph_resident_from_validated_recipe(
     monkeypatch.setattr(modelslim_graph, "ResidentModelSlimExpertGraphWeights", resident_types[1])
     if backend_name == "ascend_fused":
         monkeypatch.setattr(packed_graph, "ResidentAscendFusedGraphWeights", resident_types[0])
-        monkeypatch.setattr(
-            packed_graph, "create_modelslim_graph_weights", resident_types[1]
-        )
+        monkeypatch.setattr(packed_graph, "create_modelslim_graph_weights", resident_types[1])
     monkeypatch.setattr(graph_execution, "AscendDecodeGraphExecution", graph_factory)
 
     if fail_after_graph:
@@ -661,3 +663,32 @@ def test_failed_receiver_cleanup_still_closes_disk_cache_and_observability(
     with pytest.raises(RuntimeError, match="native close failed"):
         asyncio.run(build_worker_application(config, instance_resolver=_resolve_instance))
     assert closed == ["disk", "observability"]
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_factory_resolves_metadata_once_before_controller_and_device_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prepared: bool
+) -> None:
+    import expertkit_worker.factory as factory
+
+    metadata = ModelMetadata(1, "qwen3_moe", 2, 0, 2, 4, 4, 8, 2, "bfloat16", None)
+    fetch = AsyncMock(return_value=metadata)
+    device_wiring = Mock(side_effect=AssertionError("device initialized before Controller"))
+    monkeypatch.setattr("expertkit_worker.weights.metadata.fetch_model_metadata", fetch)
+    monkeypatch.setattr(factory, "_create_device_wiring", device_wiring)
+
+    class ReachedController(Exception):
+        pass
+
+    async def stop_at_controller(*_args: object, **_kwargs: object) -> None:
+        raise ReachedController
+
+    async def scenario() -> None:
+        config = _config(tmp_path)
+        startup = await resolve_worker_config(config) if prepared else config
+        with pytest.raises(ReachedController):
+            await build_worker_application(startup, instance_resolver=stop_at_controller)
+
+    asyncio.run(scenario())
+    fetch.assert_awaited_once()
+    device_wiring.assert_not_called()

@@ -60,8 +60,9 @@ from expertkit_worker.observability import create_observability
 from expertkit_worker.weights import (
     DirectIOWeightDiskCache,
     ExpertStateChange,
+    ResolvedWorkerConfig,
     WeightManager,
-    resolve_model_metadata,
+    resolve_worker_config,
 )
 from expertkit_worker.weights.factory import (
     WeightServices,
@@ -141,13 +142,15 @@ def _async_wiring[StreamT, EventT](
 
 
 async def build_worker_application(
-    config: WorkerConfig,
+    config: WorkerConfig | ResolvedWorkerConfig,
     *,
     instance_resolver: _InstanceResolver = resolve_default_instance,
 ) -> WorkerApplication:
     """Build the selected MVP Worker without starting network listeners.
 
     Args:
+        config: A complete configuration to resolve, or a previously resolved
+            startup snapshot that avoids a second Weight Server request.
         instance_resolver: Startup-only Controller resolver. Tests may replace
             it to avoid opening a control channel.
 
@@ -156,9 +159,11 @@ async def build_worker_application(
         ValueError: Startup resource planning or a component contract is invalid.
     """
 
-    if not isinstance(config, WorkerConfig):
-        raise TypeError("config must be a WorkerConfig")
-    config = await resolve_model_metadata(config)
+    if isinstance(config, WorkerConfig):
+        config = await resolve_worker_config(config)
+    if not isinstance(config, ResolvedWorkerConfig):
+        raise TypeError("config must be a WorkerConfig or ResolvedWorkerConfig")
+    config = config.config
     resolved_instance = await instance_resolver(
         config.controller.endpoint,
         requested_instance_id=config.model.instance_id,

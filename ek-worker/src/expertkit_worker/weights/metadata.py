@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
 
 import aiohttp
 import structlog
+from pydantic import TypeAdapter
 
-from expertkit_worker.config import QuantizationConfig, QuantizationType, WorkerConfig
+from expertkit_worker.config.models import (
+    ModelConfig,
+    QuantizationConfig,
+    QuantizationType,
+    WeightManagerConfig,
+    WorkerConfig,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -42,7 +50,11 @@ class QuantizationMetadata:
 
 @dataclass(frozen=True)
 class ModelMetadata:
-    """Normalized model dimensions and optional quantization recipe."""
+    """Normalized model dimensions and optional quantization recipe.
+
+    A missing clipping limit remains distinguishable from explicit zero so graph
+    startup can require the checkpoint fact without changing ordinary defaults.
+    """
 
     schema_version: int
     model_type: str
@@ -56,7 +68,19 @@ class ModelMetadata:
     activation_dtype: str | None
     quantization: QuantizationMetadata | None
     expert_compute: str = "swiglu"
-    swiglu_limit: float = 0.0
+    swiglu_limit: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedWorkerConfig:
+    """Carry a complete configuration and its startup metadata snapshot.
+
+    Passing this value to the Worker factory reuses the resolution result instead
+    of fetching a second, potentially different metadata snapshot.
+    """
+
+    config: WorkerConfig
+    metadata: ModelMetadata | None
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -114,16 +138,14 @@ def _parse_payload(payload: Any) -> ModelMetadata:
     if not isinstance(expert_compute, str) or expert_compute not in {"swiglu", "deepseek_v4"}:
         raise ModelMetadataError("unsupported expert_compute metadata")
     limit = payload.get("swiglu_limit")
-    if limit is None:
-        limit = 0.0
-    if (
+    if limit is not None and (
         isinstance(limit, bool)
         or not isinstance(limit, int | float)
         or not math.isfinite(limit)
         or limit < 0
     ):
         raise ModelMetadataError("swiglu_limit must be finite and nonnegative")
-    return ModelMetadata(
+    metadata = ModelMetadata(
         schema_version=schema_version,
         model_type=model_type,
         num_layers=_positive_int(payload.get("num_layers"), "num_layers"),
@@ -138,8 +160,13 @@ def _parse_payload(payload: Any) -> ModelMetadata:
         activation_dtype=activation_dtype,
         quantization=quantization,
         expert_compute=expert_compute,
-        swiglu_limit=float(limit),
+        swiglu_limit=float(limit) if limit is not None else None,
     )
+    if not 0 <= metadata.moe_layer_start < metadata.moe_layer_end <= metadata.num_layers:
+        raise ModelMetadataError("model metadata MoE layer range must lie within num_layers")
+    if metadata.top_k is not None and metadata.top_k > metadata.experts_per_layer:
+        raise ModelMetadataError("model metadata top_k cannot exceed experts_per_layer")
+    return metadata
 
 
 async def fetch_model_metadata(
@@ -236,68 +263,132 @@ def _quantization_from_metadata(metadata: ModelMetadata) -> QuantizationConfig |
     )
 
 
-def _validate_model_metadata(config: WorkerConfig, metadata: ModelMetadata) -> None:
-    """Reject metadata whose dimensions disagree with Worker routing."""
+def _model_value(field: str, value: Any) -> Any:
+    """Validate one explicit model fact with the complete schema's field rules."""
 
-    expected = config.model
-    fields = (
-        ("num_layers", expected.num_layers, metadata.num_layers),
-        ("experts_per_layer", expected.experts_per_layer, metadata.experts_per_layer),
-        ("hidden_dim", expected.hidden_dim, metadata.hidden_dim),
-        (
-            "expert_intermediate_dim",
-            expected.expert_intermediate_dim,
-            metadata.expert_intermediate_dim,
-        ),
-    )
-    for name, configured, advertised in fields:
-        if configured != advertised:
-            raise ValueError(
-                f"Weight Server model metadata mismatch for {name}: "
-                f"Worker has {configured}, server has {advertised}"
-            )
-    if metadata.top_k is not None and expected.top_k != metadata.top_k:
-        raise ValueError(
-            f"Weight Server model metadata mismatch for top_k: "
-            f"Worker has {expected.top_k}, server has {metadata.top_k}"
+    definition = ModelConfig.model_fields[field]
+    return TypeAdapter(
+        Annotated[definition.annotation, definition], config=ModelConfig.model_config
+    ).validate_python(value)
+
+
+def _resolve_model_fields(
+    model: Mapping[str, Any], metadata: ModelMetadata, *, graph_enabled: bool
+) -> dict[str, Any]:
+    """Fill omitted model facts and reject assertions conflicting with the server."""
+
+    discovered = {
+        "num_layers": metadata.num_layers,
+        "experts_per_layer": metadata.experts_per_layer,
+        "hidden_dim": metadata.hidden_dim,
+        "expert_intermediate_dim": metadata.expert_intermediate_dim,
+        "expert_compute": metadata.expert_compute,
+        "swiglu_limit": metadata.swiglu_limit if metadata.swiglu_limit is not None else 0.0,
+        "quantization": _quantization_from_metadata(metadata),
+    }
+    if metadata.top_k is not None:
+        discovered["top_k"] = metadata.top_k
+    elif graph_enabled or "top_k" not in model:
+        raise ModelMetadataError("Weight Server model metadata is missing required top_k")
+    if metadata.model_type == "deepseek_v4" and metadata.expert_compute != "deepseek_v4":
+        raise ModelMetadataError(
+            "V4 requires expert computation metadata from an updated Weight Server"
         )
+    resolved = dict(model)
+    for field, advertised in discovered.items():
+        if field in model and _model_value(field, model[field]) != advertised:
+            raise ValueError(f"Worker model.{field} conflicts with Weight Server metadata")
+        resolved[field] = advertised
+    return resolved
+
+
+def _config_document(config: WorkerConfig | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(config, WorkerConfig):
+        document = config.model_dump()
+        # Defaulted semantics are discoverable; only explicit fields are assertions.
+        document["model"] = config.model.model_dump(exclude_unset=True)
+        graph = config.worker.ascend_decode_graph
+        if graph is not None and "model" not in graph.model_fields_set:
+            document["worker"]["ascend_decode_graph"].pop("model", None)
+        return document
+    if not isinstance(config, Mapping):
+        raise TypeError("config must be a WorkerConfig or configuration mapping")
+    return dict(config)
+
+
+def _resolve_graph_model(document: dict[str, Any], model: ModelConfig) -> None:
+    """Use the resolved Worker model for graph validation without profile defaults."""
+
+    worker = dict(document["worker"])
+    graph = worker.get("ascend_decode_graph")
+    if graph is None:
+        return
+    if not isinstance(graph, Mapping):
+        raise ValueError("worker.ascend_decode_graph must be a mapping")
+    graph = dict(graph)
+    supplied = graph.get("model", {})
+    if not isinstance(supplied, Mapping):
+        raise ValueError("worker.ascend_decode_graph.model must be a mapping")
+    # The existing graph model is a subset of ModelConfig, not an independent fact source.
+    from expertkit_transport.transports.ascend_graph.config import AscendGraphModel
+
+    canonical = model.model_dump(mode="json", include=set(AscendGraphModel.model_fields))
+    asserted = AscendGraphModel.model_validate(canonical | dict(supplied)).model_dump(mode="json")
+    for field in supplied:
+        if asserted[field] != canonical[field]:
+            raise ValueError(f"Worker graph model.{field} conflicts with resolved Worker model")
+    graph["model"] = canonical
+    worker["ascend_decode_graph"] = graph
+    document["worker"] = worker
+
+
+async def resolve_worker_config(
+    config: WorkerConfig | Mapping[str, Any],
+) -> ResolvedWorkerConfig:
+    """Fetch model facts once, then validate a complete Worker configuration.
+
+    Unavailable metadata permits legacy fallback only for independently complete
+    ordinary configurations. Graph startup always requires metadata. Invalid
+    responses and explicit conflicts never permit fallback.
+
+    Raises:
+        ModelMetadataError: Metadata is invalid or required facts are unavailable.
+        ValueError: Explicit facts conflict or the completed configuration is invalid.
+    """
+
+    document = _config_document(config)
+    for section in ("model", "worker", "weight_manager"):
+        if not isinstance(document.get(section), Mapping):
+            raise ValueError(f"Worker {section} must be a mapping")
+    model = dict(document["model"])
+    name = _model_value("name", model.get("name"))
+    weights = WeightManagerConfig.model_validate(document["weight_manager"])
+    graph_enabled = document["worker"].get("ascend_decode_graph") is not None
+    if not weights.auto_model_metadata:
+        if graph_enabled:
+            raise ModelMetadataError(
+                "Ascend graphs require auto_model_metadata and server metadata"
+            )
+        return ResolvedWorkerConfig(WorkerConfig.model_validate(document), None)
+    try:
+        metadata = await fetch_model_metadata(str(weights.weight_server_endpoint), name)
+    except ModelMetadataUnavailable as error:
+        if weights.metadata_required or graph_enabled:
+            raise ModelMetadataError(
+                "required Weight Server model metadata is unavailable"
+            ) from error
+        complete = WorkerConfig.model_validate(document)
+        logger.warning("model_metadata_unavailable", error=str(error))
+        return ResolvedWorkerConfig(complete, None)
+    if graph_enabled and metadata.model_type == "deepseek_v4" and metadata.swiglu_limit is None:
+        raise ModelMetadataError("V4 graph metadata is missing required swiglu_limit")
+    resolved_model = _resolve_model_fields(model, metadata, graph_enabled=graph_enabled)
+    document["model"] = resolved_model
+    _resolve_graph_model(document, ModelConfig.model_validate(resolved_model))
+    return ResolvedWorkerConfig(WorkerConfig.model_validate(document), metadata)
 
 
 async def resolve_model_metadata(config: WorkerConfig) -> WorkerConfig:
-    """Resolve model recipes from Weight Server metadata with legacy fallback."""
+    """Resolve metadata for an existing complete configuration with legacy fallback."""
 
-    if not config.weight_manager.auto_model_metadata:
-        return config
-    try:
-        metadata = await fetch_model_metadata(
-            str(config.weight_manager.weight_server_endpoint),
-            config.model.name,
-        )
-        _validate_model_metadata(config, metadata)
-        discovered = _quantization_from_metadata(metadata)
-        configured = config.model.quantization
-        if configured is not None and discovered != configured:
-            raise ValueError("Worker model.quantization conflicts with Weight Server metadata")
-        for field in ("expert_compute", "swiglu_limit"):
-            if field in config.model.model_fields_set and getattr(config.model, field) != getattr(
-                metadata, field
-            ):
-                raise ValueError(f"Worker model.{field} conflicts with Weight Server metadata")
-        model_data = config.model.model_dump()
-        model_data.update(
-            quantization=discovered,
-            expert_compute=metadata.expert_compute,
-            swiglu_limit=metadata.swiglu_limit,
-        )
-        if metadata.model_type == "deepseek_v4" and metadata.expert_compute != "deepseek_v4":
-            raise ValueError(
-                "V4 requires expert computation metadata from an updated Weight Server"
-            )
-        data = config.model_dump()
-        data["model"] = model_data
-        return WorkerConfig.model_validate(data)
-    except ModelMetadataUnavailable as error:
-        if config.weight_manager.metadata_required:
-            raise RuntimeError("required Weight Server model metadata is unavailable") from error
-        logger.warning("model_metadata_unavailable", error=str(error))
-        return config
+    return (await resolve_worker_config(config)).config

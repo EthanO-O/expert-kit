@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from expertkit_worker.config import BackendName, ConfigFileError, load_config
+from expertkit_worker.config import (
+    BackendName,
+    ConfigFileError,
+    load_config,
+    read_config_document,
+)
 
 
 def _valid_config(cache_path: Path) -> str:
@@ -144,3 +149,17 @@ def test_rejects_invalid_yaml_documents(tmp_path: Path, contents: str) -> None:
 def test_reports_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigFileError, match="cannot read Worker configuration"):
         load_config(tmp_path / "missing.yaml")
+
+
+def test_raw_document_accepts_omitted_structure_without_weakening_strict_loader(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "worker.yaml"
+    contents = _valid_config(tmp_path / "weights").replace("  hidden_dim: 64\n", "")
+    config_path.write_text(contents, encoding="utf-8")
+
+    document = read_config_document(config_path)
+
+    assert "hidden_dim" not in document["model"]
+    with pytest.raises(ValidationError, match="hidden_dim"):
+        load_config(config_path)

@@ -13,18 +13,17 @@ class ConfigFileError(ValueError):
     """Indicate that a Worker configuration file cannot be read as a YAML mapping."""
 
 
-def load_config(path: str | Path) -> WorkerConfig:
-    """Load and validate one Worker configuration file.
+def read_config_document(path: str | Path) -> dict[str, Any]:
+    """Read one Worker YAML mapping without validating runtime model facts.
 
     Args:
         path: UTF-8 YAML file selected by the Worker ``--config`` argument.
 
     Returns:
-        An immutable configuration model with all cross-section defaults resolved.
+        The document to resolve with Weight Server metadata before full validation.
 
     Raises:
         ConfigFileError: The file cannot be read, parsed, or does not contain a mapping.
-        pydantic.ValidationError: The parsed mapping violates the Worker schema.
     """
 
     config_path = Path(path)
@@ -38,4 +37,18 @@ def load_config(path: str | Path) -> WorkerConfig:
     if not isinstance(document, Mapping):
         raise ConfigFileError("Worker configuration must contain one YAML mapping")
 
-    return WorkerConfig.model_validate(document)
+    return dict(document)
+
+
+def load_config(path: str | Path) -> WorkerConfig:
+    """Load and fully validate an explicit Worker configuration without network IO.
+
+    Configurations omitting model facts must use ``read_config_document`` and the
+    asynchronous metadata resolver instead.
+
+    Raises:
+        ConfigFileError: The file cannot be read as one YAML mapping.
+        pydantic.ValidationError: The document violates the complete Worker schema.
+    """
+
+    return WorkerConfig.model_validate(read_config_document(path))

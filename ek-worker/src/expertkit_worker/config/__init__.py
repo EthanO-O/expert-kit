@@ -1,6 +1,6 @@
 """Validated Worker configuration."""
 
-from expertkit_worker.config.loader import ConfigFileError, load_config
+from expertkit_worker.config.loader import ConfigFileError, load_config, read_config_document
 from expertkit_worker.config.models import (
     ActivationDType,
     BackendName,
@@ -34,5 +34,6 @@ __all__ = [
     "WorkerConfig",
     "load_config",
     "plan_device_resources",
+    "read_config_document",
     "validate_available_device_memory",
 ]

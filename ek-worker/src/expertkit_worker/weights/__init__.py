@@ -39,8 +39,10 @@ from expertkit_worker.weights.metadata import (
     ModelMetadataError,
     ModelMetadataUnavailable,
     QuantizationMetadata,
+    ResolvedWorkerConfig,
     fetch_model_metadata,
     resolve_model_metadata,
+    resolve_worker_config,
 )
 from expertkit_worker.weights.peer_server import PeerWeightServer
 from expertkit_worker.weights.ready import (
@@ -67,6 +69,7 @@ __all__ = [
     "QuantizationMetadata",
     "ReadyWeightLease",
     "ReadyWeightTable",
+    "ResolvedWorkerConfig",
     "SafeTensorDType",
     "SafeTensorData",
     "SafeTensorFormatError",
@@ -89,4 +92,5 @@ __all__ = [
     "max_safetensors_file_bytes",
     "parse_safetensors",
     "resolve_model_metadata",
+    "resolve_worker_config",
 ]
