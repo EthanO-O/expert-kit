@@ -88,9 +88,7 @@ def cpu_ordered_combine(
 
 @pytest.mark.parametrize("direct_combine", [False, True])
 @pytest.mark.parametrize("expert_range", [(0, 2), (2, 3), (0, 16), (48, 64), (112, 128)])
-def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
-    expert_range, direct_combine
-):
+def test_original_i8_storage_and_fp32_scales_follow_shared_routing(expert_range, direct_combine):
     generator = torch.Generator().manual_seed(61)
     experts_per_layer = 128 if expert_range[1] - expert_range[0] == 16 else 3
     table = ReadyWeightTable(1, experts_per_layer)
@@ -101,10 +99,7 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
                 torch.randint(-8, 8, shape, generator=generator, dtype=torch.int8)
                 for shape in ((4, 6), (4, 6), (6, 4))
             ),
-            tuple(
-                (torch.rand(width, generator=generator) / 8 + 0.001).bfloat16().float()
-                for width in (6, 6, 4)
-            ),
+            tuple(torch.rand(width, generator=generator) / 8 + 0.001 for width in (6, 6, 4)),
             torch.bfloat16,
         )
         table.publish(0, expert, weight)
@@ -174,13 +169,11 @@ def test_original_i8_storage_and_lossless_scales_follow_shared_routing(
                     resident._fp32_scales[lease][call % 3][index], weight.scales[call % 3]
                 )
         assert table.usage_count(0, expert_range[0]) == 1
-        assert resident._scales
         assert resident._matrices
         assert resident._fp32_scales
     finally:
         resident.close(wait_for_completion=lambda: None)
     assert table.usage_count(0, expert_range[0]) == 0
-    assert not resident._scales
     assert not resident._matrices
     assert not resident._fp32_scales
     assert resident._ordered_combine is None
@@ -234,9 +227,32 @@ def single_expert_resident(table):
     )
 
 
-def test_nonrepresentable_fp32_scale_rejects_preparation_and_releases_lease():
-    table = single_expert_table(1.001)
-    with pytest.raises(ValueError, match="preserve every FP32 bit"):
+@pytest.mark.parametrize("scale", [1.001, 0.1234567])
+def test_nonrepresentable_fp32_scale_preserves_original_projection_and_releases_lease(scale):
+    table = single_expert_table(scale)
+    resident = single_expert_resident(table)
+    lease = next(iter(resident._layers.values()))
+    weight = lease.objects[0]
+    inputs = torch.arange(1, 65).reshape(16, 4).bfloat16()
+    try:
+        actual = resident._project(inputs, lease, 0, torch.tensor([16]))
+        expected = projection(inputs, weight.matrices[0], weight.scales[0])
+        rounded = projection(inputs, weight.matrices[0], weight.scales[0].bfloat16().float())
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert not torch.equal(actual, rounded)
+        assert torch.equal(resident._fp32_scales[lease][0][0], weight.scales[0])
+        assert table.usage_count(0, 0) == 1
+    finally:
+        resident.close(wait_for_completion=lambda: None)
+    assert not resident._fp32_scales and not resident._matrices
+    assert table.usage_count(0, 0) == 0
+    assert not table.quarantined
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf"), -float("inf")])
+def test_invalid_scale_rejects_preparation_and_releases_lease(scale):
+    table = single_expert_table(scale)
+    with pytest.raises(ValueError, match="finite positive"):
         single_expert_resident(table)
     assert table.usage_count(0, 0) == 0
     assert not table.quarantined
@@ -250,22 +266,21 @@ def test_device_failure_retains_prepared_scales_with_original_lease(monkeypatch,
     )
     table = single_expert_table()
     if failure_phase == "prepare":
-        original_to = torch.Tensor.to
-        conversions = 0
+        original_stack = torch.stack
+        allocations = 0
 
-        def fail_second_conversion(tensor, *args, **kwargs):
-            nonlocal conversions
-            if args == (torch.bfloat16,) and tensor.dtype is torch.float32:
-                conversions += 1
-                if conversions == 2:
-                    raise RuntimeError("device conversion failed")
-            return original_to(tensor, *args, **kwargs)
+        def fail_second_table(*args, **kwargs):
+            nonlocal allocations
+            allocations += 1
+            if allocations == 2:
+                raise RuntimeError("device scale allocation failed")
+            return original_stack(*args, **kwargs)
 
-        monkeypatch.setattr(torch.Tensor, "to", fail_second_conversion)
-        with pytest.raises(RuntimeError, match="device conversion failed"):
+        monkeypatch.setattr(torch, "stack", fail_second_table)
+        with pytest.raises(RuntimeError, match="device scale allocation failed"):
             single_expert_resident(table)
         resident = retained[0]
-        assert sum(len(scales) for layer in resident._scales.values() for scales in layer) == 1
+        assert sum(len(scales) for scales in resident._fp32_scales.values()) == 1
     else:
         resident = single_expert_resident(table)
 
@@ -276,9 +291,7 @@ def test_device_failure_retains_prepared_scales_with_original_lease(monkeypatch,
             resident.close(wait_for_completion=failed_completion)
         assert retained == [resident]
         assert len(next(iter(resident._fp32_scales.values()))) == 3
-    prepared = [
-        scale for layer in resident._scales.values() for scales in layer for scale in scales
-    ]
+    prepared = [scale for scales in resident._fp32_scales.values() for scale in scales]
     matrices = [
         matrix
         for layer in resident._matrices.values()
@@ -290,9 +303,7 @@ def test_device_failure_retains_prepared_scales_with_original_lease(monkeypatch,
     assert table.quarantined
     assert table.usage_count(0, 0) == 1
     resident.close(wait_for_completion=lambda: None)
-    assert prepared == [
-        scale for layer in resident._scales.values() for scales in layer for scale in scales
-    ]
+    assert prepared == [scale for scales in resident._fp32_scales.values() for scale in scales]
     assert matrices == [
         matrix
         for layer in resident._matrices.values()
@@ -303,7 +314,7 @@ def test_device_failure_retains_prepared_scales_with_original_lease(monkeypatch,
 
 
 def v4_case(experts=3, expert_range=(0, 2), scale=1.0):
-    """Keep original FP32 scales that preserve all bits through BF16."""
+    """Keep original FP32 scales for V4 projection and lifecycle checks."""
     table = ReadyWeightTable(1, experts)
     generator = torch.Generator().manual_seed(81)
     weights = {}
@@ -313,10 +324,7 @@ def v4_case(experts=3, expert_range=(0, 2), scale=1.0):
                 torch.randint(-2, 3, shape, generator=generator, dtype=torch.int8)
                 for shape in ((4, 6), (4, 6), (6, 4))
             ),
-            tuple(
-                torch.full((width,), scale + expert / 1000).bfloat16().float()
-                for width in (6, 6, 4)
-            ),
+            tuple(torch.full((width,), scale + expert / 1000) for width in (6, 6, 4)),
             torch.bfloat16,
         )
         table.publish(0, expert, weight)
@@ -343,7 +351,7 @@ def v4_resident(table, operators, experts=3, expert_range=(0, 2)):
 
 
 @pytest.mark.parametrize("experts,expert_range", [(3, (0, 2)), (256, (224, 256))])
-def test_v4_lossless_scales_route_before_down_and_mask_nonlocal_tail(experts, expert_range):
+def test_v4_fp32_scales_route_before_down_and_mask_nonlocal_tail(experts, expert_range):
     table, operators, weights = v4_case(experts, expert_range)
     resident = v4_resident(table, operators, experts, expert_range)
     start, end = expert_range
@@ -398,51 +406,46 @@ def test_v4_lossless_scales_route_before_down_and_mask_nonlocal_tail(experts, ex
                     for matrix, weight in zip(matrices, weights.values(), strict=True)
                 )
         lease = next(iter(resident._layers.values()))
-        for index, scales in enumerate(resident._scales[lease]):
-            for converted, weight in zip(scales, weights.values(), strict=True):
-                assert converted.dtype is torch.bfloat16
-                assert torch.equal(
-                    converted.float().view(torch.int32), weight.scales[index].view(torch.int32)
-                )
+        for index, scales in enumerate(resident._fp32_scales[lease]):
+            for prepared, weight in zip(scales, weights.values(), strict=True):
+                assert prepared.dtype is torch.float32
+                assert torch.equal(prepared, weight.scales[index])
         assert table.usage_count(0, start) == 1
     finally:
         resident.close(wait_for_completion=lambda: None)
-    assert not resident._scales and not resident._matrices and not resident._fp32_scales
+    assert not resident._matrices and not resident._fp32_scales
     assert table.usage_count(0, start) == 0
 
 
-@pytest.mark.parametrize("failure_phase", ["invalid", "nonrepresentable", "prepare", "completion"])
-def test_v4_lossless_scale_failure_follows_shared_lease_lifetime(monkeypatch, failure_phase):
+@pytest.mark.parametrize("failure_phase", ["invalid", "prepare", "completion"])
+def test_v4_scale_failure_follows_shared_lease_lifetime(monkeypatch, failure_phase):
     retained = []
     monkeypatch.setattr(
         "expertkit_worker.backends.torch.decode_graph.retain_until_process_exit", retained.append
     )
-    table, operators, weights = v4_case(scale=-1 if failure_phase == "invalid" else 1.0)
-    if failure_phase == "nonrepresentable":
-        weights[0].scales[0][0] = 1.001
-    if failure_phase in ("invalid", "nonrepresentable"):
-        with pytest.raises(ValueError, match=r"finite positive|preserve every FP32 bit"):
+    table, operators, _weights = v4_case(scale=-1 if failure_phase == "invalid" else 1.001)
+    if failure_phase == "invalid":
+        with pytest.raises(ValueError, match="finite positive"):
             v4_resident(table, operators)
         assert table.usage_count(0, 0) == 0 and not table.quarantined
         assert not operators.calls
         return
     if failure_phase == "prepare":
-        original = torch.Tensor.to
+        original = torch.stack
         calls = 0
 
-        def fail_second_conversion(tensor, *args, **kwargs):
+        def fail_second_table(*args, **kwargs):
             nonlocal calls
-            if args == (torch.bfloat16,) and tensor.dtype is torch.float32:
-                calls += 1
-                if calls == 2:
-                    raise RuntimeError("device scale conversion failed")
-            return original(tensor, *args, **kwargs)
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("device scale allocation failed")
+            return original(*args, **kwargs)
 
-        monkeypatch.setattr(torch.Tensor, "to", fail_second_conversion)
-        with pytest.raises(RuntimeError, match="scale conversion failed"):
+        monkeypatch.setattr(torch, "stack", fail_second_table)
+        with pytest.raises(RuntimeError, match="scale allocation failed"):
             v4_resident(table, operators)
         resident = retained[0]
-        assert sum(len(scales) for layer in resident._scales.values() for scales in layer) == 1
+        assert sum(len(scales) for scales in resident._fp32_scales.values()) == 1
     else:
         resident = v4_resident(table, operators)
 
@@ -451,9 +454,7 @@ def test_v4_lossless_scale_failure_follows_shared_lease_lifetime(monkeypatch, fa
 
         with pytest.raises(RuntimeError, match="completion failed"):
             resident.close(wait_for_completion=failed_completion)
-    prepared = [
-        value for layer in resident._scales.values() for scales in layer for value in scales
-    ]
+    prepared = [value for scales in resident._fp32_scales.values() for value in scales]
     assert retained == [resident] and table.quarantined
     assert table.usage_count(0, 0) == 1 and prepared
     resident.close(wait_for_completion=lambda: None)
@@ -461,7 +462,7 @@ def test_v4_lossless_scale_failure_follows_shared_lease_lifetime(monkeypatch, fa
         left is right
         for left, right in zip(
             prepared,
-            [value for layer in resident._scales.values() for scales in layer for value in scales],
+            [value for scales in resident._fp32_scales.values() for value in scales],
             strict=True,
         )
     )

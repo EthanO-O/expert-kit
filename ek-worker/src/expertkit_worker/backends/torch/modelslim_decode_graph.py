@@ -2,9 +2,9 @@
 
 Routing and ready-weight lifetime use the shared resident computation. Local
 sums preserve the ordinary BF16 output boundary before FP32 transport. Original
-FP32 channel scales must preserve every bit through BF16 before prepared BF16
-scales can be admitted. Projections use INT32 grouped dots and multiply channel
-and token scales in FP32 before applying them to the dot and rounding to BF16.
+FP32 channel scales are retained without conversion. Projections use INT32
+grouped dots and multiply channel and token scales in FP32 before applying
+them to the dot and rounding to BF16.
 Device graph execution and numerical equivalence still require qualification.
 """
 
@@ -56,14 +56,9 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
             ReadyWeightLease[TorchModelSlimW8A8Weights],
             tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]],
         ] = {}
-        self._scales: dict[
-            ReadyWeightLease[TorchModelSlimW8A8Weights],
-            tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]],
-        ] = {}
         self._fp32_scales: dict[
             ReadyWeightLease[TorchModelSlimW8A8Weights], list[torch.Tensor]
         ] = {}
-        self._scale_temporaries: list[torch.Tensor] = []
         self._combine_temporaries: list[torch.Tensor] = []
         self._ordered_combine: Callable[..., None] | None = None
         super().__init__(
@@ -80,17 +75,14 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
             swiglu_limit=swiglu_limit,
         )
         try:
-            exact = self._prepare_projections()
+            valid = self._prepare_projections()
         except BaseException:
             self.quarantine()
             raise
-        if not exact:
+        if not valid:
             # The Host guard completed all preparation work before rejecting it.
             self.close(wait_for_completion=lambda: None)
-            raise ValueError(
-                "ModelSlim graph scales must be finite positive and "
-                "preserve every FP32 bit through BF16"
-            )
+            raise ValueError("ModelSlim graph scales must be finite positive")
         try:
             self.require_current()
         except BaseException:
@@ -287,8 +279,6 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         super().close(wait_for_completion=wait_for_completion)
         if self._closed and not self._quarantined:
             self._matrices.clear()
-            self._scales.clear()
-            self._scale_temporaries.clear()
             self._fp32_scales.clear()
             self._combine_temporaries.clear()
             self._ordered_combine = None
@@ -297,7 +287,6 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
         """Retain GMM views and synchronously guard scales before capture begins."""
         for lease in self._layers.values():
             self._matrices[lease] = ([], [], [])
-            self._scales[lease] = ([], [], [])
             singleton = len(lease.objects) == 1
             for projection in range(3):
                 for weight in lease.objects:
@@ -306,18 +295,7 @@ class ResidentModelSlimExpertGraphWeights(ResidentExpertGraphWeights):
                         matrix.unsqueeze(0) if singleton else matrix
                     )
                     source = weight.scales[projection]
-                    converted = source.to(torch.bfloat16)
-                    # Publish each allocation before another device operation can fail.
-                    self._scales[lease][projection].append(converted)
-                    if singleton:
-                        # Split-M with one weight requires [1,K,N] and [1,N] views.
-                        self._scales[lease][projection][-1] = converted.unsqueeze(0)
-                    round_trip = converted.float()
-                    self._scale_temporaries.append(round_trip)
-                    same_bits = torch.equal(source.view(torch.int32), round_trip.view(torch.int32))
-                    valid = bool(torch.all(torch.isfinite(source) & (source > 0)))
-                    self._scale_temporaries.clear()
-                    if not same_bits or not valid:
+                    if not bool(torch.all(torch.isfinite(source) & (source > 0))):
                         return False
         for lease in self._layers.values():
             self._fp32_scales[lease] = []
