@@ -86,16 +86,57 @@ def attention_capacity(token_bucket: int, *, mixed: bool, max_requests: int) -> 
     )
 
 
-def capture_carrier_pages(block_size: int, compress_ratio: int, tokens: int) -> int:
-    """Bound native compressed positions for the start-127 capture carrier.
+@dataclass(frozen=True)
+class V4CaptureLayout:
+    """Bound positive-query capture owners; remaining token rows use sentinels."""
+
+    query_lengths: tuple[int, ...]
+    starts: tuple[int, ...]
+
+    def page_counts(self, block_size: int, compress_ratio: int) -> tuple[int, ...]:
+        """Return isolated page-span sizes in native request order."""
+        return tuple(
+            capture_carrier_pages(block_size, compress_ratio, length, start=start)
+            for start, length in zip(self.starts, self.query_lengths, strict=True)
+        )
+
+
+def capture_layout(
+    capacity: V4AttentionCapacity, model_len: int, compress_ratios: Sequence[int]
+) -> V4CaptureLayout:
+    """Fill legal Prefill owners and leave an unfillable tail as zero padding.
+
+    Starts cross the largest feasible native compression boundary. A context
+    shorter than a compression ratio cannot produce a row for that ratio, but
+    native padded compressor metadata still retains its fixed output capacity.
+    """
+    if type(model_len) is not int or model_len < 2:
+        raise ValueError("V4 mixed capture requires a context of at least two tokens")
+    boundary = max((ratio for ratio in compress_ratios if ratio <= model_len), default=1)
+    remaining = capacity.outer_tokens
+    lengths = []
+    while remaining >= 2 and len(lengths) < capacity.max_requests:
+        length = min(remaining, model_len)
+        lengths.append(length)
+        remaining -= length
+    capacity.validate_population(lengths, 0)
+    return V4CaptureLayout(
+        tuple(lengths), tuple(min(boundary - 1, model_len - length) for length in lengths)
+    )
+
+
+def capture_carrier_pages(block_size: int, compress_ratio: int, tokens: int, *, start: int) -> int:
+    """Bound one capture owner's native compressed positions.
 
     The native compressor emits floor((start + qlen) / ratio) minus
     floor(start / ratio) rows, starting at floor(start / ratio).
     """
-    if any(type(n) is not int or n <= 0 for n in (block_size, compress_ratio, tokens)):
+    if any(type(n) is not int or n <= 0 for n in (block_size, compress_ratio, tokens)) or (
+        type(start) is not int or start < 0
+    ):
         raise ValueError("V4 capture geometry must contain positive integers")
-    end = (127 + tokens) // compress_ratio
-    return (end + block_size - 1) // block_size
+    end = (start + tokens) // compress_ratio
+    return max(1, (end + block_size - 1) // block_size)
 
 
 def capture_group_ratio(group_spec: Any) -> int:
@@ -224,13 +265,16 @@ class V4KVScratchLayout:
 
 
 def kv_scratch_layout(
-    groups: Sequence[Any], *, max_virtual_owners: int, mixed_capture_sizes: Sequence[int]
+    groups: Sequence[Any],
+    *,
+    max_virtual_owners: int,
+    mixed_capture_layouts: Sequence[V4CaptureLayout],
 ) -> V4KVScratchLayout:
     """Derive isolated scratch domains from native block and compression specs."""
     if type(max_virtual_owners) is not int or max_virtual_owners < 0 or not groups:
         raise ValueError("V4 scratch requires native groups and a nonnegative owner count")
-    sizes = tuple(mixed_capture_sizes)
-    if any(type(n) is not int or n < 2 for n in sizes) or bool(sizes) != bool(max_virtual_owners):
+    layouts = tuple(mixed_capture_layouts)
+    if bool(layouts) != bool(max_virtual_owners):
         raise ValueError("V4 mixed scratch owners and capture sizes are inconsistent")
     blocks, ratios, carriers = [], [], []
     for group in groups:
@@ -242,7 +286,9 @@ def kv_scratch_layout(
         ratio = capture_group_ratio(group.kv_cache_spec)
         blocks.append(block)
         ratios.append(ratio)
-        carriers.append(max((capture_carrier_pages(block, ratio, n) for n in sizes), default=0))
+        carriers.append(
+            max((sum(layout.page_counts(block, ratio)) for layout in layouts), default=0)
+        )
     return V4KVScratchLayout(max_virtual_owners, tuple(blocks), tuple(ratios), tuple(carriers))
 
 
@@ -668,14 +714,26 @@ class V4FullAttention:
         probe_config.cache_config.num_gpu_blocks_override = 1
         plan = get_kv_cache_config_from_groups(probe_config, groups, 0)
         _allocation_strides(plan)
+        ratios = tuple(capture_group_ratio(group.kv_cache_spec) for group in groups)
+        for bucket in self._buckets.values():
+            bucket["capture"] = capture_layout(bucket["capacity"], self._model_len, ratios)
+        captures = tuple(bucket["capture"] for bucket in self._buckets.values())
         owners = max((bucket["capacity"].requests for bucket in self._buckets.values()), default=0)
         self._layout = kv_scratch_layout(
-            groups, max_virtual_owners=owners, mixed_capture_sizes=tuple(self._buckets)
+            groups, max_virtual_owners=owners, mixed_capture_layouts=captures
+        )
+        max_capture_end = max(
+            (
+                start + length
+                for layout in captures
+                for start, length in zip(layout.starts, layout.query_lengths, strict=True)
+            ),
+            default=0,
         )
         for pair in _ROPE_STATE.full_rope_cache.values():
             for tensor in pair:
-                if self._buckets and tensor.shape[0] < 127 + max(self._buckets):
-                    raise ValueError("V4 start-127 capture carrier exceeds native RoPE storage")
+                if tensor.shape[0] < max_capture_end:
+                    raise ValueError("V4 capture carrier exceeds native RoPE storage")
                 self._immutable[id(tensor)] = tensor
         builder_groups = []
         widths = []
@@ -705,8 +763,8 @@ class V4FullAttention:
             ratio = self._layout.compress_ratios[group_id]
             model_len = max(self._model_len, self.runner.max_encoder_len)
             width = max((((model_len + block - 1) // block) + ratio - 1) // ratio, 1)
-            if self._layout.carrier_pages[group_id] > width:
-                raise ValueError("V4 native table is too short for the start-127 capture carrier")
+            if any(max(layout.page_counts(block, ratio)) > width for layout in captures):
+                raise ValueError("V4 native table is too short for a capture owner")
             widths.append(width)
             for key, names in selected.items():
                 builder_cls = backends[key].get_builder_cls()
@@ -722,21 +780,37 @@ class V4FullAttention:
                 self._pending_tokens = tokens
                 self._step = None
                 self._capture_phase = "mixed"
+                layout = bucket["capture"]
+                query = [0]
+                for length in layout.query_lengths:
+                    query.append(query[-1] + length)
                 common = AscendCommonAttentionMetadata(
-                    query_start_loc=torch.zeros(2, dtype=torch.int32, device=self.runner.device),
-                    query_start_loc_cpu=torch.tensor([0, tokens], dtype=torch.int32),
-                    seq_lens=torch.zeros(1, dtype=torch.int32, device=self.runner.device),
-                    seq_lens_cpu=torch.tensor([127 + tokens], dtype=torch.int32),
-                    num_reqs=1,
-                    num_actual_tokens=tokens,
-                    max_query_len=tokens,
+                    query_start_loc=torch.tensor(
+                        query, dtype=torch.int32, device=self.runner.device
+                    ),
+                    query_start_loc_cpu=torch.tensor(query, dtype=torch.int32),
+                    seq_lens=torch.zeros(
+                        len(layout.query_lengths), dtype=torch.int32, device=self.runner.device
+                    ),
+                    seq_lens_cpu=torch.tensor(
+                        [
+                            start + length
+                            for start, length in zip(
+                                layout.starts, layout.query_lengths, strict=True
+                            )
+                        ],
+                        dtype=torch.int32,
+                    ),
+                    num_reqs=len(layout.query_lengths),
+                    num_actual_tokens=sum(layout.query_lengths),
+                    max_query_len=max(layout.query_lengths),
                     max_seq_len=self._model_len,
                     block_table_tensor=None,
                     slot_mapping=None,
                     causal=True,
                     num_input_tokens=tokens,
                 )
-                self._prepare_step(common, 1)
+                self._prepare_step(common, len(layout.query_lengths))
                 for group_id, builder_cls, spec, names in builder_groups:
                     builder = builder_cls(
                         spec,
@@ -746,7 +820,9 @@ class V4FullAttention:
                     )
                     bucket["builders"][names[0]] = builder
                     common.block_table_tensor = torch.zeros(
-                        (1, widths[group_id]), dtype=torch.int32, device=self.runner.device
+                        (len(layout.query_lengths), widths[group_id]),
+                        dtype=torch.int32,
+                        device=self.runner.device,
                     )
                     self._build_local(builder, group_id, list(names), common)
             if self.runner.device.type == "npu":
@@ -1103,7 +1179,8 @@ class V4FullAttention:
             raise ValueError("V4 actual native request count exceeds its allocation")
         capturing_mixed = self._capture_phase == "mixed"
         if capturing_mixed:
-            lengths = (self._pending_tokens,)
+            layout = self._buckets[self._pending_tokens]["capture"]
+            lengths = layout.query_lengths
             decodes = 0
         else:
             qcpu = common.query_start_loc_cpu
@@ -1135,8 +1212,12 @@ class V4FullAttention:
         bucket = self._buckets[capacity.outer_tokens]
         bucket["buffers"].update_population(population)
         if capturing_mixed:
-            starts = (127,)
-            original_positions = list(range(127, 127 + sum(lengths)))
+            starts = layout.starts
+            original_positions = [
+                position
+                for start, length in zip(starts, lengths, strict=True)
+                for position in range(start, start + length)
+            ]
         else:
             scpu = common.seq_lens_cpu
             if scpu is None:
@@ -1229,23 +1310,18 @@ class V4FullAttention:
             block_size = builder.kv_cache_spec.block_size
             if getattr(builder.kv_cache_spec, "compress_ratio", 1) != ratio:
                 raise ValueError("V4 builder compression differs from its native group")
-            page_count = capture_carrier_pages(block_size, ratio, capacity.outer_tokens)
+            counts = bucket["capture"].page_counts(block_size, ratio)
             reserved = self._layout.carrier_pages[group_id]
-            if page_count > reserved:
+            if sum(counts) > reserved:
                 raise ValueError("V4 capture carrier exceeds its reserved physical pages")
-            if page_count > width:
+            if max(counts) > width:
                 raise ValueError("V4 native table is too short for the capture carrier")
-            owner = capacity.decode_requests
-            table[owner].zero_()
-            table[owner, :page_count].copy_(
-                torch.arange(
-                    self._layout.carrier_start(self.runner.kv_cache_config.num_blocks, group_id),
-                    self._layout.carrier_start(self.runner.kv_cache_config.num_blocks, group_id)
-                    + page_count,
-                    dtype=table.dtype,
-                    device=table.device,
+            page = self._layout.carrier_start(self.runner.kv_cache_config.num_blocks, group_id)
+            for (owner, _), count in zip(real_rows, counts, strict=True):
+                table[owner, :count].copy_(
+                    torch.arange(page, page + count, dtype=table.dtype, device=table.device)
                 )
-            )
+                page += count
         else:
             owners = torch.tensor(
                 [owner for owner, _ in real_rows], dtype=torch.int64, device=self.runner.device
@@ -1267,13 +1343,16 @@ class V4FullAttention:
             pass
         elif step["capturing_mixed"]:
             block_size = builder.kv_cache_spec.block_size
-            logical_positions = torch.arange(
-                127, 127 + capacity.outer_tokens, dtype=torch.int64, device=self.runner.device
-            )
-            pages = table[capacity.decode_requests].index_select(0, logical_positions // block_size)
-            slots.index_copy_(
-                0, valid_rows, pages.to(torch.int64) * block_size + logical_positions % block_size
-            )
+            for owner, _ in real_rows:
+                begin, end = (
+                    capacity.decode_tokens + offset
+                    for offset in step["query_cpu"][owner : owner + 2].tolist()
+                )
+                logical_positions = positions[begin:end]
+                pages = table[owner].index_select(0, logical_positions // block_size)
+                slots[begin:end] = (
+                    pages.to(torch.int64) * block_size + logical_positions % block_size
+                )
         else:
             slots.index_copy_(
                 0, valid_rows, common.slot_mapping[: len(population.valid_rows)].to(torch.int64)

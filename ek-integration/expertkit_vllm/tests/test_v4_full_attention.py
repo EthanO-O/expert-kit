@@ -8,6 +8,7 @@ from expertkit_vllm.v4_full_attention import (
     _AttentionBuffers,
     _NativeMetadataStorage,
     attention_capacity,
+    capture_layout,
     local_builder_config,
 )
 
@@ -20,6 +21,7 @@ def _test_buckets():
     return {
         c: {
             "capacity": (capacity := attention_capacity(c, max_requests=256, mixed=True)),
+            "capture": capture_layout(capacity, 4096, (1, 4, 128)),
             "buffers": _AttentionBuffers(capacity, 2, torch.float32, "cpu"),
             "metadata": _NativeMetadataStorage(),
             "builders": {},
@@ -310,7 +312,14 @@ def test_physical_pool_clone_preserves_logical_object_and_every_alias(padding):
             SimpleNamespace(size=113 * 3, offset=0, block_stride=0, shared_by=[])
         )
     before = deepcopy(logical)
-    layout = kv_scratch_layout(groups, max_virtual_owners=7, mixed_capture_sizes=(3, 7))
+    layout = kv_scratch_layout(
+        groups,
+        max_virtual_owners=7,
+        mixed_capture_layouts=tuple(
+            capture_layout(attention_capacity(c, mixed=True, max_requests=7), 4096, (4, 128))
+            for c in (3, 7)
+        ),
+    )
     physical = physical_cache_config(logical, layout)
     assert logical == before
     assert physical.num_blocks == logical.num_blocks + layout.extra_pages
@@ -621,7 +630,7 @@ def test_native_capture_carrier_keeps_group_width_and_runtime_slots(
         tuple(blocks),
         (4, 128, 1, 1, 1, 1),
         tuple(
-            capture_carrier_pages(b, r, 2048)
+            capture_carrier_pages(b, r, 2048, start=127)
             for b, r in zip(blocks, (4, 128, 1, 1, 1, 1), strict=True)
         ),
     )
@@ -642,7 +651,7 @@ def test_native_capture_carrier_keeps_group_width_and_runtime_slots(
     adapter._build_local(builder, group, ["layer"], common)
     captured = received[-1]
     assert captured.block_table_tensor.shape == (bucket["capacity"].requests, width)
-    pages = capture_carrier_pages(block, ratio, tokens)
+    pages = capture_carrier_pages(block, ratio, tokens, start=127)
     owner = bucket["capacity"].decode_requests
     assert captured.block_table_tensor[owner, :pages].tolist() == list(
         range(carrier_start, carrier_start + pages)
@@ -689,9 +698,9 @@ def test_capture_group_ratio_rejects_nonuniform_native_group():
                     }
                 )
             )
-    assert capture_carrier_pages(128, 128, 2) == 1
-    assert capture_carrier_pages(128, 4, 2048) == 5
-    assert capture_carrier_pages(128, 128, 2048) == 1
+    assert capture_carrier_pages(128, 128, 2, start=127) == 1
+    assert capture_carrier_pages(128, 4, 2048, start=127) == 5
+    assert capture_carrier_pages(128, 128, 2048, start=127) == 1
 
 
 def test_carrier_pages_cover_every_mixed_bucket_native_compressor_rows():
@@ -708,7 +717,7 @@ def test_carrier_pages_cover_every_mixed_bucket_native_compressor_rows():
             start = 127 // ratio
             rows = (127 + tokens) // ratio - start
             assert rows > 0
-            pages = capture_carrier_pages(block, ratio, tokens)
+            pages = capture_carrier_pages(block, ratio, tokens, start=127)
             assert (start + rows - 1) // block < pages <= width
 
 
@@ -972,6 +981,7 @@ def native_profile_runtime(monkeypatch, request):
             events.append(("builder", names[0], config.scheduler_config.max_num_batched_tokens))
 
         def build(self, prefix, common, **kwargs):
+            self.common = common
             self.source = Metadata(
                 Prefill(
                     common.max_query_len,
@@ -1133,6 +1143,219 @@ def native_profile_runtime(monkeypatch, request):
         modules=modules,
         Builder=Builder,
     )
+
+
+@pytest.mark.parametrize("native_profile_runtime", (False, True), indirect=True)
+@pytest.mark.parametrize("ratio", (4, 128))
+@pytest.mark.parametrize(
+    "model_len,captures,requests,tokens",
+    (
+        (2048, (3, 64, 2048), 256, 2048),
+        (128, (3, 7, 12), 8, 32),
+        (2, (2, 3, 7), 2, 8),
+        (3, (2, 7, 13), 2, 16),
+        (63, (3, 64, 129), 3, 160),
+        (127, (2, 128, 255), 2, 256),
+        (128, (2, 129, 513), 2, 1024),
+        (128, (1, 2, 257), 1, 512),
+    ),
+)
+def test_profile_capture_respects_native_context_capacity(
+    native_profile_runtime, model_len, captures, requests, tokens, ratio
+):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    import torch
+
+    from expertkit_vllm.v4_full_attention import V4FullAttention
+
+    runtime = native_profile_runtime
+    runtime.adapter.close()
+    runner = runtime.runner
+    runner.max_model_len = runner.model_config.max_model_len = model_len
+    runner.max_num_reqs, runner.max_num_tokens = requests, tokens
+    runtime.config.model_config.max_model_len = model_len
+    runtime.config.scheduler_config.max_num_seqs = requests
+    runtime.config.scheduler_config.max_num_batched_tokens = tokens
+    for role in ("a", "b"):
+        runtime.specs[role] = replace(runtime.specs[role], compress_ratio=ratio)
+    graph = SimpleNamespace(
+        capture_sizes=captures,
+        decode_capture_sizes=tuple(c for c in captures if c <= requests),
+        model=runtime.adapter.graph_config.model,
+    )
+    adapter = V4FullAttention(runner, graph)
+    try:
+        adapter.prepare_profile_metadata()
+        assert tuple(adapter._buckets) == tuple(c for c in captures if c >= 2)
+        assert not any(event[0] == "allocate" for event in runtime.events)
+        logical = deepcopy(adapter._profile_plan)
+        logical.num_blocks = 113
+        for raw in logical.kv_cache_tensors:
+            raw.size *= logical.num_blocks
+        runner.kv_cache_config = logical
+        total = runtime.planned_bytes_per_block * (113 + adapter._layout.extra_pages)
+        assert adapter._reserve_kv_memory(total) == 113 * runtime.planned_bytes_per_block
+        runner.initialize_kv_cache_tensors(logical)
+        assert sum(raw.size for raw in adapter._physical_config.kv_cache_tensors) == total
+        for c, bucket in adapter._buckets.items():
+            capacity, layout = bucket["capacity"], bucket["capture"]
+            assert 1 <= len(layout.query_lengths) <= requests
+            assert all(2 <= q <= model_len for q in layout.query_lengths)
+            assert sum(layout.query_lengths) <= min(c, requests * model_len)
+            assert all(
+                0 <= start < start + q <= model_len
+                for start, q in zip(layout.starts, layout.query_lengths, strict=True)
+            )
+            if c == 7 and model_len == 3:
+                assert layout.query_lengths == (3, 3)
+            if c > requests * model_len:
+                assert sum(layout.query_lengths) == requests * model_len
+            adapter._pending_tokens, adapter._capture_phase, adapter._step = c, "mixed", None
+            adapter._prepare_step(SimpleNamespace(), min(c, requests))
+            population = adapter._step["population"]
+            assert population.num_decodes == 0
+            assert population.query_lengths == layout.query_lengths
+            assert all(q == 0 for q in population.physical_lengths[: capacity.decode_requests])
+            assert population.gather_sources[sum(layout.query_lengths) :] == (capacity.tokens,) * (
+                c - sum(layout.query_lengths)
+            )
+            for group, role in ((0, "a"), (1, "c")):
+                builder = bucket["builders"][role]
+                spec = builder.kv_cache_spec
+                block, r = spec.block_size, spec.compress_ratio
+                stored = bucket["metadata"].values[role]
+                pointers = tuple(
+                    tensor.data_ptr()
+                    for tensor in (
+                        stored.prefill.table,
+                        stored.prefill.slots,
+                        stored.prefill.positions,
+                    )
+                )
+                common = SimpleNamespace(
+                    block_table_tensor=torch.zeros(
+                        1, adapter._profile_table_widths[group], dtype=torch.int32
+                    )
+                )
+                adapter._build_local(builder, group, builder.names, common)
+                local = builder.common
+                assert pointers == tuple(
+                    tensor.data_ptr()
+                    for tensor in (
+                        stored.prefill.table,
+                        stored.prefill.slots,
+                        stored.prefill.positions,
+                    )
+                )
+                assert common.block_table_tensor.count_nonzero() == 0
+                counts = layout.page_counts(block, r)
+                assert sum(counts) <= adapter._layout.carrier_pages[group]
+                assert max(counts) <= local.block_table_tensor.shape[1]
+                page = adapter._layout.carrier_start(113, group)
+                used = set()
+                for i, (start, q, count) in enumerate(
+                    zip(layout.starts, layout.query_lengths, counts, strict=True)
+                ):
+                    owner = capacity.decode_requests + i
+                    pages = local.block_table_tensor[owner, :count].tolist()
+                    assert pages == list(range(page, page + count))
+                    assert not used.intersection(pages)
+                    used.update(pages)
+                    positions = (
+                        range(start, start + q) if r == 1 else range(start // r, (start + q) // r)
+                    )
+                    assert all(
+                        local.block_table_tensor[owner, p // block].item() in pages
+                        for p in positions
+                    )
+                    page += count
+                emitted = sum(
+                    (start + q) // r - start // r
+                    for start, q in zip(layout.starts, layout.query_lengths, strict=True)
+                )
+                native_rows = min(
+                    capacity.prefill_tokens,
+                    capacity.prefill_tokens // r + capacity.prefill_requests,
+                )
+                assert emitted <= native_rows
+                assert native_rows > 0
+                if model_len >= r:
+                    assert emitted > 0
+                if r == 1:
+                    offset = capacity.decode_tokens
+                    for i, (start, q) in enumerate(
+                        zip(layout.starts, layout.query_lengths, strict=True)
+                    ):
+                        positions = torch.arange(start, start + q)
+                        pages = local.block_table_tensor[
+                            capacity.decode_requests + i, positions // block
+                        ]
+                        expected = pages.to(torch.int64) * block + positions % block
+                        assert torch.equal(local.slot_mapping[offset : offset + q], expected)
+                        offset += q
+                    assert (local.slot_mapping[: capacity.decode_tokens] == -1).all()
+                    assert (local.slot_mapping[offset:] == -1).all()
+                else:
+                    assert (local.slot_mapping == -1).all()
+            adapter._capture_phase, adapter._step = None, None
+            query = [0]
+            for q in layout.query_lengths:
+                query.append(query[-1] + q)
+            common = SimpleNamespace(
+                query_start_loc_cpu=torch.tensor(query),
+                seq_lens_cpu=torch.tensor(layout.query_lengths),
+                positions_cpu=torch.cat([torch.arange(q) for q in layout.query_lengths]),
+                slot_mapping=torch.arange(query[-1]) + 1000,
+            )
+            adapter._prepare_step(common, len(layout.query_lengths))
+            for group, role in ((0, "a"), (1, "c")):
+                width = adapter._profile_table_widths[group]
+                common.block_table_tensor = torch.arange(
+                    len(layout.query_lengths) * width, dtype=torch.int32
+                ).reshape(-1, width)
+                original = {name: tensor.clone() for name, tensor in vars(common).items()}
+                builder = bucket["builders"][role]
+                stored = bucket["metadata"].values[role]
+                pointer = stored.prefill.table.data_ptr()
+                adapter._build_local(builder, group, builder.names, common)
+                assert stored.prefill.table.data_ptr() == pointer
+                local = builder.common
+                owner = capacity.decode_requests
+                assert torch.equal(
+                    local.block_table_tensor[owner : owner + len(layout.query_lengths)],
+                    common.block_table_tensor,
+                )
+                assert torch.equal(
+                    local.slot_mapping[list(adapter._step["population"].valid_rows)],
+                    common.slot_mapping,
+                )
+                assert torch.equal(
+                    local.positions[list(adapter._step["population"].valid_rows)],
+                    common.positions_cpu,
+                )
+                assert all(
+                    torch.equal(getattr(common, name), tensor) for name, tensor in original.items()
+                )
+    finally:
+        adapter.close()
+
+
+def test_profile_rejects_context_without_any_legal_prefill(native_profile_runtime):
+    from expertkit_vllm.v4_full_attention import V4FullAttention
+
+    runtime = native_profile_runtime
+    runtime.adapter.close()
+    runtime.runner.max_model_len = runtime.runner.model_config.max_model_len = 1
+    runtime.config.model_config.max_model_len = 1
+    adapter = V4FullAttention(runtime.runner, runtime.adapter.graph_config)
+    try:
+        with pytest.raises(ValueError, match="context of at least two tokens"):
+            adapter.prepare_profile_metadata()
+        assert not any(event[0] in {"builder", "allocate"} for event in runtime.events)
+    finally:
+        adapter.close()
 
 
 @pytest.mark.parametrize("native_profile_runtime", (False, True), indirect=True)
@@ -1367,26 +1590,28 @@ def test_profile_rejects_short_rope_before_materializing_builders(native_profile
 
     runtime = native_profile_runtime
     runtime.modules["vllm_ascend.ops.rope_dsv4"]._ROPE_STATE.full_rope_cache = {
-        "c4": (torch.zeros(138, 1),)
+        "c4": (torch.zeros(14, 1),)
     }
     with pytest.raises(ValueError, match="exceeds native RoPE storage"):
         runtime.adapter.prepare_profile_metadata()
     assert not any(event[0] in {"builder", "allocate"} for event in runtime.events)
 
 
-def test_profile_rejects_short_native_table_before_materializing_builders(native_profile_runtime):
-    runtime = native_profile_runtime
-    runtime.adapter.close()
-    runtime.runner.max_model_len = 128
-    runtime.runner.model_config.max_model_len = 128
-    runtime.config.model_config.max_model_len = 128
-    from expertkit_vllm.v4_full_attention import V4FullAttention
+def test_runtime_rejects_short_native_table_before_metadata_update(native_profile_runtime):
+    import torch
 
-    adapter = V4FullAttention(runtime.runner, runtime.adapter.graph_config)
-    with pytest.raises(ValueError, match="table is too short"):
-        adapter.prepare_profile_metadata()
-    assert not any(event[0] in {"builder", "allocate"} for event in runtime.events)
-    adapter.close()
+    runtime = native_profile_runtime
+    adapter = runtime.adapter
+    adapter.prepare_profile_metadata()
+    adapter._pending_tokens, adapter._capture_phase, adapter._step = 7, "mixed", None
+    adapter._prepare_step(SimpleNamespace(), 1)
+    builder = adapter._buckets[7]["builders"]["a"]
+    common = SimpleNamespace(
+        block_table_tensor=torch.zeros(1, adapter._profile_table_widths[0] - 1, dtype=torch.int32)
+    )
+    with pytest.raises(RuntimeError, match="native table geometry changed"):
+        adapter._build_local(builder, 0, builder.names, common)
+    assert not any(event[0] == "allocate" for event in runtime.events)
 
 
 @pytest.mark.parametrize(
