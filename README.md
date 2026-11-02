@@ -27,11 +27,11 @@ https://github.com/user-attachments/assets/9f1f5b23-28fe-44cf-b592-2f6ad0ad4dad
 
 Here are some tutorials to help you quickly start with Expert Kit.
 
-1. [Qwen3-30B-A3B](./doc/tutorial/standalone/qwen3-moe-a3b-demo.md): A demo for running the Qwen3-30B-A3B model with Expert Kit, showcasing the framework's capabilities in handling real-world MoE models.
-2. [DeepSeek-V2-Lite](./doc/tutorial/standalone/deepseek-v2-lite.md): A complete Python Worker and Torch Frontend deployment using the official DeepSeek-V2-Lite checkpoint.
-3. [Qwen3-30B-A3B on Ascend 910C](./doc/tutorial/ascend/qwen3-30b-a3b.md): Deploy the Controller, vLLM attention frontend, and two expert pools, then run online and offline benchmarks.
-4. [DeepSeek-V3 on Ascend 910C](./doc/tutorial/ascend/deepseek-v3.md): Configure and qualify the BF16 remote-expert path.
-5. [Qwen3 and V4 W8A8 Decode graphs](./doc/tutorial/ascend/decode-graphs.md): Build the shared prebuilt-runtime image and deploy fixed expert Workers.
+1. [Qwen3 and V4 ModelSlim W8A8 graphs on Ascend](./doc/tutorial/ascend/decode-graphs.md): Current Full/Decode graph configuration, shared prebuilt runtime, startup, and hardware qualification scope.
+2. [Qwen3-30B-A3B BF16 on Ascend 910C](./doc/tutorial/ascend/qwen3-30b-a3b.md): Deploy the Controller, vLLM attention frontend, and two expert pools, then run online and offline benchmarks.
+3. [Qwen3-30B-A3B BF16 with Transformers on CUDA](./doc/tutorial/standalone/qwen3-moe-a3b-demo.md): Run the Python Worker and Torch Frontend.
+4. [DeepSeek-V2-Lite BF16 on CUDA](./doc/tutorial/standalone/deepseek-v2-lite.md): Deploy the Python Worker with Transformers or the separately qualified vLLM 0.25.1 path.
+5. [DeepSeek-V3 BF16 on Ascend 910C](./doc/tutorial/ascend/deepseek-v3.md): Configure the remote-expert deployment and complete its pending end-to-end hardware qualification.
 
 ## Python Workspace
 

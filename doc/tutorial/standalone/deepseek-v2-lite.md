@@ -2,8 +2,12 @@
 
 ## Overview
 
-This guide deploys `deepseek-ai/DeepSeek-V2-Lite-Chat` with the Python Worker
-and either the Transformers 5.14.1 or vLLM 0.25.1 Frontend:
+This CUDA/BF16 guide deploys `deepseek-ai/DeepSeek-V2-Lite-Chat` with the Python
+Worker and either the Transformers 5.14.1 or vLLM 0.25.1 Frontend. Current Ascend
+ModelSlim Qwen3/V4 deployments use the separate
+[Full and Decode graph guide](../ascend/decode-graphs.md).
+
+The CUDA computation path is:
 
 ```text
 Transformers wrapper --\
@@ -89,8 +93,6 @@ Create `$EK_RUN/controller.yaml`:
 ```bash
 cat > "$EK_RUN/controller.yaml" <<'EOF'
 inference:
-  hidden_dim: 2048
-  intermediate_dim: 1408
   instance_name: deepseek-v2-lite-demo
   model_name: DeepSeek-V2-Lite-Chat
 
@@ -119,6 +121,8 @@ EOF
 ```
 
 Workers connect to port 5001. The Frontend receives topology from port 5002.
+Controller scheduling reads model metadata from the Weight Server; the legacy
+Controller dimension fields are unnecessary.
 
 ### 2. Start PostgreSQL and initialize the database
 
@@ -152,11 +156,6 @@ cat > "$EK_RUN/worker.yaml" <<EOF
 model:
   name: DeepSeek-V2-Lite-Chat
   weight_version: main
-  num_layers: 27
-  experts_per_layer: 64
-  hidden_dim: 2048
-  expert_intermediate_dim: 1408
-  top_k: 6
   activation_dtype: bf16
   weight_dtype: bf16
 
@@ -201,6 +200,10 @@ observability:
     enabled: false
 EOF
 ```
+
+Worker startup resolves geometry, expert computation, clipping, and quantization
+from Weight Server metadata. Explicit model dimensions are optional assertions
+and must agree with that metadata.
 
 `device_memory_limit` is the total Worker GPU budget. Reduce it when other
 processes use the same GPU. If the resulting expert capacity is below 1,664,
@@ -397,8 +400,9 @@ published topology is sufficient.
 
 The verified scope is deliberately narrower than the code paths:
 
-- Transformers 5.5.3 has completed real DeepSeek-V2-Lite end-to-end runs over
-  both gRPC and SHM.
+- Historical CUDA migration checks with Transformers 5.5.3 completed real
+  DeepSeek-V2-Lite end-to-end runs over both gRPC and SHM. Those results do not
+  establish a new hardware qualification for Transformers 5.14.1.
 - vLLM 0.25.1 has loaded the official checkpoint and completed a real
   16-input/16-output-token Expert Kit generation over gRPC.
 - vLLM uses the same Transport client class, and SHM has shared Transport

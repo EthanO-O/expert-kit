@@ -3,7 +3,7 @@
 This package replaces vLLM's routed MoE factory with an implementation that
 keeps vLLM's router and shared experts local while sending one complete routed
 layer to Expert Kit Transport. The PyPI CUDA engine extra targets vLLM `0.25.1`.
-The Ascend Decode graph lane uses the official prebuilt vLLM `0.26.0` /
+The Ascend Full/Decode graph lane uses the official prebuilt vLLM `0.26.0` /
 vLLM-Ascend `v0.26.0rc2-a3` image described below.
 
 The ordinary vLLM 0.25.1 lane is runtime-qualified with the official
@@ -86,13 +86,15 @@ variable. Shared memory requires vLLM and the Worker to use the same Host,
 - Pipeline and ordinary data-parallel model processes are allowed.
 - On the ordinary path, full graph capture is changed to piecewise capture
   because remote MoE calls perform network I/O between graph segments.
-- The optional Ascend path preserves native `FULL_DECODE_ONLY`, keeps all routed
-  experts resident, and coordinates one control exchange around each complete
-  Decode step. Prefill and mixed batches use the ordinary path. Qwen3 uses one
-  Frontend and two expert Workers; V4 uses one Frontend and eight Workers. Each
-  role requires a distinct device and fixed placement. The V2-Lite profile is
-  also accepted; its historical qualification does not qualify the new image.
-  See the graph guide for model declarations and target-server validation.
+- The optional Ascend graph path supports native `FULL_DECODE_ONLY` (`decode`)
+  and `FULL` (`full`). Decode mode uses ordinary execution for Prefill and mixed
+  batches; Full mode also captures those steps. Routed experts remain resident
+  with fixed placement, and control exchanges coordinate complete graph steps.
+  Worker counts and per-layer expert ownership come from READY topology; the
+  example Qwen3/V4 counts are not requirements. Each role uses a distinct device.
+  See the [graph guide's hardware qualification scope](../../doc/tutorial/ascend/decode-graphs.md#hardware-qualification)
+  for actual model/backend/mode checks on the current stack. V2-Lite's historical
+  results do not qualify it on this image.
 - The integration depends on vLLM internal interfaces and therefore stays
   pinned until a later version is reviewed and adapted.
 

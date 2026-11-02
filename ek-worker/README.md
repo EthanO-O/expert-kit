@@ -44,8 +44,8 @@ Important settings:
   named by the Controller configuration. An explicit ID must match that default.
 - `model.name` must match the model name served by the Weight Server.
 - `worker.id` must match the node name assigned by the Controller.
-- `worker.device` is one explicit `cuda:<id>` for Torch. Start another process
-  for another device.
+- `worker.device` selects one device, such as `cuda:<id>` or `npu:<id>` for
+  Torch. Start another process for another device.
 - `worker.device_memory_limit` is the complete device budget for this process.
   Startup rejects a budget larger than the device or current available memory.
 - `worker.max_batch_tokens` defaults to `4096`.
@@ -225,13 +225,14 @@ helpers before Worker registration. If Triton is absent, ordinary execution stay
 available; other initialization errors propagate. Single-token execution and
 other model profiles retain their existing computation paths.
 
-### Ascend ModelSlim resident Decode graphs
+### Ascend ModelSlim resident Full/Decode graphs
 
 Both `worker.backend: torch` and `worker.backend: ascend_fused` implement the
 same resident graph interface. Their computation implementations are independent.
-The Ascend fused provider retains packed W13/W2 weights, maps contiguous global
-expert intervals by subtraction and masking, and captures the same
-`run_ascend_fused_moe()` pipeline as eager execution. Nonlocal routes use the
+The Ascend fused provider retains packed W13/W2 weights and captures the same
+`run_ascend_fused_moe()` pipeline as eager execution. It maps contiguous global
+expert intervals by subtraction and masking, and noncontiguous per-layer
+ownership through an index table. Nonlocal routes use the
 inactive expert sentinel and zero routing weight. ModelSlim scales are converted
 to the native scaled-GMM dtype once before capture; they need not round-trip
 losslessly through BF16. FP32 transport carries the BF16 native partial result.
@@ -243,45 +244,46 @@ native output combination. Compare numerical accuracy against the reference,
 not bitwise equality between the two pipelines.
 Graph execution requires one active BF16 NPU slot and fixed placement.
 CPU operator tests compare resident fused output with the eager fused pipeline.
-Native capture/replay and checkpoint output accuracy still require qualification
-on the target NPU runtime. To check one capture against eager execution with
-changing routes, duplicates and zero local assignments, run on an NPU host:
+See the [Ascend graph qualification scope](../doc/tutorial/ascend/decode-graphs.md#hardware-qualification)
+for full-model checks on the current runtime. Changed configurations and checkpoint
+output accuracy require target-device validation. To check one capture against
+eager execution with changing routes, duplicates and zero local assignments,
+run on an NPU host:
 
 ```bash
 uv run --no-sync pytest -q ek-worker/tests/unit/backends/ascend_fused/test_decode_graph.py \
   -k native_capture
 ```
 
-The Torch ModelSlim Qwen resident path is enabled explicitly through
-`worker.ascend_decode_graph` with the `modelslim-w8a8-dynamic` recipe. Its fused
-ordered reduction requires the optional Triton-Ascend package with an Ascend
-backend. Install a build compatible with the existing torch-npu and CANN stack
-before enabling this path; the Worker does not install or upgrade it at startup.
-The qualified stack used torch 2.10.0, torch-npu 2.10.0.post4, CANN 9.1.0, and
-triton-ascend 3.2.2 (Triton module version 3.5.0).
+The Torch ModelSlim resident path is enabled through
+`worker.ascend_decode_graph` with the `modelslim-w8a8-dynamic` recipe. It supports
+per-layer expert maps, including noncontiguous ownership and different local
+expert sets across layers. Qwen3's 128 experts, hidden size 2048, intermediate
+size 768, and top-8 routing enable an optimized ordered reduction when every
+layer owns the same `[0, 64)` or `[64, 128)` interval. Those intervals select an
+optimization; they are not general graph placement requirements.
 
-Missing Triton or its Ascend backend causes an explicit startup error for this
-path. Kernel compilation and warmup happen before graph capture; failures retain
-the resident weights in quarantine until process exit. Other ordinary ModelSlim
-profiles, BF16 resident graphs, and CPU/CUDA imports do not load these kernels.
+That optimized reduction requires compatible Triton-Ascend with an Ascend
+backend. Missing support causes an explicit startup error when the optimization
+is selected. Kernel compilation and warmup happen before capture; failures retain
+resident weights in quarantine until process exit. Other profiles use the generic
+resident computation. The shared prebuilt runtime is described in the
+[Ascend graph guide](../doc/tutorial/ascend/decode-graphs.md).
 
-The Torch Qwen graph computation supports 128 experts, hidden size 2048, expert
-intermediate size 768, top-8 routing, SwiGLU, and BF16 activations. Each
-Worker owns one contiguous 64-expert shard, either `[0, 64)` or `[64, 128)`. Each gate, up, and
-down projection produces BF16 values. Routing weights multiply the
-down-projection results in FP32, and the local sum follows expert ID order and
-route-column order before
-rounding to BF16. An FP32 transport destination carries that BF16-rounded local
-result promoted to FP32.
+For ordinary SwiGLU, projections produce BF16 values, routing weights multiply
+the down-projection results in FP32, and the local sum follows expert ID and
+route-column order before rounding to BF16. An FP32 transport destination carries
+that BF16-rounded result promoted to FP32. V4 retains its separate clipping and
+pre-down-projection routing semantics described above.
 
-Full-model resident Decode graphs also require the matching Frontend and
-Transport graph-session integration. Enable the same session and capture
-capacities across the Frontend and both Workers; enabling the Worker option
-alone does not establish a full-model graph session.
+Full-model Full/Decode graphs also require matching Frontend and Transport
+integration. Bootstrap coordinates session identity and capture capacities across
+the selected Workers; enabling the Worker option alone does not establish a
+full-model graph session.
 
-Torch resident ModelSlim weight scales must be finite and positive, and an FP32 to
-BF16 to FP32 round trip must preserve each scale exactly. Construction rejects
-scales that fail this requirement.
+Torch resident ModelSlim scales must be finite and positive. Original FP32 scales
+are retained without a BF16 round-trip requirement. The fused provider's native
+scale conversion remains a separate numerical policy.
 
 ### Checkpoint recipes
 
@@ -292,10 +294,11 @@ stores routed experts in FP4; selecting from the global `quant_method` alone is
 incorrect. Quantization also needs its activation scheme and scale granularity.
 
 Use [`examples/deepseek-v4-flash.torch.yaml`](./examples/deepseek-v4-flash.torch.yaml)
-for either V4 checkpoint, changing `model.name` to the Weight Server directory
-name. Keep `auto_model_metadata: true` and `metadata_required: true`; no manual
-quantization entry is needed. Dimensions and routing settings still belong in
-Worker configuration and are checked against the server. Change `weight_version`
+for the original FP4 or compressed-tensors W8A8 V4 checkpoint, changing
+`model.name` to the Weight Server directory name. Keep `auto_model_metadata: true`
+and `metadata_required: true`; no manual quantization entry is needed. Worker startup resolves geometry, expert
+computation, clipping, and quantization from the server. Explicit model values
+are optional assertions and must agree with that metadata. Change `weight_version`
 and the disk-cache directory when replacing a checkpoint.
 
 | Checkpoint format | Torch execution | Ready GPU weights |
@@ -308,24 +311,28 @@ The W8A8 adapter accepts per-channel `weight_scale` shaped `[output, 1]` in
 FP16/BF16/FP32, and optional INT8 zero-valued `weight_zero_point`. It rejects
 static or asymmetric activations, grouped weights, transforms, regex targets,
 partially ignored routed experts, and unexpected auxiliary tensors. The name
-“W8A8” alone does not establish checkpoint compatibility. Older `blockwise_int8`
-exports, QuaRot transforms, and Ascend execution require their own validated
-format or backend support.
+“W8A8” alone does not establish checkpoint compatibility. This compressed-tensors
+recipe is separate from Ascend ModelSlim W8A8_DYNAMIC, which uses its own metadata,
+weight adapters, and NPU operators. See [quantized expert execution](QUANTIZATION.md)
+for the supported recipes. Older `blockwise_int8` exports and QuaRot transforms
+require their own validated format and backend support.
 
-Both V4 paths apply the configured SwiGLU clipping, calculate the intermediate
-activation in FP32, and apply routing weights **before** the down projection.
+Both Torch V4 reference paths in the table apply the configured SwiGLU clipping,
+calculate the intermediate activation in FP32, and apply routing weights
+**before** the down projection.
 The FP4 compatibility path uses different GEMM accumulation from the native V4
 kernels; it is not a claim of bitwise equality or native FP4 acceleration. Its
 expanded weights do not save GPU weight memory. W8A8 keeps weights compressed,
 but the eager quantization and scaling operations can cost more time for small
 batches; no end-to-end speedup has been established.
 
-These changes support **routed expert computation**. The current Frontend
-loader does not implement the complete V4 model, including its attention,
-routing, shared experts, and hyper-connections. Full-model generation requires
-that integration and separate accuracy and performance validation. A100 tests
-use synthetic expert tensors with the official 4096/2048 dimensions; no V4
-checkpoint weights are downloaded for these tests.
+The CUDA recipes above support **routed expert computation**; the Transformers
+Frontend does not implement the complete V4 model. The separate vLLM-Ascend
+ModelSlim path uses native model attention, routing, shared experts, and
+hyper-connections; its full-model graph checks are recorded in the
+[Ascend graph guide](../doc/tutorial/ascend/decode-graphs.md#hardware-qualification).
+A100 tests use synthetic expert tensors with the official 4096/2048 dimensions;
+no V4 checkpoint weights are downloaded for these tests.
 
 Run CPU tests and the CUDA qualification from the repository root:
 
@@ -401,8 +408,9 @@ done
 
 Synthetic ModelSlim sources use positive FP32 scales exactly representable in
 BF16 in both modes, recorded as `synthetic_scale_policy: bf16_exact_fp32`.
-This satisfies the Torch resident provider's scale guard and keeps seeded inputs
-identical across backends and modes; it is not checkpoint accuracy validation.
+This keeps seeded inputs identical across backends and modes; it is a synthetic
+benchmark condition, not a Torch scale restriction or checkpoint accuracy
+validation.
 Graph runs require BF16, an indexed NPU and concurrency one. Graph temporary
 estimates are reported as null rather than reusing eager estimates; peak device
 allocation is still reported. Add `--profile` for NPU kernel traces. Full vLLM

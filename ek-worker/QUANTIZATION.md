@@ -1,9 +1,10 @@
 # Quantized expert execution
 
 Expert Kit discovers a checkpoint's expert quantization from the Weight Server,
-validates its supported numerical recipe, and selects the Torch weight adapter
-and arithmetic at Worker startup. Computation requests use ready weights only.
-They never infer the recipe from the presence of a scale tensor or start a load.
+validates its supported numerical recipe, and selects the weight adapter and
+arithmetic for the configured backend at Worker startup. Computation requests
+use ready weights only. They never infer the recipe from the presence of a scale
+tensor or start a load.
 
 ## Configuration and ownership
 
@@ -51,9 +52,11 @@ the optional legacy fallback. There is one expert recipe per Worker.
 | Unquantized | Floating source views | Selected floating dtype | Floating GEMM |
 | Symmetric AutoGPTQ v1 INT4, canonical groups | Packed words, scales and zero points | Floating weights decoded at placement | Floating GEMM |
 | Original DeepSeek-V4-Flash routed experts | Packed E2M1 FP4 and E8M0 scales per 32 values | Floating weights decoded at placement, normally BF16 | E4M3 activation rounding per 128 values followed by floating GEMM |
-| Supported compressed-tensors W8A8 export | INT8 source views and per-channel scales | INT8 weights and FP32 scales | Dynamic per-token INT8 quantization, INT32 GEMM accumulation and rescaling |
+| Supported compressed-tensors W8A8 export | INT8 source views and per-channel scales | INT8 weights and FP32 scales | Torch dynamic per-token INT8 quantization, INT32 GEMM accumulation and rescaling |
+| Ascend ModelSlim W8A8_DYNAMIC | INT8 source views, channel scales and zero offsets | Backend-specific INT8 layouts; Torch retains FP32 scales, fused uses native scale conversion | NPU dynamic quantization and grouped projections through Torch or `ascend_fused` |
 
-The selected W8A8 format is `sgl-npu/DeepSeek-V4-Flash-W8A8`, with
+The selected compressed-tensors W8A8 format is
+`sgl-npu/DeepSeek-V4-Flash-W8A8`, with
 `quant_method=compressed-tensors`, `format=int-quantized`, symmetric per-channel
 integer weights, and dynamic symmetric per-token integer activations. The Worker
 uses `max(abs(x))/127` FP32 activation scales, nearest-even rounding and signed
@@ -61,6 +64,13 @@ INT8 clipping. All-zero rows produce zero output. Non-null activation
 `scale_dtype`, static activations, nonzero zero points, transforms and unsupported
 group strategies are rejected. W8A8 is a fixed supported recipe here, rather than
 a promise to execute every export with eight-bit weights and activations.
+
+Ascend ModelSlim is a separate checkpoint recipe, advertised as
+`modelslim-w8a8-dynamic`. Its adapters validate INT8 projection matrices,
+finite positive BF16/FP32 per-channel scales shaped `[output, 1]`, and matching
+zero-valued offsets. Torch retains the scales in FP32; the fused graph converts
+them to the native scaled-GMM dtype before capture. ModelSlim support does not
+make compressed-tensors W8A8 or original FP4 checkpoints executable on Ascend.
 
 The original V4 global configuration says FP8 while its routed experts use FP4.
 The server resolves those expert-specific semantics before advertising `mxfp4`.
@@ -154,10 +164,13 @@ Tests cover strict metadata rejection, model-prefix selection, exact FP4 nibbles
 and scales across chunk boundaries, bounded decoding allocations, small Host
 budgets, cancellation during concurrent conversion, and numerical/ownership
 behavior. Synthetic experts with the published 4096/2048 V4 dimensions qualify
-FP4 and W8A8 on the local A100; these are not official checkpoint accuracy or
-end-to-end inference benchmarks.
+FP4 and compressed-tensors W8A8 on the local A100; these are not official
+checkpoint accuracy or end-to-end inference benchmarks.
 
-This increment implements expert computation. Full V4 Frontend attention and
-hyper-connections, actual-checkpoint numerical qualification, mixed recipes within
-one Worker, fused low-bit kernels and Ascend execution remain outside its support.
-No checkpoint weight download is required by these tests.
+The A100 tests qualify the Torch expert reference recipes, not complete V4
+Frontend generation. Current full-model V4 execution uses the separate native
+vLLM-Ascend ModelSlim integration; see the
+[Ascend graph qualification scope](../doc/tutorial/ascend/decode-graphs.md#hardware-qualification)
+for its actual capture/replay checks. Mixed recipes within one Worker, native
+FP4 acceleration, and general checkpoint accuracy remain outside that scope.
+No checkpoint weight download is required by the synthetic A100 tests.

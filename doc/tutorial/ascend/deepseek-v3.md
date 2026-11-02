@@ -1,8 +1,11 @@
-# Qualify DeepSeek-V3 on Ascend 910C
+# Deploy and qualify DeepSeek-V3 BF16 on Ascend 910C
 
 This tutorial applies the same generated 8A32E deployment used by the
 [Qwen3-30B-A3B guide](qwen3-30b-a3b.md) to DeepSeek-V3: eight attention ranks
 on `node-a` and two sixteen-Worker expert pools on `node-b` and `node-c`.
+This BF16 deployment still requires its first complete EK end-to-end hardware
+qualification. The [Qwen3/V4 graph results](decode-graphs.md#hardware-qualification)
+cover different checkpoints and execution paths.
 
 ## Before the start
 
@@ -11,10 +14,9 @@ before using this tutorial. It owns the shared Host preparation, generation,
 image build, startup, benchmark, and shutdown steps.
 
 DeepSeek publishes the official V3 checkpoint in FP8 and provides an official
-FP8-to-BF16 conversion script. The current Ascend Worker path supports
-unquantized FP16/BF16 expert weights, so this guide uses a converted BF16
-checkpoint. Do not point `weight_dtype: bf16` at the original FP8 files; YAML
-does not convert weights.
+FP8-to-BF16 conversion script. This guide uses the Ascend Worker's
+unquantized FP16/BF16 expert path with a converted BF16 checkpoint. Do not point
+`weight_dtype: bf16` at the original FP8 files; YAML does not convert weights.
 
 DeepSeek-V3.2 is outside this qualification. Its `model_type` is
 `deepseek_v32`, and its checkpoint and routed-MoE integration require separate

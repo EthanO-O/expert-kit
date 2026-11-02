@@ -1,4 +1,4 @@
-# Ascend Decode graphs
+# Ascend Full and Decode graphs
 
 By default, the graph path captures the complete model forward for Decode,
 including routed experts on separate Workers. Prefill and mixed batches use
@@ -23,6 +23,25 @@ Both graph modes reuse this image; normal runtime kernel JIT and graph warmup
 still run.
 The PyPI `expertkit-vllm[engine]` extra selects a different CUDA engine; use the
 Docker build below for Ascend.
+
+## Hardware qualification
+
+The following small-request checks were recorded on 2026-11-02 using the fixed
+prebuilt 0.26 runtime above, one Frontend device, and separate Worker devices on
+Ascend 910C. All rows used ModelSlim dynamic W8A8 checkpoints and native automatic
+KV planning.
+
+| Model | Mode | Worker backend / count | Actual capture and replay |
+| --- | --- | --- | --- |
+| Qwen3-30B-A3B | Full | `torch` / 2 | Captured capacities 3/64/256 and verified native replay. Two 300-token prompts each used 256+44 Prefill tokens, followed by Decode. |
+| Qwen3-30B-A3B | Decode | `ascend_fused` / 2 | Captured capacities 3/7; verified capacity 3 replay. Two 300-token prompts each used one ordinary Prefill step. |
+| DeepSeek-V4-Flash | Full | `ascend_fused` / 8 | Captured Decode 3 and Mixed 3/64/256; replayed Decode 3 and Mixed 64/256. A larger configuration also captured Decode 3/64 and Mixed 3/64/2048, with actual Decode 3 and Mixed 2048 replay; a 1536-token prompt completed Prefill in one step. |
+
+These are functional graph checks, not performance benchmarks. Qwen Full chat
+output was truncated at 32 tokens; V4 chat output was truncated at 128 tokens.
+Some buckets were captured without natural replay. V4 Decode and other
+model/backend/layout combinations are not covered by these checks. Changed
+placements and capacities require their own target-device qualification.
 
 ## Configure the existing examples
 
@@ -87,7 +106,8 @@ Multi-host configuration acceptance does not establish hardware qualification.
 ### Full graphs and native serving capacity
 
 `mode: decode` selects `FULL_DECODE_ONLY`; Prefill and mixed steps use ordinary
-execution. `mode: full` also captures Prefill and mixed steps. For example:
+execution. `mode: full` also captures Prefill and mixed steps. Update these fields
+in the existing experiment configuration, keeping its other `serve` loading options:
 
 ```yaml
 serve:

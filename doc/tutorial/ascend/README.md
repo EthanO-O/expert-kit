@@ -7,8 +7,8 @@ qualification status differ.
 
 | Model | Status | Guide |
 | --- | --- | --- |
-| Qwen3-30B-A3B | BF16 deployment; ModelSlim W8A8 Decode graph configuration with server qualification pending on the prebuilt 0.26 runtime | [BF16](qwen3-30b-a3b.md), [W8A8 graphs](decode-graphs.md) |
-| DeepSeek-V4-Flash | ModelSlim W8A8 Decode graph configuration; server qualification pending on the prebuilt 0.26 runtime | [W8A8 graphs](decode-graphs.md) |
+| Qwen3-30B-A3B | BF16 deployment; ModelSlim W8A8 Full/Decode graph qualification scope recorded in the graph guide | [BF16](qwen3-30b-a3b.md), [W8A8 graphs](decode-graphs.md#hardware-qualification) |
+| DeepSeek-V4-Flash | ModelSlim W8A8 Full graph qualification scope recorded in the graph guide | [W8A8 graphs](decode-graphs.md#hardware-qualification) |
 | DeepSeek-V3 | BF16 qualification path; vLLM integration still needs an end-to-end hardware run | [Qualify DeepSeek-V3](deepseek-v3.md) |
 
 These guides keep authored configuration, generated YAML, and caches inside the
@@ -110,11 +110,9 @@ npu-smi info
 npu-smi info -t board -i 0
 ```
 
-Retain the NPU and board identity and driver version with your results. See
-[SoC identification and runtime checks](../../../container/ascend/README.md)
-for the `SOC_VERSION` example and Triton-Ascend diagnostics. `SOC_VERSION` is
-needed when compiling native extensions for a specific target; the current
-prebuilt EK image workflow does not require it or rebuild the engine.
+Retain the NPU and board identity and driver version with your results. The
+[current graph guide](decode-graphs.md) records the shared prebuilt runtime;
+this workflow installs EK wheels without rebuilding the engine.
 
 Generate from the repository root:
 
@@ -371,8 +369,9 @@ own Python package and is not included in these four wheels.
 The image does not build vLLM, vLLM-Ascend, Torch, Triton or Mooncake from source.
 EK Triton kernels still compile on first use as part of normal warmup. Decode
 graph transport uses HCCL and does not require the optional Mooncake native build.
-See the [graph recipe](deepseek-v2-lite-decode-graphs.md) for graph configuration
-and startup order.
+See the [current Qwen3/V4 graph guide](decode-graphs.md) for graph configuration,
+startup order, and hardware qualification scope. The
+[V2-Lite graph page](deepseek-v2-lite-decode-graphs.md) records historical results.
 
 Do not install the PyPI CUDA `engine` extra or synchronize the default root uv
 environment over the attention image's accelerator stack. The root `npu` and

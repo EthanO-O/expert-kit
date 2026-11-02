@@ -1,13 +1,16 @@
 # Run Qwen3-30B-A3B with the Python Worker
 
-This guide exercises the Expert Kit Transformers 5.14.1 path with the BF16
+This CUDA guide exercises the Expert Kit Transformers 5.14.1 path with the BF16
 `Qwen/Qwen3-30B-A3B` checkpoint. The model configuration has 48 routed layers,
 128 experts per layer, hidden size 2048, expert intermediate size 768, and top-k
 8. Those values come from the model's
 [`config.json`](https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/config.json).
 
 The final check sends one prompt and generates at most 20 new tokens. It is the
-small Torch Frontend check used by the Worker migration.
+small CUDA Torch Frontend check used by the Worker migration. For Ascend BF16,
+use the [Qwen3 Ascend tutorial](../ascend/qwen3-30b-a3b.md); for current ModelSlim
+W8A8 Full/Decode graph deployment and qualification scope, use the
+[graph guide](../ascend/decode-graphs.md).
 
 ## Before starting
 
@@ -73,8 +76,6 @@ Save the following as `/tmp/qwen-controller.yaml`:
 
 ```yaml
 inference:
-  hidden_dim: 2048
-  intermediate_dim: 768
   instance_name: qwen3-demo
   model_name: Qwen3-30B-A3B
 
@@ -102,7 +103,9 @@ controller:
 ```
 
 Port 5001 carries Worker registration, heartbeat, and weight control. Port 5002
-publishes Frontend topology. They are separate endpoints.
+publishes Frontend topology. They are separate endpoints. Controller scheduling
+reads model metadata from the Weight Server; the legacy Controller dimension
+fields are unnecessary.
 
 ## 3. Start metadata and the Weight Server
 
@@ -136,6 +139,10 @@ For every copy, set:
 - advertised addresses reachable by the Frontend and other Workers;
 - a unique, writable, direct-I/O-compatible absolute disk-cache path;
 - Controller port 5001 and the Weight Server address.
+
+Worker geometry, expert computation, clipping, and quantization are resolved from
+Weight Server metadata. The example's explicit model dimensions are optional
+assertions; omit them or keep them consistent with the checkpoint.
 
 The sample's 20 GiB device budget is only an example. Worker startup subtracts
 fixed input/output buffers, Backend temporary memory, conversion memory, and
@@ -215,20 +222,22 @@ uv run --package expertkit-torch pytest \
   ek-integration/expertkit_torch/tests/test_deployment_benchmark.py -m qwen
 ```
 
-## Current limits
+## CUDA tutorial scope and limits
 
 - Cross-host computation uses gRPC and copies Tensor bytes through Host memory.
   The experimental same-host SHM path removes protobuf Tensor payloads but
   still stages CUDA transfers through pinned Host memory. RDMA, NCCL, and
   NVSHMEM are not available.
-- Torch is the only Backend targeted for full migration qualification.
-- GGML is experimental and CPU-only. The fused Backend is experimental and
-  requires a compatible CUDA and Triton environment.
+- This migration tutorial targets the Torch backend. GGML is experimental and
+  CPU-only; the NVIDIA `fused` backend requires compatible CUDA and Triton.
+  Ascend `ascend_fused` is a separate backend covered by the Ascend guides.
 - The Controller does not relay computation as a fallback during topology
   changes. Frontend requests can receive retryable failures until a replacement
   topology is installed.
-- This guide uses the Transformers Frontend; a full Qwen-vLLM deployment has
-  not been qualified. Separately, vLLM 0.25.1 has completed a real
+- This guide uses the Transformers Frontend; its CUDA Qwen-vLLM deployment has
+  not been qualified. Ascend Qwen-vLLM graph qualification is recorded in the
+  [graph guide](../ascend/decode-graphs.md#hardware-qualification).
+  Separately, CUDA vLLM 0.25.1 has completed a real
   DeepSeek-V2-Lite 16-input/16-output-token run over gRPC. vLLM uses the shared
   `expertkit-transport` client, and SHM has Transport conformance coverage, but
   a real vLLM DeepSeek model has not yet completed an SHM end-to-end run.

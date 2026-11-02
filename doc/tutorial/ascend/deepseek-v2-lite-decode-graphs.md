@@ -1,8 +1,12 @@
-# DeepSeek-V2-Lite Ascend Decode graphs
+# Historical DeepSeek-V2-Lite Ascend Decode graphs
 
-For the current Docker runtime and startup commands, use the
-[Ascend Decode graph guide](decode-graphs.md). The checked-in Qwen3 and V4 examples
-use different model geometry and expert counts from DeepSeek-V2-Lite.
+This page preserves V2-Lite results from an earlier source-built runtime.
+For current Docker configuration and startup, use the
+[Qwen3/V4 Full and Decode graph guide](decode-graphs.md), including its
+[hardware qualification scope](decode-graphs.md#hardware-qualification).
+Those examples use different model geometry and expert counts; their results do
+not qualify V2-Lite on the current prebuilt runtime. For the CUDA/Transformers
+V2-Lite deployment, use the [standalone tutorial](../standalone/deepseek-v2-lite.md).
 
 ## V2-Lite model declaration
 
