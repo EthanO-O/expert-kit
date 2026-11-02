@@ -27,8 +27,6 @@ run:
   temperature: 0
   save_result: true
 ascend_decode_graph:
-  rendezvous_host: 192.0.2.10
-  rendezvous_port: 18090
   capture_sizes:
   - 1
   - 2

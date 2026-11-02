@@ -391,6 +391,7 @@ async def build_worker_application(
                 graph_config.control_listen,
                 begin=graph_execution.begin,
                 finish=graph_execution.finish,
+                rendezvous=graph_execution.rendezvous,
             )
 
         control = create_controller_supervisor(

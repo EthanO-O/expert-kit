@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,7 @@ from expertkit_transport.transports.ascend_graph.contracts import (
     GraphControlRejected,
     GraphStepCommand,
 )
+from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
 
 SERVICE = "expertkit.internal.AscendGraphControl"
 MAX_CONTROL_BYTES = 1024 * 1024
@@ -48,8 +50,9 @@ def decode_message(payload: bytes) -> dict[str, Any]:
 def control_handler(
     begin: GraphStepCommand,
     finish: GraphStepCommand,
+    rendezvous: GraphStepCommand | None = None,
 ) -> grpc.GenericRpcHandler:
-    """Bind the two coarse-step methods using the existing gRPC dependency."""
+    """Bind coarse-step and optional bootstrap methods on the same endpoint."""
 
     def bind(method):
         def invoke(payload, context):
@@ -68,16 +71,25 @@ def control_handler(
 
         return grpc.unary_unary_rpc_method_handler(invoke, response_serializer=encode_message)
 
+    methods = {"Begin": begin, "Finish": finish}
+    if rendezvous is not None:
+        methods["Rendezvous"] = rendezvous
     return grpc.method_handlers_generic_handler(
-        SERVICE,
-        {name: bind(method) for name, method in (("Begin", begin), ("Finish", finish))},
+        SERVICE, {name: bind(method) for name, method in methods.items()}
     )
 
 
 class GraphControlServer:
     """Own the bounded gRPC endpoint and RPC threads, without owning device work."""
 
-    def __init__(self, endpoint: str, *, begin: GraphStepCommand, finish: GraphStepCommand) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        begin: GraphStepCommand,
+        finish: GraphStepCommand,
+        rendezvous: GraphStepCommand | None = None,
+    ) -> None:
         self._endpoint = endpoint
         self._port: int | None = None
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ek-graph-control")
@@ -88,7 +100,7 @@ class GraphControlServer:
                 ("grpc.max_send_message_length", MAX_CONTROL_BYTES),
             ],
         )
-        self._server.add_generic_rpc_handlers((control_handler(begin, finish),))
+        self._server.add_generic_rpc_handlers((control_handler(begin, finish, rendezvous),))
 
     def start(self) -> int:
         """Bind and start Host control, returning the actual port for loopback clients."""
@@ -115,6 +127,7 @@ class _PeerControl:
     channel: grpc.Channel
     begin: Any
     finish: Any
+    rendezvous: Any
     worker_start_id: str | None = None
     ready_revision: int | None = None
 
@@ -147,7 +160,7 @@ class GraphStepControl:
                     request_serializer=encode_message,
                     response_deserializer=decode_message,
                 )
-                for name in ("Begin", "Finish")
+                for name in ("Begin", "Finish", "Rendezvous")
             ]
             self._peers.append(_PeerControl(channel, *methods, worker.expected_start_id))
         self._sequence = 0
@@ -155,6 +168,76 @@ class GraphStepControl:
         self._requests: list[dict[str, object]] = []
         self._poisoned = False
         self._deadline = 0.0
+        self._reservation: GraphRendezvousRequest | None = None
+
+    @classmethod
+    def reserve(
+        cls,
+        facts: dict[str, Any],
+        *,
+        monotonic_deadline: float,
+        require_current: Callable[[AscendGraphConfig], None] | None = None,
+    ) -> GraphStepControl:
+        """Resolve a live rank1 endpoint and retain cleanup ownership before PREPARE.
+
+        The facts contain a concrete host and requested port, with zero allowed
+        only here. The returned config is fully validated and shared by all ranks.
+        """
+        request = GraphRendezvousRequest.from_facts(facts)
+        channel = grpc.insecure_channel(request.worker.control_endpoint)
+        method = channel.unary_unary(
+            f"/{SERVICE}/Rendezvous",
+            request_serializer=encode_message,
+            response_deserializer=decode_message,
+        )
+        try:
+            remaining = monotonic_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("graph startup deadline expired before rendezvous")
+            reply = method(request.model_dump(mode="json"), timeout=remaining)
+            expected = {
+                "version": 1,
+                "state": "listening",
+                "reservation_id": request.reservation_id,
+                "session_id": request.session_id,
+                "worker_start_id": request.worker_start_id,
+                "rendezvous_host": request.rendezvous_host,
+            }
+            if (
+                set(reply) != {*expected, "rendezvous_port"}
+                or type(reply["version"]) is not int
+                or any(reply[key] != value for key, value in expected.items())
+                or type(reply["rendezvous_port"]) is not int
+                or not 1 <= reply["rendezvous_port"] <= 65535
+                or (request.rendezvous_port and reply["rendezvous_port"] != request.rendezvous_port)
+            ):
+                raise RuntimeError("invalid graph rendezvous reply or owner")
+            if time.monotonic() >= monotonic_deadline:
+                raise TimeoutError("graph startup deadline expired during rendezvous")
+            config = AscendGraphConfig.model_validate(
+                {**facts, "rendezvous_port": reply["rendezvous_port"]}
+            )
+            if require_current is not None:
+                require_current(config)
+            control = cls(
+                config,
+                require_current=(
+                    None if require_current is None else lambda: require_current(config)
+                ),
+            )
+            control._reservation = request
+            return control
+        except BaseException:
+            cls._release(method, request)
+            raise
+        finally:
+            channel.close()
+
+    @staticmethod
+    def _release(method: Any, request: GraphRendezvousRequest) -> None:
+        # The Worker independently expires unused listeners if this reply is lost.
+        with suppress(BaseException):
+            method(request.release_request(), timeout=min(1.0, request.timeout_seconds))
 
     @property
     def worker_start_id(self) -> str | None:
@@ -313,5 +396,8 @@ class GraphStepControl:
     def close(self) -> None:
         """Close Host channels without asserting any device completion."""
         self._poisoned = True
+        reservation, self._reservation = self._reservation, None
+        if reservation is not None:
+            self._release(self._peers[0].rendezvous, reservation)
         for peer in self._peers:
             peer.channel.close()

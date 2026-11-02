@@ -24,6 +24,10 @@ from expertkit_transport.transports.ascend_graph.contracts import (
     GraphCompletionUnproven,
     GraphControlRejected,
 )
+from expertkit_transport.transports.ascend_graph.rendezvous import (
+    GraphRendezvousRequest,
+    OwnedGraphRendezvous,
+)
 from expertkit_transport.transports.ascend_graph.session import HcclGraphSession
 from pydantic import ValidationError
 
@@ -88,6 +92,10 @@ class AscendDecodeGraphExecution:
         self._terminate = terminate
         self._weights: ResidentGraphWeights | None = None
         self._session: HcclGraphSession | None = None
+        self._rendezvous: OwnedGraphRendezvous | None = None
+        self._rendezvous_binding: GraphRendezvousRequest | None = None
+        self._rendezvous_deadline = 0.0
+        self._retired_reservation_id: str | None = None
         self._stream: Any = None
         self._graphs: dict[int | tuple[str, int], Any] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ek-decode-graph")
@@ -120,6 +128,7 @@ class AscendDecodeGraphExecution:
             if self._closed:
                 return
             self._closed = True
+            self._release_unused_rendezvous()
         self._stopped.set()
         if self._monitor is not None:
             await self._monitor
@@ -136,6 +145,155 @@ class AscendDecodeGraphExecution:
     @property
     def _timeout_seconds(self) -> float:
         return self.config.timeout_seconds if self.config is not None else self._shutdown_grace_secs
+
+    def _release_unused_rendezvous(self) -> None:
+        reservation = self._rendezvous
+        if reservation is not None and reservation.adopted:
+            return
+        request = reservation.request if reservation is not None else self._rendezvous_binding
+        if request is None:
+            return
+        if reservation is not None:
+            reservation.close()
+        self._retired_reservation_id = request.reservation_id
+        self._rendezvous = None
+        self._rendezvous_binding = None
+        if self._assignment_guard is not None:
+            self._assignment_guard.close()
+            self._assignment_guard = None
+
+    def _expire_rendezvous(self) -> None:
+        with self._lock:
+            reservation = self._rendezvous
+            if reservation is not None and reservation.adopted:
+                return
+            if reservation is None and self._rendezvous_binding is None:
+                return
+            deadline = (
+                reservation.deadline if reservation is not None else self._rendezvous_deadline
+            )
+            try:
+                assert self._assignment_guard is not None
+                self._assignment_guard.require_current()
+                if time.monotonic() < deadline:
+                    return
+            except RuntimeError:
+                pass
+            self._release_unused_rendezvous()
+
+    def rendezvous(self, request: dict[str, Any], *, timeout: float | None) -> dict[str, object]:
+        """Bind or release one Host-only listener without admitting device work.
+
+        A lost reply leaves the listener owned until the original deadline. Only
+        matching PREPARE can transfer it to the device session's lifetime.
+        """
+        try:
+            return self._rendezvous_command(request, timeout=timeout)
+        except (ValueError, RuntimeError) as error:
+            raise GraphControlRejected(str(error)) from error
+        except TimeoutError as error:
+            raise GraphAdmissionTimeout(str(error)) from error
+
+    def _rendezvous_command(
+        self, request: dict[str, Any], *, timeout: float | None
+    ) -> dict[str, object]:
+        with self._lock:
+            if not isinstance(request, dict):
+                raise ValueError("graph rendezvous request must be an object")
+            if request.get("action") == "release":
+                reservation = self._rendezvous
+                owner = reservation.request if reservation is not None else self._rendezvous_binding
+                if (
+                    type(request.get("version")) is not int
+                    or owner is None
+                    or request != owner.release_request()
+                ):
+                    raise ValueError("no matching graph rendezvous owner to release")
+                reply = {key: value for key, value in request.items() if key != "action"}
+                reply["state"] = (
+                    "attached" if reservation is not None and reservation.adopted else "released"
+                )
+                self._release_unused_rendezvous()
+                return reply
+            parsed = GraphRendezvousRequest.model_validate(request)
+            if (
+                self._closed
+                or self._poisoned
+                or self._pending is not None
+                or self.config is not None
+            ):
+                raise ValueError("graph session cannot reserve a listener")
+            if (
+                parsed.worker_start_id != self._worker_start_id
+                or parsed.worker.worker_id != self._worker_id
+                or parsed.worker.device != self._device_name
+                or parsed.instance_id != self._instance_id
+                or parsed.weight_version != self._weight_version
+                or any(
+                    not self._moe_layer_range[0] <= layer < self._moe_layer_range[1]
+                    for layer in parsed.layer_ids
+                )
+            ):
+                raise ValueError("graph rendezvous owner does not match the Worker")
+            if self._rendezvous is not None:
+                if parsed != self._rendezvous.request:
+                    raise ValueError("another graph session owns the rendezvous listener")
+                assert self._assignment_guard is not None
+                self._assignment_guard.require_current()
+                if time.monotonic() >= self._rendezvous.deadline:
+                    self._release_unused_rendezvous()
+                    raise ValueError("graph rendezvous reservation expired")
+                return self._rendezvous.reply()
+            if self._rendezvous_binding is not None:
+                raise ValueError("a graph rendezvous listener is already binding")
+            if parsed.reservation_id == self._retired_reservation_id:
+                raise ValueError("graph rendezvous reservation already ended")
+            budget = min(
+                parsed.timeout_seconds, timeout if timeout is not None else parsed.timeout_seconds
+            )
+            deadline = time.monotonic() + budget
+            guard = self._guard_assignments(parsed.worker, parsed.layer_ids)
+            try:
+                guard.require_current()
+            except BaseException:
+                guard.close()
+                raise
+            self._assignment_guard = guard
+            self._rendezvous_binding = parsed
+            self._rendezvous_deadline = deadline
+        reservation = None
+        try:
+            # Native address resolution/connect may block; never hold admission's lock here.
+            reservation = OwnedGraphRendezvous(
+                parsed, monotonic_deadline=deadline, bind_timeout_seconds=self._shutdown_grace_secs
+            )
+            with self._lock:
+                if (
+                    self._closed
+                    or self._poisoned
+                    or self._rendezvous_binding is not parsed
+                    or time.monotonic() >= deadline
+                ):
+                    raise ValueError("graph rendezvous reservation ended while binding")
+                guard.require_current()
+                self._rendezvous = reservation
+                self._rendezvous_binding = None
+                logger.info(
+                    "worker_graph_rendezvous_listening",
+                    worker_id=self._worker_id,
+                    start_id=self._worker_start_id,
+                    session_id=parsed.session_id,
+                    rendezvous_host=parsed.rendezvous_host,
+                    rendezvous_port=reservation.port,
+                )
+                return reservation.reply()
+        except BaseException:
+            if reservation is not None:
+                reservation.close()
+            with self._lock:
+                if self._rendezvous_binding is parsed:
+                    self._release_unused_rendezvous()
+            raise
 
     def _validate_request(
         self, request: dict[str, Any]
@@ -213,6 +371,12 @@ class AscendDecodeGraphExecution:
                 raise ValueError(
                     "graph session facts do not match the resolved Worker configuration"
                 )
+            if self._rendezvous_binding is not None or (rank != 1 and self._rendezvous is not None):
+                raise ValueError("another graph session owns this Worker's rendezvous reservation")
+            if rank == 1:
+                if self._rendezvous is None:
+                    raise ValueError("graph Rendezvous protocol 1 is required before rank1 PREPARE")
+                self._rendezvous.validate_config(config)
         else:
             if self.config is None or request["assignment_id"] != self._assignment_id:
                 raise ValueError("graph session is not prepared or its assignment digest changed")
@@ -271,7 +435,12 @@ class AscendDecodeGraphExecution:
                 if config is not None:
                     rank = config.worker_rank(self._worker_id)
                     assignment = config.participants[rank - 1]
-                    guard = self._guard_assignments(assignment, config.layer_ids)
+                    guard = (
+                        self._assignment_guard
+                        if rank == 1
+                        else self._guard_assignments(assignment, config.layer_ids)
+                    )
+                    assert guard is not None
                     try:
                         guard.require_current()
                     except BaseException:
@@ -282,6 +451,9 @@ class AscendDecodeGraphExecution:
                     self._rank = rank
                     self._assignment = assignment
                     self._assignment_guard = guard
+                    if rank == 1:
+                        assert self._rendezvous is not None
+                        self._rendezvous.adopted = True
             except (ValueError, RuntimeError) as error:
                 raise GraphControlRejected(str(error)) from error
             self._sequence = request["sequence"]
@@ -374,6 +546,11 @@ class AscendDecodeGraphExecution:
                             device=self._device,
                             hidden_dim=self._hidden_dim,
                             top_k=self._top_k,
+                            rendezvous_store=(
+                                self._rendezvous.store
+                                if self._rank == 1 and self._rendezvous is not None
+                                else None
+                            ),
                         )
                         for profile in self.config.capture_sizes:
                             self._session.buffers(profile)
@@ -423,6 +600,20 @@ class AscendDecodeGraphExecution:
             self._session.combine(buffers)
 
     def _destroy(self) -> None:
+        if (
+            self._weights is None
+            and self._session is None
+            and self._stream is None
+            and not self._graphs
+        ):
+            if self._rendezvous is not None:
+                self._rendezvous.close()
+                self._rendezvous = None
+            if self._assignment_guard is not None:
+                self._assignment_guard.close()
+                self._assignment_guard = None
+            return
+
         def completed() -> None:
             if self._stream is not None:
                 self._stream.synchronize()
@@ -437,6 +628,9 @@ class AscendDecodeGraphExecution:
             if self._session is not None:
                 self._session.close()
                 self._session = None
+            if self._rendezvous is not None:
+                self._rendezvous.close()
+                self._rendezvous = None
             if self._assignment_guard is not None:
                 self._assignment_guard.close()
                 self._assignment_guard = None
@@ -453,6 +647,7 @@ class AscendDecodeGraphExecution:
 
     async def _watch(self) -> None:
         while not self._stopped.is_set():
+            self._expire_rendezvous()
             pending = self._pending
             if pending is not None and time.monotonic() > self._deadline:
                 self._fatal("graph_step_deadline_expired")

@@ -109,8 +109,8 @@ class AscendGraphOptions(BaseModel):
     mode: Literal["decode", "full"] = "decode"
     capture_sizes: _CaptureSizes = (1, 2, 4, 8, 16, 32, 64)
     timeout_seconds: float = Field(default=120.0, gt=0, le=600, allow_inf_nan=False)
-    rendezvous_host: _RendezvousHost
-    rendezvous_port: StrictInt = Field(gt=0, le=65535)
+    rendezvous_host: _RendezvousHost | None = None
+    rendezvous_port: StrictInt | None = Field(default=None, gt=0, le=65535)
 
     @model_validator(mode="before")
     @classmethod

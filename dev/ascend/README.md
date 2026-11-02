@@ -108,8 +108,8 @@ overhead comparison.
 ## Ascend graphs
 
 `experiment.ascend_decode_graph` contains only Frontend graph choices: `mode`,
-`capture_sizes`, `timeout_seconds`, `rendezvous_host` and `rendezvous_port`.
-The shared options validator sorts and deduplicates capture sizes without adding
+`capture_sizes`, `timeout_seconds` and optional `rendezvous_host`/`rendezvous_port`
+overrides. The shared options validator sorts and deduplicates capture sizes without adding
 buckets. Omit the mapping for ordinary execution. See the
 [graph guide](../../doc/tutorial/ascend/decode-graphs.md) for the existing Qwen3/V4
 examples and pinned prebuilt runtime.
@@ -156,11 +156,14 @@ resolved allocation and compatible captures; Decode-only ordinary Prefill keeps
 its native token budget. Native startup reports effective limits.
 
 Multiple hosts and pools are accepted; known device and port collisions are
-checked per host. `rendezvous_host` is user-owned and must address the Worker
-selected as the first graph rank after READY selection, ordered by Worker ID.
-That Worker owns the TCPStore listener. The generator cannot infer its ownership
-offline and does not replace this address with the Frontend host. Multi-host
-configuration acceptance is not NPU qualification.
+checked per host. After READY selection, the first selected Worker in Worker-ID
+order binds and retains the graph TCPStore before the Frontend starts HCCL.
+By default, its advertised graph-control host supplies the rendezvous host and
+the OS assigns the actual listener port. Either `rendezvous_host` or
+`rendezvous_port` may be overridden independently. An explicit host must reach
+that Worker; an explicit port conflict fails without choosing another port.
+The generator checks rendezvous port collisions only when both overrides are
+known. Multi-host configuration acceptance is not NPU qualification.
 
 Keep graph execution/tracing settings compatible with the selected runtime.
 After related placement, weights or participating processes change, stop incoming
@@ -186,7 +189,8 @@ cp dev/ascend/configs/$profile/cluster.example.yaml dev/ascend/configs/cluster.y
 cp dev/ascend/configs/$profile/bench.example.yaml dev/ascend/configs/experiment.yaml
 ```
 
-Fill in model/results paths and replace `192.0.2.10` in both local inputs.
+Fill in model/results paths and replace `192.0.2.10` in the cluster input.
+If adding a rendezvous host override, update that address too.
 Keep `attention.devices: [0]` and use eight Workers: change the Qwen pool's
 `devices` to `[1, 2, 3, 4, 5, 6, 7, 8]`; the V4 pool already uses those devices.
 Add the directory containing `frozen.json` to `cluster.paths.datasets`:

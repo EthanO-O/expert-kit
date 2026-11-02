@@ -338,20 +338,37 @@ def _resolve_graph_config(runner: Any, options: AscendGraphOptions):
             max_capture_size=max(options.capture_sizes),
             monotonic_deadline=deadline,
         )
-        config = AscendGraphConfig(
-            **options.model_dump(),
-            session_id=uuid4().hex,
-            instance_id=instance.instance_id,
-            model_name=instance.model_name,
-            weight_version=weight_version,
-            model=model,
-            layer_ids=layers,
-            decode_capture_sizes=limits.decode_capture_sizes,
-            workers=workers,
-            source_topology_version=source_version,
+        host = options.rendezvous_host
+        if host is None:
+            host = workers[0].control_endpoint.rpartition(":")[0]
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+        facts = {
+            **options.model_dump(mode="json"),
+            "session_id": uuid4().hex,
+            "instance_id": instance.instance_id,
+            "model_name": instance.model_name,
+            "weight_version": weight_version,
+            "model": model.model_dump(mode="json"),
+            "layer_ids": list(layers),
+            "decode_capture_sizes": list(limits.decode_capture_sizes),
+            "workers": [worker.model_dump(mode="json") for worker in workers],
+            "source_topology_version": source_version,
+            "rendezvous_host": host,
+            "rendezvous_port": options.rendezvous_port or 0,
+        }
+        control = GraphStepControl.reserve(
+            facts, monotonic_deadline=deadline, require_current=subscription.require_current
         )
-        subscription.require_current(config)
-        return config, subscription, deadline
+        config = control.config
+        logger.info(
+            "frontend_graph_rendezvous_resolved",
+            session_id=config.session_id,
+            worker_id=config.workers[0].worker_id,
+            rendezvous_host=config.rendezvous_host,
+            rendezvous_port=config.rendezvous_port,
+        )
+        return config, subscription, deadline, control
     except BaseException:
         subscription.close()
         raise
@@ -372,15 +389,20 @@ class DecodeGraphSession:
         topology: GraphTopologySubscription | None = None,
         attention: Any = None,
         startup_deadline: float | None = None,
+        control: GraphStepControl | None = None,
     ) -> None:
         self.config = config
         self._topology = topology
         self._startup_deadline = startup_deadline
-        self._control = GraphStepControl(
-            config,
-            require_current=(
-                None if topology is None else lambda: topology.require_current(config)
-            ),
+        self._control = (
+            control
+            if control is not None
+            else GraphStepControl(
+                config,
+                require_current=(
+                    None if topology is None else lambda: topology.require_current(config)
+                ),
+            )
         )
         self._data: HcclGraphSession | None = None
         self._deadline: float | None = None
@@ -698,7 +720,7 @@ def install_decode_graph_wrapper(options: AscendGraphOptions) -> None:
                 )
             session = wrapper.__dict__.get("_expertkit_decode_session")
             if session is None:
-                config, topology, deadline = _resolve_graph_config(runner, options)
+                config, topology, deadline, control = _resolve_graph_config(runner, options)
                 adapter = None
                 try:
                     if _is_v4_full(config):
@@ -712,12 +734,17 @@ def install_decode_graph_wrapper(options: AscendGraphOptions) -> None:
                         topology=topology,
                         attention=adapter,
                         startup_deadline=deadline,
+                        control=control,
                     )
                     wrapper.__dict__["_expertkit_decode_session"] = session
                 except BaseException as error:
                     # Retain failed constructors' unpublished native resources too.
                     retain_until_process_exit(error)
-                    topology.close()
+                    try:
+                        if control is not None:
+                            control.close()
+                    finally:
+                        topology.close()
                     raise
             config = session.config
             token = _PROFILE.set(True)

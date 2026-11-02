@@ -180,8 +180,8 @@ def test_benchmark_examples_render_full_graphs_and_frozen_sharegpt_cli(
         "mode": "full",
         "capture_sizes": captures,
         "timeout_seconds": 600.0,
-        "rendezvous_host": "192.0.2.10",
-        "rendezvous_port": 18090,
+        "rendezvous_host": None,
+        "rendezvous_port": None,
     }
     serve = _read(tmp_path, "vllm-serve.yaml")
     is_v4 = profile == "deepseek-v4-flash-w8a8"
@@ -567,6 +567,7 @@ def test_known_deployment_conflicts_fail_before_rendering(tmp_path, generator, c
     elif case == "peer-transport":
         pool["start_peer_port"] = pool["start_worker_port"]
     elif case == "rendezvous":
+        experiment["ascend_decode_graph"]["rendezvous_host"] = "192.0.2.10"
         experiment["ascend_decode_graph"]["rendezvous_port"] = pool["start_graph_control_port"]
     elif case == "device":
         pool["devices"] = [1, 1]
@@ -693,3 +694,21 @@ def test_native_optional_settings_reject_types_without_coercion(tmp_path, genera
     with pytest.raises(ValueError):
         generator(tmp_path / "output", cluster, experiment)
     assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"rendezvous_host": "192.0.2.99"},
+        {"rendezvous_port": 18090},
+        {"rendezvous_host": "192.0.2.99", "rendezvous_port": 18090},
+    ],
+)
+def test_generator_preserves_independent_rendezvous_overrides(tmp_path, generator, overrides):
+    cluster, experiment = _inputs()
+    experiment["ascend_decode_graph"].update(overrides)
+    generator(tmp_path, cluster, experiment)
+    options = json.loads((tmp_path / "ascend-decode-graph.json").read_text())
+    assert options["rendezvous_host"] == overrides.get("rendezvous_host")
+    assert options["rendezvous_port"] == overrides.get("rendezvous_port")

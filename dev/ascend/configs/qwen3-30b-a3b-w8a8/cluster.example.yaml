@@ -48,7 +48,7 @@ pools:
     start_worker_port: 53234
     start_peer_port: 54234
     start_graph_control_port: 18079
-# Replace every 192.0.2.10 address in both inputs with the host's routable IP.
+# Replace every 192.0.2.10 address below with the host's routable IP.
 nodes:
   node-a:
     address: 192.0.2.10

@@ -172,7 +172,8 @@ class TemplateContext(BaseModel):
             claim(str(pool.node.address), ports)
         if self.ascend_decode_graph is not None:
             graph = self.ascend_decode_graph
-            claim(graph.rendezvous_host, [graph.rendezvous_port])
+            if graph.rendezvous_host is not None and graph.rendezvous_port is not None:
+                claim(graph.rendezvous_host, [graph.rendezvous_port])
         return self
 
     @model_validator(mode="after")

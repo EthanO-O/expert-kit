@@ -76,8 +76,6 @@ ascend_decode_graph:
   mode: decode
   capture_sizes: [1, 2, 4, 8, 16, 32, 64]
   timeout_seconds: 600.0
-  rendezvous_host: 192.0.2.10
-  rendezvous_port: 18090
 ```
 
 Do not add `session_id`, `instance_id`, `model`, `layer_ids`, expert ranges or
@@ -97,11 +95,19 @@ still supply the previous Frontend defaults for omitted `serve` options; explici
 values take precedence, and `null` leaves the corresponding native key absent.
 
 The graph's TCPStore listener belongs to the first selected Worker rank, ordered
-by Worker ID after READY replica selection. `rendezvous_host` must address that
-Worker's host. On multiple hosts, check the actual selected participants; the
-Frontend is not automatically the listener. The generator preserves this explicit
-address and checks known collisions, but cannot establish runtime rank ownership.
-Multi-host configuration acceptance does not establish hardware qualification.
+by Worker ID after READY replica selection. That Worker binds and retains the
+listener before returning its live endpoint over the existing graph-control
+connection. The Frontend then shares one final configuration with every rank
+before HCCL initialization. By default, the host comes from that Worker's
+advertised graph-control endpoint and the OS assigns the port during binding.
+
+`rendezvous_host` and `rendezvous_port` are independent optional overrides. An
+explicit host must reach the selected Worker. An explicit port conflict fails;
+it does not silently select another port. Unused listeners are released after
+startup failure or timeout; an adopted listener stays owned until graph teardown.
+The internal startup handshake requires matching Frontend and Worker versions;
+older explicit user configurations remain valid. Multi-host configuration
+acceptance does not establish hardware qualification.
 
 ### Full graphs and native serving capacity
 
@@ -120,8 +126,6 @@ ascend_decode_graph:
   mode: full
   capture_sizes: [64, 128, 256]
   timeout_seconds: 600.0
-  rendezvous_host: 192.0.2.10
-  rendezvous_port: 18090
 ```
 
 Only these graph sizes are captured; smaller steps use the smallest compatible

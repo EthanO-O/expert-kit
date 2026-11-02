@@ -34,6 +34,7 @@ class HcclGraphSession:
         device: torch.device,
         hidden_dim: int,
         top_k: int,
+        rendezvous_store: distributed.TCPStore | None = None,
     ) -> None:
         world_size = len(config.participants) + 1
         if not 0 <= rank < world_size or device.type != "npu":
@@ -48,14 +49,23 @@ class HcclGraphSession:
         timeout = timedelta(seconds=config.timeout_seconds)
         # Worker owns the store listener; it can acknowledge preparation before
         # the Frontend connects without touching the default vLLM rendezvous.
-        self._store = distributed.TCPStore(
-            config.rendezvous_host,
-            config.rendezvous_port,
-            world_size,
-            is_master=rank == 1,
-            timeout=timeout,
-            wait_for_workers=False,
+        if rank == 1 and rendezvous_store is None:
+            raise ValueError("rank1 requires its retained rendezvous store before HCCL creation")
+        if rank != 1 and rendezvous_store is not None:
+            raise ValueError("only rank1 can own the rendezvous listener")
+        self._store = (
+            rendezvous_store
+            if rank == 1
+            else distributed.TCPStore(
+                config.rendezvous_host,
+                config.rendezvous_port,
+                world_size,
+                is_master=False,
+                timeout=timeout,
+                wait_for_workers=False,
+            )
         )
+        self._store.set_timeout(timeout)
         self._prefix_store = distributed.PrefixStore(config.session_id, self._store)
         from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 

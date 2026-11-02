@@ -43,7 +43,5 @@ run:
     seed: 0
 ascend_decode_graph:
   mode: full
-  rendezvous_host: 192.0.2.10
-  rendezvous_port: 18090
   capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
   timeout_seconds: 600.0

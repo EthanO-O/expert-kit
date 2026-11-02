@@ -96,6 +96,20 @@ def execution():
         asyncio.run(owner.close())
 
 
+def _reserve_execution(execution, config=None):
+    from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
+
+    facts = (config or execution._test_config).model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    reply = execution.rendezvous(
+        GraphRendezvousRequest.from_facts(facts).model_dump(mode="json"), timeout=2
+    )
+    execution._test_config = AscendGraphConfig.model_validate(
+        {**facts, "rendezvous_port": reply["rendezvous_port"]}
+    )
+    return execution._test_config
+
+
 def request_for(execution, *, finishing=False, **updates):
     """Construct the full initial snapshot or a compact subsequent command."""
     config = execution.config or execution._test_config
@@ -605,14 +619,14 @@ def test_prepare_uses_actual_sparse_layers_within_metadata_range(
         assert execution.config is None
         return
 
-    execution.begin(request, timeout=2)
+    config = _reserve_execution(execution, config)
+    execution.begin(request_for(execution), timeout=2)
     execution.finish(dict(execution._pending_request), timeout=2)
     assert execution.config is not None
     layers = execution.config.layer_ids
     assert layers == (1, 5)
     execution._guard_assignments.assert_called_once_with(config.participants[0], layers)
     execution._prepare_weights.assert_called_once_with(config.participants[0], layers)
-    assert execution._guard_assignments.call_args.args[1] is layers
     assert execution._prepare_weights.call_args.args[1] is layers
 
 
@@ -620,12 +634,18 @@ def test_v2_real_control_binds_once_and_finishes_compactly(execution, monkeypatc
     from expertkit_transport.ascend_graph import GraphStepControl
 
     events, _guard, weights = _fake_device(execution, monkeypatch)
-    server = GraphControlServer("127.0.0.1:0", begin=execution.begin, finish=execution.finish)
+    server = GraphControlServer(
+        "127.0.0.1:0",
+        begin=execution.begin,
+        finish=execution.finish,
+        rendezvous=execution.rendezvous,
+    )
     port = server.start()
     data = execution._test_config.model_dump(mode="json")
     data["workers"][0]["control_endpoint"] = f"127.0.0.1:{port}"
-    config = AscendGraphConfig.model_validate(data)
-    control = GraphStepControl(config)
+    data["rendezvous_port"] = 0
+    control = GraphStepControl.reserve(data, monotonic_deadline=time.monotonic() + 2)
+    config = control.config
     try:
         assert execution.config is None and execution._rank is None
         control.begin("prepare")
@@ -727,6 +747,7 @@ def test_prepare_rejects_wrong_digest_and_initial_start_before_binding(execution
 def test_guard_is_rechecked_after_acquisition_before_hccl(execution, monkeypatch):
     events, guard, weights = _fake_device(execution, monkeypatch)
     execution._guard_assignments.return_value = guard
+    _reserve_execution(execution)
     guard.require_current.side_effect = [None, None, RuntimeError("selected target removed")]
     with pytest.raises(GraphCompletionUnproven):
         execution.begin(request_for(execution), timeout=2)
@@ -735,6 +756,7 @@ def test_guard_is_rechecked_after_acquisition_before_hccl(execution, monkeypatch
     guard.close.assert_not_called()
     execution._closed = True
     execution._executor.shutdown(wait=True)
+    execution._rendezvous.close()
 
 
 def test_expired_step_quarantines_without_detaching_assignment_guard(execution, monkeypatch):
@@ -778,11 +800,11 @@ def test_v4_decode_phase_uses_derived_membership_not_256(execution):
         execution._validate_request({**request, "capacity": 1024})
 
 
-def test_missing_selected_target_rejects_prepare_before_device_work(execution):
+def test_missing_selected_target_rejects_rendezvous_before_device_work(execution):
     execution._guard_assignments = Mock(side_effect=RuntimeError("not a Controller target"))
     execution._prepare_weights = Mock()
     with pytest.raises(GraphControlRejected, match="Controller target"):
-        execution.begin(request_for(execution), timeout=2)
+        _reserve_execution(execution)
     assert execution.config is None and execution._pending is None
     execution._prepare_weights.assert_not_called()
 
@@ -820,3 +842,377 @@ def test_invalidation_teardown_keeps_the_original_active_step_deadline(execution
     guard.close.assert_not_called()
     execution._closed = True
     executor.shutdown(wait=True)
+
+
+def _assert_port_held(port):
+    with socket.socket() as probe, pytest.raises(OSError):
+        probe.bind(("127.0.0.1", port))
+
+
+def _assert_port_released(port):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", port))
+
+
+def test_reservation_duplicate_does_not_renew_and_foreign_commands_cannot_release(execution):
+    from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
+
+    config = _reserve_execution(execution)
+    reservation = execution._rendezvous
+    deadline = reservation.deadline
+    request = reservation.request.model_dump(mode="json")
+    assert execution.rendezvous(request, timeout=2)["rendezvous_port"] == config.rendezvous_port
+    assert reservation.deadline == deadline
+    for update in (
+        {"session_id": "foreign-session-00001"},
+        {"worker_start_id": "old-start"},
+        {"reservation_id": "f" * 64},
+        {"version": True},
+    ):
+        with pytest.raises(GraphControlRejected):
+            execution.rendezvous({**reservation.request.release_request(), **update}, timeout=2)
+        _assert_port_held(config.rendezvous_port)
+    foreign = GraphRendezvousRequest.from_facts(
+        {**config.model_dump(mode="json"), "session_id": "foreign-session-00001"}
+    )
+    with pytest.raises(GraphControlRejected):
+        execution.rendezvous(foreign.model_dump(mode="json"), timeout=2)
+    assert execution._rendezvous is reservation
+    execution.rendezvous(reservation.request.release_request(), timeout=2)
+    _assert_port_released(config.rendezvous_port)
+    with pytest.raises(GraphControlRejected, match="already ended"):
+        execution.rendezvous(request, timeout=2)
+
+
+@pytest.mark.parametrize(
+    "change", ["session_id", "rendezvous_host", "rendezvous_port", "capture_sizes", "rank"]
+)
+def test_foreign_prepare_cannot_adopt_or_displace_live_reservation(execution, change):
+    config = _reserve_execution(execution)
+    reservation, guard = execution._rendezvous, execution._assignment_guard
+    facts = config.model_dump(mode="json")
+    if change == "session_id":
+        facts["session_id"] = "foreign-session-00001"
+    elif change == "rendezvous_host":
+        facts["rendezvous_host"] = "127.0.0.2"
+    elif change == "rendezvous_port":
+        facts["rendezvous_port"] = config.rendezvous_port % 65535 + 1
+    elif change == "capture_sizes":
+        facts["capture_sizes"] = facts["decode_capture_sizes"] = [1]
+    else:
+        facts["workers"][0]["experts_by_layer"] = [[2, 3]]
+        facts["workers"].insert(
+            0,
+            {
+                "worker_id": "before-worker",
+                "expected_start_id": "other-start",
+                "device": "npu:1",
+                "control_endpoint": "127.0.0.1:12347",
+                "experts_by_layer": [[0, 1]],
+            },
+        )
+    changed = AscendGraphConfig.model_validate(facts)
+    with pytest.raises(GraphControlRejected, match="reservation"):
+        execution.begin(
+            request_for(execution, config=facts, assignment_id=changed.assignment_id), timeout=2
+        )
+    assert execution._rendezvous is reservation and execution._assignment_guard is guard
+    assert not reservation.adopted and execution.config is None and execution._pending is None
+    guard.close.assert_not_called()
+    _assert_port_held(config.rendezvous_port)
+
+
+@pytest.mark.parametrize("reason", ["expiry", "invalidation"])
+def test_unused_listener_released_without_waiting_for_ordinary_device(
+    execution, monkeypatch, reason
+):
+    config = _reserve_execution(execution)
+    reservation, guard = execution._rendezvous, execution._assignment_guard
+    if reason == "expiry":
+        reservation.deadline = time.monotonic() - 1
+    else:
+        guard.require_current.side_effect = RuntimeError("target removed")
+    with execution._admission.use():
+        execution._expire_rendezvous()
+        assert execution._rendezvous is None and execution._assignment_guard is None
+        _assert_port_released(config.rendezvous_port)
+    guard.close.assert_called_once()
+
+
+def test_shutdown_releases_unused_listener_even_while_native_bind_is_blocked(
+    execution, monkeypatch
+):
+    from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
+
+    import expertkit_worker.execution.decode_graph as module
+
+    entered, release = threading.Event(), threading.Event()
+    original = module.OwnedGraphRendezvous
+    bound_ports = []
+
+    def blocked(request, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        reservation = original(request, **kwargs)
+        bound_ports.append(reservation.port)
+        return reservation
+
+    monkeypatch.setattr(module, "OwnedGraphRendezvous", blocked)
+    facts = execution._test_config.model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    request = GraphRendezvousRequest.from_facts(facts).model_dump(mode="json")
+    with ThreadPoolExecutor(1) as caller:
+        pending = caller.submit(execution.rendezvous, request, timeout=2)
+        try:
+            assert entered.wait(2)
+            guard = execution._assignment_guard
+            # Host-only shutdown must not acquire ordinary device admission.
+            with execution._admission.use():
+                asyncio.run(asyncio.wait_for(execution.close(), timeout=1))
+            guard.close.assert_called_once()
+            assert execution._rendezvous_binding is None
+        finally:
+            release.set()
+        with pytest.raises(GraphControlRejected, match="ended while binding"):
+            pending.result(timeout=2)
+    assert len(bound_ports) == 1
+    _assert_port_released(bound_ports[0])
+
+
+def test_prepare_failure_before_stream_creation_releases_adopted_host_resources(
+    execution, monkeypatch
+):
+    _events, guard, _weights = _fake_device(execution, monkeypatch)
+    config = _reserve_execution(execution)
+    monkeypatch.setattr(
+        torch.npu, "set_device", Mock(side_effect=RuntimeError("device unavailable"))
+    )
+    with pytest.raises(GraphCompletionUnproven):
+        execution.begin(request_for(execution), timeout=2)
+    assert execution._rendezvous.adopted and execution._stream is None
+    asyncio.run(execution.close())
+    guard.close.assert_called_once()
+    assert execution._rendezvous is None
+    _assert_port_released(config.rendezvous_port)
+
+
+def test_real_grpc_bootstrap_shares_one_final_config_and_preserves_adopted_store(
+    execution, monkeypatch
+):
+    from expertkit_transport.ascend_graph import GraphStepControl
+
+    _fake_device(execution, monkeypatch)
+    second = AscendDecodeGraphExecution(
+        instance_id=execution._instance_id,
+        model_name=execution._model_name,
+        weight_version=execution._weight_version,
+        model=execution._model,
+        moe_layer_range=execution._moe_layer_range,
+        worker_id="worker-z",
+        worker_start_id="start-two",
+        device=torch.device("cpu"),
+        device_name="npu:1",
+        max_batch_tokens=2048,
+        shutdown_grace_secs=2.0,
+        admission=DeviceAdmission(),
+        prepare_weights=Mock(),
+        guard_assignments=Mock(),
+        terminate=Mock(),
+    )
+    _fake_device(second, monkeypatch)
+    servers = [
+        GraphControlServer(
+            "127.0.0.1:0",
+            begin=owner.begin,
+            finish=owner.finish,
+            rendezvous=owner.rendezvous,
+        )
+        for owner in (execution, second)
+    ]
+    ports = [server.start() for server in servers]
+    facts = execution._test_config.model_dump(mode="json")
+    facts["workers"] = [
+        {
+            "worker_id": worker,
+            "expected_start_id": start,
+            "device": f"npu:{rank}",
+            "control_endpoint": f"127.0.0.1:{port}",
+            "experts_by_layer": [experts],
+        }
+        for rank, (worker, start, port, experts) in enumerate(
+            [
+                ("worker", "start-one", ports[0], [0, 2]),
+                ("worker-z", "start-two", ports[1], [1, 3]),
+            ]
+        )
+    ]
+    facts["rendezvous_port"] = 0
+    control = None
+    try:
+        control = GraphStepControl.reserve(facts, monotonic_deadline=time.monotonic() + 2)
+        config = control.config
+        assert execution._session is None and second._session is None
+        _assert_port_held(config.rendezvous_port)
+        reservation = execution._rendezvous
+        deadline = reservation.deadline
+        control.begin("prepare")
+        control.finish()
+        assert execution.config == second.config == config
+        assert execution._session.config.assignment_id == second._session.config.assignment_id
+        assert execution._session.options["rendezvous_store"] is reservation.store
+        assert second._session.options["rendezvous_store"] is None
+        assert (
+            execution.rendezvous(reservation.request.release_request(), timeout=2)["state"]
+            == "attached"
+        )
+        assert reservation.deadline == deadline and reservation.adopted
+        reservation.deadline = time.monotonic() - 1
+        execution._expire_rendezvous()
+        _assert_port_held(config.rendezvous_port)
+        control.begin("warmup", 1)
+        control.finish()
+        control.begin("close")
+        control.finish()
+        assert execution._rendezvous is None and execution._assignment_guard is None
+        _assert_port_released(config.rendezvous_port)
+    finally:
+        if control is not None:
+            control.close()
+        for server in servers:
+            server.close()
+        asyncio.run(second.close())
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong-start", "wrong-host", "bool-port", "extra", "lost-reply", "interrupt"]
+)
+def test_real_grpc_bad_or_lost_bootstrap_reply_releases_only_its_owner(execution, failure):
+    from expertkit_transport.ascend_graph import GraphStepControl
+
+    bound_ports = []
+
+    def rendezvous(request, *, timeout):
+        reply = execution.rendezvous(request, timeout=timeout)
+        if request["action"] == "release":
+            return reply
+        bound_ports.append(reply["rendezvous_port"])
+        if failure == "wrong-start":
+            return {**reply, "worker_start_id": "restarted"}
+        if failure == "wrong-host":
+            return {**reply, "rendezvous_host": "127.0.0.2"}
+        if failure == "bool-port":
+            return {**reply, "rendezvous_port": True}
+        if failure == "extra":
+            return {**reply, "unrecognized": 1}
+        if failure == "lost-reply":
+            raise GraphCompletionUnproven("reply could not be delivered")
+        return reply
+
+    def interrupted(_config):
+        raise KeyboardInterrupt("Frontend startup interrupted")
+
+    server = GraphControlServer(
+        "127.0.0.1:0", begin=execution.begin, finish=execution.finish, rendezvous=rendezvous
+    )
+    port = server.start()
+    facts = execution._test_config.model_dump(mode="json")
+    facts["workers"][0]["control_endpoint"] = f"127.0.0.1:{port}"
+    facts["rendezvous_port"] = 0
+    try:
+        with pytest.raises((RuntimeError, grpc.RpcError, KeyboardInterrupt)):
+            GraphStepControl.reserve(
+                facts,
+                monotonic_deadline=time.monotonic() + 2,
+                require_current=interrupted if failure == "interrupt" else None,
+            )
+        assert len(bound_ports) == 1 and execution._rendezvous is None
+        assert execution.config is None and execution._assignment_guard is None
+        _assert_port_released(bound_ports[0])
+    finally:
+        server.close()
+
+
+def test_cancelled_bootstrap_rpc_leaves_listener_owned_until_unused_expiry(execution):
+    from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
+
+    bound, release_reply = threading.Event(), threading.Event()
+
+    def rendezvous(request, *, timeout):
+        reply = execution.rendezvous(request, timeout=timeout)
+        bound.set()
+        assert release_reply.wait(2)
+        return reply
+
+    server = GraphControlServer(
+        "127.0.0.1:0", begin=execution.begin, finish=execution.finish, rendezvous=rendezvous
+    )
+    port = server.start()
+    facts = execution._test_config.model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    request = GraphRendezvousRequest.from_facts(facts)
+    try:
+        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            method = channel.unary_unary(
+                f"/{SERVICE}/Rendezvous",
+                request_serializer=encode_message,
+                response_deserializer=decode_message,
+            )
+            pending = method.future(request.model_dump(mode="json"), timeout=2)
+            assert bound.wait(2)
+            held_port = execution._rendezvous.port
+            pending.cancel()
+            _assert_port_held(held_port)
+            execution._rendezvous.deadline = time.monotonic() - 1
+            execution._expire_rendezvous()
+            _assert_port_released(held_port)
+            assert execution.config is None
+    finally:
+        release_reply.set()
+        server.close()
+
+
+def test_rank1_prepare_without_new_handshake_fails_before_admission(execution):
+    with pytest.raises(GraphControlRejected, match="Rendezvous protocol 1"):
+        execution.begin(request_for(execution), timeout=2)
+    assert execution.config is None and execution._pending is None
+    assert execution._assignment_guard is None
+
+
+def test_reservation_uses_rpc_remaining_budget_without_renewing_it(execution):
+    from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
+
+    facts = execution._test_config.model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    request = GraphRendezvousRequest.from_facts(facts).model_dump(mode="json")
+    before = time.monotonic()
+    reply = execution.rendezvous(request, timeout=0.5)
+    after = time.monotonic()
+    deadline = execution._rendezvous.deadline
+    assert before + 0.5 <= deadline <= after + 0.5
+    assert execution.rendezvous(request, timeout=2) == reply
+    assert execution._rendezvous.deadline == deadline
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"version": True},
+        {"version": 2},
+        {"worker_start_id": "stale"},
+        {"instance_id": 2},
+        {"rendezvous_port": True},
+        {"unknown": 1},
+    ],
+)
+def test_invalid_reservation_rejected_before_listener_or_device_ownership(execution, update):
+    from expertkit_transport.transports.ascend_graph.rendezvous import GraphRendezvousRequest
+
+    facts = execution._test_config.model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    request = GraphRendezvousRequest.from_facts(facts).model_dump(mode="json")
+    execution._guard_assignments = Mock()
+    with pytest.raises(GraphControlRejected):
+        execution.rendezvous({**request, **update}, timeout=2)
+    assert execution._rendezvous is None and execution._rendezvous_binding is None
+    assert execution._pending is None and execution.config is None
+    execution._guard_assignments.assert_not_called()

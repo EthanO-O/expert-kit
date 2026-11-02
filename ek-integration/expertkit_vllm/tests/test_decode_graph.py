@@ -298,7 +298,7 @@ def graph_runtime(monkeypatch, request):
 
     def resolve(*args):
         events.append("resolve-runtime")
-        return config, topology, None
+        return config, topology, None, None
 
     monkeypatch.setattr(graph, "_resolve_graph_config", resolve)
     graph.install_decode_graph_wrapper(_options(config))
@@ -1283,8 +1283,18 @@ def test_options_environment_rejects_old_placement_document(tmp_path, monkeypatc
         graph.graph_config_from_environment()
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"rendezvous_host": "host"},
+        {"rendezvous_port": 1234},
+        {"rendezvous_host": "host", "rendezvous_port": 1234},
+    ],
+)
+@pytest.mark.parametrize("control_host", ["127.0.0.1", "[::1]"])
 def test_startup_resolves_native_facts_and_ready_assignments_once(
-    modelslim_graph_deployment, monkeypatch
+    modelslim_graph_deployment, monkeypatch, overrides, control_host
 ):
     runtime, existing = modelslim_graph_deployment
     calls = []
@@ -1292,9 +1302,7 @@ def test_startup_resolves_native_facts_and_ready_assignments_once(
     runtime.scheduler_config.max_num_scheduled_tokens = 24
     runtime.compilation_config.cudagraph_capture_sizes = [3, 7, 12]
     runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
-    options = AscendGraphOptions(
-        mode="full", capture_sizes=(3, 7, 12), rendezvous_host="host", rendezvous_port=1234
-    )
+    options = AscendGraphOptions(mode="full", capture_sizes=(3, 7, 12), **overrides)
 
     def resolve(endpoint, *, requested_instance_id, monotonic_deadline):
         calls.append(("instance", endpoint, requested_instance_id, monotonic_deadline))
@@ -1306,7 +1314,11 @@ def test_startup_resolves_native_facts_and_ready_assignments_once(
 
         def start(self, **kwargs):
             calls.append(("start", kwargs))
-            return 9, "ready-version", existing.workers
+            workers = tuple(
+                worker.model_copy(update={"control_endpoint": f"{control_host}:12345"})
+                for worker in existing.workers
+            )
+            return 9, "ready-version", workers
 
         def require_current(self, config):
             calls.append(("current", config))
@@ -1318,7 +1330,21 @@ def test_startup_resolves_native_facts_and_ready_assignments_once(
     monkeypatch.setattr(graph, "GraphTopologySubscription", Topology)
     monkeypatch.setenv("EK_ADDR", "controller:5002")
     runner = SimpleNamespace(vllm_config=runtime, max_num_reqs=8, max_num_tokens=32)
-    config, topology, deadline = graph._resolve_graph_config(runner, options)
+
+    def reserve(facts, *, monotonic_deadline, require_current):
+        assert facts["rendezvous_host"] == overrides.get(
+            "rendezvous_host", control_host.strip("[]")
+        )
+        assert facts["rendezvous_port"] == overrides.get("rendezvous_port", 0)
+        config = AscendGraphConfig.model_validate(
+            {**facts, "rendezvous_port": facts["rendezvous_port"] or 32123}
+        )
+        require_current(config)
+        return SimpleNamespace(config=config)
+
+    monkeypatch.setattr(graph.GraphStepControl, "reserve", reserve)
+    config, topology, deadline, control = graph._resolve_graph_config(runner, options)
+    assert control.config is config
     assert config.model == existing.model and config.layer_ids == existing.layer_ids
     assert config.instance_id == 7 and config.model_name == "controller-model"
     assert config.weight_version == "ready-version" and config.source_topology_version == 9
@@ -1505,7 +1531,7 @@ def test_failed_hccl_constructor_retains_unpublished_resources(graph_runtime, mo
             raise RuntimeError("partially created HCCL")
 
     monkeypatch.setattr(graph, "HcclGraphSession", FailedData)
-    config, topology, _deadline = graph._resolve_graph_config(None, None)
+    config, topology, _deadline, _control = graph._resolve_graph_config(None, None)
 
     def fail():
         with pytest.raises(RuntimeError, match="partially created HCCL"):
@@ -1542,3 +1568,27 @@ def test_host_phase_does_not_bypass_native_descriptor_eligibility(graph_runtime,
     ):
         runner.execute_model(SimpleNamespace(num_scheduled_tokens=scheduled))
     assert events == []
+
+
+@pytest.mark.parametrize("graph_runtime", ["v4-full"], indirect=True)
+def test_attention_setup_failure_releases_bootstrap_before_prepare(graph_runtime, monkeypatch):
+    events, _context, runner, _wrapper = graph_runtime
+    config, topology, deadline, _control = graph._resolve_graph_config(None, None)
+    control = SimpleNamespace(close=lambda: events.append("reservation-release"))
+    monkeypatch.setattr(
+        graph, "_resolve_graph_config", lambda *_: (config, topology, deadline, control)
+    )
+
+    def fail(*_):
+        raise RuntimeError("attention setup failed")
+
+    monkeypatch.setattr(
+        sys.modules["expertkit_vllm.v4_full_attention"], "install_v4_full_attention", fail
+    )
+    with pytest.raises(RuntimeError, match="attention setup failed"):
+        runner.profile_run()
+    assert events.count("reservation-release") == 1
+    assert "topology-close" in events
+    assert not any(
+        isinstance(event, tuple) and event[:2] == ("begin", "prepare") for event in events
+    )

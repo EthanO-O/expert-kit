@@ -244,6 +244,7 @@ def test_factory_selects_graph_resident_from_validated_recipe(
         "0.0.0.0:18079",
         begin=graph_factory.return_value.begin,
         finish=graph_factory.return_value.finish,
+        rendezvous=graph_factory.return_value.rendezvous,
     )
     for resident in resident_types:
         resident.assert_not_called()

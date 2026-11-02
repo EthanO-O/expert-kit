@@ -1113,3 +1113,131 @@ def test_limits_report_actual_buffer_conflict(mode, requests, tokens, reason):
         resolve_graph_limits(
             options, allocated_requests=requests, allocated_tokens=tokens, scheduled_tokens=24
         )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"rendezvous_host": "host"},
+        {"rendezvous_port": 1234},
+        {"rendezvous_host": "host", "rendezvous_port": 1234},
+    ],
+)
+def test_user_rendezvous_overrides_are_independently_optional(overrides):
+    options = AscendGraphOptions(**overrides)
+    assert options.rendezvous_host == overrides.get("rendezvous_host")
+    assert options.rendezvous_port == overrides.get("rendezvous_port")
+    for name in ("rendezvous_host", "rendezvous_port"):
+        facts = config_for().model_dump(mode="json")
+        facts[name] = None
+        with pytest.raises(ValidationError):
+            AscendGraphConfig.model_validate(facts)
+    with pytest.raises(ValidationError):
+        config_for(rendezvous_port=0)
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, True, "1234"])
+def test_optional_rendezvous_port_still_rejects_invalid_override(port):
+    with pytest.raises(ValidationError):
+        AscendGraphOptions(rendezvous_port=port)
+
+
+def test_real_tcpstore_reservation_retains_ephemeral_listener_and_releases():
+    import socket
+    import time
+    from datetime import timedelta
+
+    from torch.distributed import TCPStore
+
+    from expertkit_transport.transports.ascend_graph.rendezvous import (
+        GraphRendezvousRequest,
+        OwnedGraphRendezvous,
+    )
+
+    facts = config_for(rendezvous_port=12346).model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    request = GraphRendezvousRequest.from_facts(facts)
+    first = OwnedGraphRendezvous(request, monotonic_deadline=time.monotonic() + 2)
+    second_request = GraphRendezvousRequest.from_facts(
+        {**facts, "session_id": "another-cpu-session-0002"}
+    )
+    second = OwnedGraphRendezvous(second_request, monotonic_deadline=time.monotonic() + 2)
+    client = None
+    try:
+        assert 0 < first.port <= 65535 and first.port != second.port
+        client = TCPStore("127.0.0.1", first.port, 2, False, timedelta(seconds=1))
+        first.store.set("owned", "live")
+        assert client.get("owned") == b"live"
+        final = AscendGraphConfig.model_validate({**facts, "rendezvous_port": first.port})
+        first.validate_config(final)
+        with pytest.raises(ValueError, match="reservation"):
+            first.validate_config(
+                final.model_copy(update={"session_id": second_request.session_id})
+            )
+        with socket.socket() as probe, pytest.raises(OSError):
+            probe.bind(("127.0.0.1", first.port))
+        conflict = GraphRendezvousRequest.from_facts({**facts, "rendezvous_port": first.port})
+        with pytest.raises(RuntimeError):
+            OwnedGraphRendezvous(conflict, monotonic_deadline=time.monotonic() + 2)
+        second.close()
+        assert client.get("owned") == b"live"
+        client = None
+        first.close()
+        with socket.socket() as released:
+            released.bind(("127.0.0.1", first.port))
+    finally:
+        client = None
+        first.close()
+        second.close()
+
+
+def test_rank1_hccl_reuses_retained_store_without_rebinding(monkeypatch):
+    import sys
+    import time
+    from types import SimpleNamespace
+
+    from expertkit_transport.transports.ascend_graph.rendezvous import (
+        GraphRendezvousRequest,
+        OwnedGraphRendezvous,
+    )
+    from expertkit_transport.transports.ascend_graph.session import HcclGraphSession
+
+    facts = config_for().model_dump(mode="json")
+    facts["rendezvous_port"] = 0
+    reservation = OwnedGraphRendezvous(
+        GraphRendezvousRequest.from_facts(facts),
+        monotonic_deadline=time.monotonic() + 2,
+        bind_timeout_seconds=0.1,
+    )
+    assert reservation.store.timeout.total_seconds() == 0.1
+    config = AscendGraphConfig.model_validate({**facts, "rendezvous_port": reservation.port})
+
+    class ProcessGroup:
+        Options = SimpleNamespace
+
+        def __init__(self, store, rank, world_size, options):
+            store.set("group", "constructed")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu._C._distributed_c10d",
+        SimpleNamespace(ProcessGroupHCCL=ProcessGroup),
+    )
+    session = None
+    try:
+        session = HcclGraphSession(
+            config,
+            rank=1,
+            device=SimpleNamespace(type="npu"),
+            hidden_dim=config.model.hidden_dim,
+            top_k=config.model.top_k,
+            rendezvous_store=reservation.store,
+        )
+        assert session._store is reservation.store
+        assert reservation.store.timeout.total_seconds() == config.timeout_seconds
+        assert reservation.store.get(f"{config.session_id}/group") == b"constructed"
+    finally:
+        if session is not None:
+            session.close()
+        reservation.close()
