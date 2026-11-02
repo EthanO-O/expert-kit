@@ -63,11 +63,19 @@ ascend_decode_graph:
 
 Do not add `session_id`, `instance_id`, `model`, `layer_ids`, expert ranges or
 Workers here. Frontend bootstrap creates a fresh session from native vLLM/Hugging
-Face model facts and the Controller's READY topology. Workers resolve omitted
-geometry from Weight Server metadata, validate explicit model declarations, and
-check PREPARE against the resolved facts.
-The examples retain their quantization/export hints for native Frontend loading.
-Neither the generator nor the user needs a second HF parser or placement list.
+Face model facts and the Controller's READY topology. Workers resolve geometry,
+expert computation, clipping and quantization from Weight Server metadata,
+validate optional explicit model assertions, and check PREPARE against the
+resolved facts. The examples omit these repeated model facts. Neither the
+generator nor the user needs a second HF parser or placement list.
+
+Native Frontend loading options are separate `serve` fields. Both W8A8 examples
+set `quantization: ascend`. V4 additionally sets `load_format: safetensors`,
+`safetensors_load_strategy: lazy`, `distributed_executor_backend: mp`,
+`trust_remote_code: false` and `compilation_mode: VLLM_COMPILE`. Compilation modes
+may be native strings or integers. Older explicit model quantization/V4 hints
+still supply the previous Frontend defaults for omitted `serve` options; explicit
+values take precedence, and `null` leaves the corresponding native key absent.
 
 The graph's TCPStore listener belongs to the first selected Worker rank, ordered
 by Worker ID after READY replica selection. `rendezvous_host` must address that

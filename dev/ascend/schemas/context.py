@@ -104,7 +104,10 @@ class TemplateContext(BaseModel):
             expert=expert,
             model=model,
             dataset=dataset,
-            serve=experiment.serve,
+            serve=experiment.serve.with_legacy_model_defaults(
+                experiment.model,
+                graph_enabled=experiment.ascend_decode_graph is not None,
+            ),
             run=run,
             tracing=experiment.tracing,
             ascend_decode_graph=experiment.ascend_decode_graph,

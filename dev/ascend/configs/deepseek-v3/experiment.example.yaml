@@ -1,12 +1,8 @@
+# Worker model facts are resolved from Weight Server metadata at startup.
 model:
   name: DeepSeek-V3-BF16
   path_ref: deepseek-v3-bf16
   weight_version: main
-  num_layers: 61
-  experts_per_layer: 256
-  hidden_dim: 7168
-  intermediate_dim: 2048
-  topk: 8
   weight_dtype: bf16
   activation_dtype: bf16
 

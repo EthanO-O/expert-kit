@@ -1,12 +1,8 @@
+# Worker model facts are resolved from Weight Server metadata at startup.
 model:
   name: Qwen3-30B-A3B
   path_ref: qwen3-30b-a3b
   weight_version: main
-  num_layers: 48
-  experts_per_layer: 128
-  hidden_dim: 2048
-  intermediate_dim: 768
-  topk: 8
   weight_dtype: bf16
   activation_dtype: bf16
 

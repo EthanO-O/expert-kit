@@ -79,7 +79,7 @@ topology keeps attention and control together and uses one pool per expert node.
 
 `experiment.yaml` describes what to run:
 
-- model identity, shape, dtypes, and `path_ref`;
+- model identity, dtypes, `path_ref`, and optional model-fact assertions;
 - dataset parser, label name, and optional `path_ref`;
 - vLLM serving limits;
 - optional `tracing` settings for Frontend and Worker traces;
@@ -130,11 +130,21 @@ assignments and replicas do not need a second placement manifest. The old
 `schedule graph` command now fails with migration instructions before accessing
 configuration or services.
 
-Model dimensions may be omitted from the generator input; Worker startup fills
-them from Weight Server metadata before complete validation. Explicit dimensions
-and computation declarations remain assertions and must match metadata. Current
-W8A8 examples retain their export/quantization hints for native Frontend loading.
-The generator performs no network lookup or additional Hugging Face parsing.
+Worker startup resolves model dimensions, expert computation, clipping and
+quantization from Weight Server metadata before complete validation. Examples
+omit these repeated facts. Explicit model declarations remain optional assertions
+and must match metadata. The generator performs no network lookup or additional
+Hugging Face parsing.
+
+Native Frontend loading options belong under `serve`: `quantization`,
+`load_format`, `safetensors_load_strategy`, `distributed_executor_backend`,
+`trust_remote_code` and `compilation_mode`. The W8A8 examples set
+`serve.quantization: ascend`; V4 also specifies its native loading and compilation
+options. `compilation_mode` accepts a native string or integer mode. Existing
+explicit `model.quantization` and `model.expert_compute: deepseek_v4` declarations
+retain their previous Frontend defaults when the corresponding `serve` option is
+omitted. An explicit `serve` value takes precedence, including `false`; `null`
+suppresses the compatibility default and leaves that native key absent.
 
 `serve.max_num_seqs`, `max_num_batched_tokens`, `max_num_scheduled_tokens`,
 `block_size`, `num_gpu_blocks_override`, `kv_cache_memory_bytes` and

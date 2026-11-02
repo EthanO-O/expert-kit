@@ -136,18 +136,15 @@ expert:
 
 ## 3. Configure the experiment
 
-Use the original model layer IDs and routed-expert geometry from `config.json`:
+Workers resolve the original model layer IDs and routed-expert geometry from
+Weight Server metadata. Optional explicit dimensions are assertions checked
+against that metadata; they are not required in `experiment.yaml`:
 
 ```yaml
 model:
   name: DeepSeek-V3-BF16
   path_ref: deepseek-v3-bf16
   weight_version: main
-  num_layers: 61
-  experts_per_layer: 256
-  hidden_dim: 7168
-  intermediate_dim: 2048
-  topk: 8
   weight_dtype: bf16
   activation_dtype: bf16
 

@@ -10,6 +10,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    StrictStr,
     computed_field,
     model_validator,
 )
@@ -190,6 +191,41 @@ class ServeConfig(ConfigModel):
     num_gpu_blocks_override: StrictInt | None = None
     kv_cache_memory_bytes: StrictInt | None = None
     enable_chunked_prefill: StrictBool | None = None
+    quantization: StrictStr | None = None
+    load_format: StrictStr | None = None
+    safetensors_load_strategy: StrictStr | None = None
+    distributed_executor_backend: StrictStr | None = None
+    trust_remote_code: StrictBool | None = None
+    compilation_mode: StrictStr | StrictInt | None = None
+
+    def with_legacy_model_defaults(
+        self, model: ModelConfig, *, graph_enabled: bool
+    ) -> Self:
+        """Preserve legacy loading options unless a native setting is explicit.
+
+        Explicit null suppresses a compatibility default and leaves the native
+        option absent. Model declarations remain independent Worker assertions.
+        """
+        defaults: dict[str, Any] = {}
+        if model.quantization is not None:
+            defaults["quantization"] = "ascend"
+        if model.expert_compute == "deepseek_v4":
+            defaults.update(
+                load_format="safetensors",
+                safetensors_load_strategy="lazy",
+                distributed_executor_backend="mp",
+            )
+            if graph_enabled:
+                defaults["compilation_mode"] = "VLLM_COMPILE"
+        if graph_enabled:
+            defaults["trust_remote_code"] = model.expert_compute != "deepseek_v4"
+        return self.model_copy(
+            update={
+                key: value
+                for key, value in defaults.items()
+                if key not in self.model_fields_set
+            }
+        )
 
 
 class RunConfig(ConfigModel):

@@ -16,6 +16,15 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 ASCEND = ROOT / "dev/ascend"
 SHAPES = ("num_layers", "experts_per_layer", "hidden_dim", "intermediate_dim", "topk")
+MODEL_FACTS = (*SHAPES, "expert_compute", "swiglu_limit", "quantization")
+NATIVE_LOADING = (
+    "quantization",
+    "load_format",
+    "safetensors_load_strategy",
+    "distributed_executor_backend",
+    "trust_remote_code",
+    "compilation_mode",
+)
 
 
 def _inputs(profile="qwen3-30b-a3b-w8a8"):
@@ -92,7 +101,7 @@ def test_checked_in_examples_generate_frontend_options_and_local_worker_endpoint
     assert len(workers) == count
     for index, path in enumerate(workers):
         worker = yaml.safe_load(path.read_text())
-        assert not set(SHAPES).intersection(worker["model"])
+        assert not set(MODEL_FACTS).intersection(worker["model"])
         assert "expert_intermediate_dim" not in worker["model"] and "top_k" not in worker["model"]
         assert "instance_id" not in worker["model"]
         assert worker["worker"]["device"] == "npu:0"
@@ -116,11 +125,37 @@ def test_checked_in_examples_generate_frontend_options_and_local_worker_endpoint
     serve = _read(output, "vllm-serve.yaml")
     assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
     assert serve["quantization"] == "ascend"
+    assert serve["async-scheduling"] is False
+    assert serve["enable-prefix-caching"] is False
+    assert serve["dtype"] == "bfloat16"
     assert "max-num-seqs" not in serve and "max-num-batched-tokens" not in serve
     assert "block-size" not in serve and "num-gpu-blocks-override" not in serve
     if profile.startswith("deepseek"):
         assert serve["distributed-executor-backend"] == "mp"
         assert serve["load-format"] == "safetensors"
+        assert serve["safetensors-load-strategy"] == "lazy"
+        assert serve["trust-remote-code"] is False
+        assert serve["compilation-config"]["mode"] == "VLLM_COMPILE"
+    else:
+        assert serve["trust-remote-code"] is True
+        assert "mode" not in serve["compilation-config"]
+
+
+@pytest.mark.parametrize("profile", ("qwen3-30b-a3b", "deepseek-v3"))
+def test_bf16_examples_omit_model_assertions_and_native_loading_options(
+    tmp_path, generator, profile
+):
+    cluster, experiment = _inputs(profile)
+    assert not set(MODEL_FACTS).intersection(experiment["model"])
+    generator(tmp_path, cluster, experiment)
+    for path in tmp_path.glob("*/workers/*.yaml"):
+        model = yaml.safe_load(path.read_text())["model"]
+        assert set(model) == {"name", "weight_version", "activation_dtype", "weight_dtype"}
+    controller = _read(tmp_path, "controller.yaml")["inference"]
+    assert "hidden_dim" not in controller and "intermediate_dim" not in controller
+    serve = _read(tmp_path, "vllm-serve.yaml")
+    assert not {field.replace("_", "-") for field in NATIVE_LOADING}.intersection(serve)
+    assert "compilation-config" not in serve
 
 
 @pytest.mark.parametrize("mode", ("decode", "full"))
@@ -152,9 +187,88 @@ def test_exact_captures_and_optional_native_flags_are_not_derived_from_graphs(
     assert serve["enable-chunked-prefill"] is False
 
 
+@pytest.mark.parametrize("graph_enabled", (False, True))
+@pytest.mark.parametrize("profile", ("qwen3-30b-a3b-w8a8", "deepseek-v4-flash-w8a8"))
+def test_legacy_model_hints_preserve_native_frontend_defaults(
+    tmp_path, generator, profile, graph_enabled
+):
+    cluster, experiment = _inputs(profile)
+    if not graph_enabled:
+        experiment.pop("ascend_decode_graph")
+    for field in NATIVE_LOADING:
+        experiment["serve"].pop(field, None)
+    is_v4 = profile == "deepseek-v4-flash-w8a8"
+    experiment["model"].update(
+        expert_compute="deepseek_v4" if is_v4 else "swiglu",
+        quantization=dict(type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True),
+    )
+    original = copy.deepcopy(experiment)
+    generator(tmp_path, cluster, experiment)
+    assert experiment == original
+    serve = _read(tmp_path, "vllm-serve.yaml")
+    assert serve["quantization"] == "ascend"
+    for field, value in (
+        ("load-format", "safetensors"),
+        ("safetensors-load-strategy", "lazy"),
+        ("distributed-executor-backend", "mp"),
+    ):
+        assert serve.get(field) == (value if is_v4 else None)
+    if graph_enabled:
+        assert serve["trust-remote-code"] is (not is_v4)
+        assert serve["compilation-config"].get("mode") == ("VLLM_COMPILE" if is_v4 else None)
+    else:
+        assert "trust-remote-code" not in serve
+        assert "compilation-config" not in serve
+
+
+@pytest.mark.parametrize("use_null", (False, True))
+@pytest.mark.parametrize("profile", ("qwen3-30b-a3b-w8a8", "deepseek-v4-flash-w8a8"))
+def test_explicit_native_settings_override_legacy_hints_including_false_and_null(
+    tmp_path, generator, profile, use_null
+):
+    cluster, experiment = _inputs(profile)
+    experiment["model"].update(
+        expert_compute="deepseek_v4" if profile == "deepseek-v4-flash-w8a8" else "swiglu",
+        quantization=dict(type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True),
+    )
+    values = dict(
+        quantization="custom",
+        load_format="auto",
+        safetensors_load_strategy="eager",
+        distributed_executor_backend="uni",
+        trust_remote_code=False,
+        compilation_mode=0,
+    )
+    experiment["serve"].update(dict.fromkeys(values) if use_null else values)
+    generator(tmp_path, cluster, experiment)
+    serve = _read(tmp_path, "vllm-serve.yaml")
+    for field, value in values.items():
+        target = serve["compilation-config"] if field == "compilation_mode" else serve
+        key = "mode" if field == "compilation_mode" else field.replace("_", "-")
+        if use_null:
+            assert key not in target
+        else:
+            assert target[key] == value
+    assert serve["compilation-config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+    assert serve["compilation-config"]["cudagraph_capture_sizes"] == [1, 2, 4, 8, 16, 32, 64]
+
+
+@pytest.mark.parametrize("mode", ("VLLM_COMPILE", 0))
+def test_explicit_native_compilation_mode_is_supported_without_graphs(tmp_path, generator, mode):
+    cluster, experiment = _inputs()
+    experiment.pop("ascend_decode_graph")
+    experiment["serve"]["compilation_mode"] = mode
+    generator(tmp_path, cluster, experiment)
+    assert _read(tmp_path, "vllm-serve.yaml")["compilation-config"] == {"mode": mode}
+
+
 @pytest.mark.parametrize("explicit", (False, True))
+@pytest.mark.parametrize(
+    "profile",
+    ("qwen3-30b-a3b", "deepseek-v3", "qwen3-30b-a3b-w8a8", "deepseek-v4-flash-w8a8"),
+)
 def test_generated_model_facts_are_optional_assertions_resolved_by_weight_server(
-    tmp_path, generator, monkeypatch, explicit
+    tmp_path, generator, monkeypatch, explicit, profile
 ):
     from expertkit_worker.weights import metadata as module
     from expertkit_worker.weights.metadata import (
@@ -163,9 +277,14 @@ def test_generated_model_facts_are_optional_assertions_resolved_by_weight_server
         resolve_worker_config,
     )
 
-    cluster, experiment = _inputs()
-    for field in ("expert_compute", "swiglu_limit", "quantization"):
-        experiment["model"].pop(field, None)
+    cluster, experiment = _inputs(profile)
+    is_v4 = profile == "deepseek-v4-flash-w8a8"
+    is_quantized = profile.endswith("w8a8")
+    compute = "deepseek_v4" if is_v4 else "swiglu"
+    limit = 10.0 if is_v4 else 0.0
+    recipe = dict(type="modelslim-w8a8-dynamic", bits=8, group_size=None, symmetric=True)
+    quantization = recipe if is_quantized else None
+    assert not set(MODEL_FACTS).intersection(experiment["model"])
     if explicit:
         experiment["model"].update(
             num_layers=48,
@@ -173,13 +292,15 @@ def test_generated_model_facts_are_optional_assertions_resolved_by_weight_server
             hidden_dim=2048,
             intermediate_dim=768,
             topk=8,
-            expert_compute="swiglu",
-            swiglu_limit=0.0,
+            expert_compute=compute,
+            swiglu_limit=limit,
+            quantization=quantization,
         )
     generator(tmp_path, cluster, experiment)
     document = _read(tmp_path, "worker-pool1/workers/worker-00.yaml")
     for field in ("expert_compute", "swiglu_limit"):
         assert (field in document["model"]) == explicit
+    assert ("quantization" in document["model"]) == (explicit and is_quantized)
     assert ("hidden_dim" in document["model"]) == explicit
     controller = _read(tmp_path, "controller.yaml")["inference"]
     assert ("hidden_dim" in controller) == explicit
@@ -191,7 +312,7 @@ def test_generated_model_facts_are_optional_assertions_resolved_by_weight_server
         )
         return ModelMetadata(
             schema_version=1,
-            model_type="qwen3_moe",
+            model_type="deepseek_v4" if is_v4 else "qwen3_moe",
             num_layers=48,
             moe_layer_start=0,
             moe_layer_end=48,
@@ -200,16 +321,36 @@ def test_generated_model_facts_are_optional_assertions_resolved_by_weight_server
             expert_intermediate_dim=768,
             top_k=8,
             activation_dtype="bf16",
-            quantization=QuantizationMetadata("modelslim-w8a8-dynamic", 8, None, True, None),
+            quantization=(
+                QuantizationMetadata("modelslim-w8a8-dynamic", 8, None, True, None)
+                if is_quantized
+                else None
+            ),
+            expert_compute=compute,
+            swiglu_limit=limit,
         )
 
     monkeypatch.setattr(module, "fetch_model_metadata", fetch)
     resolved = asyncio.run(resolve_worker_config(document))
     assert resolved.config.model.hidden_dim == 2048
     assert resolved.config.model.top_k == 8
-    document["model"]["hidden_dim"] = 4096
-    with pytest.raises(ValueError, match="hidden_dim conflicts"):
-        asyncio.run(resolve_worker_config(document))
+    assert resolved.config.model.expert_compute == compute
+    assert resolved.config.model.swiglu_limit == limit
+    if is_quantized:
+        assert resolved.config.model.quantization.model_dump(mode="json") == quantization
+    else:
+        assert resolved.config.model.quantization is None
+    assert resolved.metadata is not None
+    for field, value in (
+        ("hidden_dim", 4096),
+        ("expert_compute", "swiglu" if is_v4 else "deepseek_v4"),
+        ("swiglu_limit", limit + 1),
+        ("quantization", None if is_quantized else recipe),
+    ):
+        conflicting = copy.deepcopy(document)
+        conflicting["model"][field] = value
+        with pytest.raises(ValueError, match=f"{field} conflicts"):
+            asyncio.run(resolve_worker_config(conflicting))
 
 
 @pytest.mark.parametrize("cross_host", (False, True))
@@ -362,7 +503,7 @@ def test_graph_benchmark_options_still_reach_native_cli(tmp_path, generator):
 
 def test_v4_omitted_clipping_assertion_is_not_rendered_as_zero(tmp_path, generator):
     cluster, experiment = _inputs("deepseek-v4-flash-w8a8")
-    experiment["model"].pop("swiglu_limit")
+    experiment["model"]["expert_compute"] = "deepseek_v4"
     generator(tmp_path, cluster, experiment)
     model = _read(tmp_path, "worker-pool1/workers/worker-00.yaml")["model"]
     assert model["expert_compute"] == "deepseek_v4"
@@ -379,6 +520,13 @@ def test_v4_omitted_clipping_assertion_is_not_rendered_as_zero(tmp_path, generat
         ("num_gpu_blocks_override", 13.0),
         ("kv_cache_memory_bytes", "1G"),
         ("enable_chunked_prefill", 1),
+        ("quantization", True),
+        ("load_format", 1),
+        ("safetensors_load_strategy", False),
+        ("distributed_executor_backend", []),
+        ("trust_remote_code", "false"),
+        ("compilation_mode", True),
+        ("compilation_mode", 1.5),
     ),
 )
 def test_native_optional_settings_reject_types_without_coercion(tmp_path, generator, field, value):

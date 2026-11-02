@@ -61,18 +61,15 @@ In `cluster.yaml`, set `paths.models.qwen3-30b-a3b` to
 `<RESULTS_DIR>`. Keep `backend: ascend_fused` on both expert pools for the BF16
 fused-operator path described in the common tutorial.
 
-Keep the Qwen model block in `experiment.yaml` and select ShareGPT:
+Keep the Qwen model block in `experiment.yaml` and select ShareGPT. Workers
+resolve model geometry from Weight Server metadata; optional explicit dimensions
+are assertions checked against that metadata:
 
 ```yaml
 model:
   name: Qwen3-30B-A3B
   path_ref: qwen3-30b-a3b
   weight_version: main
-  num_layers: 48
-  experts_per_layer: 128
-  hidden_dim: 2048
-  intermediate_dim: 768
-  topk: 8
   weight_dtype: bf16
   activation_dtype: bf16
 

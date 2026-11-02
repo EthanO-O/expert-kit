@@ -5,7 +5,7 @@ port: {{ attention.vllm_port if transport.type == "transfer_engine" or ascend_de
 gpu-memory-utilization: {{ serve.gpu_memory_utilization }}
 max-model-len: {{ serve.max_model_len }}
 data-parallel-size: {{ attention.dp_size }}
-{% for field in ["max_num_seqs", "max_num_batched_tokens", "max_num_scheduled_tokens", "block_size", "num_gpu_blocks_override", "kv_cache_memory_bytes", "enable_chunked_prefill"] %}
+{% for field in ["max_num_seqs", "max_num_batched_tokens", "max_num_scheduled_tokens", "block_size", "num_gpu_blocks_override", "kv_cache_memory_bytes", "enable_chunked_prefill", "quantization", "load_format", "safetensors_load_strategy", "distributed_executor_backend", "trust_remote_code"] %}
 {% if serve[field] is not none %}
 {{ field | replace("_", "-") }}: {{ serve[field] | tojson }}
 {% endif %}
@@ -13,27 +13,18 @@ data-parallel-size: {{ attention.dp_size }}
 {% if serve.enforce_eager or tracing.enabled %}
 enforce-eager: true
 {% endif %}
-{% if model.quantization is not none %}
-quantization: ascend
-{% endif %}
-{% if model.expert_compute == "deepseek_v4" %}
-load-format: safetensors
-safetensors-load-strategy: lazy
-distributed-executor-backend: mp
-{% endif %}
 {% if ascend_decode_graph %}
 async-scheduling: false
 enable-prefix-caching: false
 dtype: bfloat16
-{% if model.expert_compute == "deepseek_v4" %}
-trust-remote-code: false
-{% else %}
-trust-remote-code: true
 {% endif %}
+{% if ascend_decode_graph or serve.compilation_mode is not none %}
 compilation-config:
-{% if model.expert_compute == "deepseek_v4" %}
-  mode: VLLM_COMPILE
+{% if serve.compilation_mode is not none %}
+  mode: {{ serve.compilation_mode | tojson }}
 {% endif %}
+{% if ascend_decode_graph %}
   cudagraph_mode: {{ "FULL" if ascend_decode_graph.mode == "full" else "FULL_DECODE_ONLY" }}
   cudagraph_capture_sizes: {{ ascend_decode_graph.capture_sizes | tojson }}
+{% endif %}
 {% endif %}

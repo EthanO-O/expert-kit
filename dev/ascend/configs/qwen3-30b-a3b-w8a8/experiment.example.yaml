@@ -1,23 +1,17 @@
-# Worker model geometry is resolved from Weight Server metadata at startup.
+# Worker model facts are resolved from Weight Server metadata at startup.
 model:
   name: Qwen3-30B-A3B-w8a8
   path_ref: qwen3-30b-a3b-w8a8
   weight_version: main
   weight_dtype: bf16
   activation_dtype: bf16
-  expert_compute: swiglu
-  swiglu_limit: 0.0
-  quantization:
-    type: modelslim-w8a8-dynamic
-    bits: 8
-    group_size: null
-    symmetric: true
 dataset:
   type: random
   name: Random
 serve:
   gpu_memory_utilization: 0.8
   max_model_len: 4096
+  quantization: ascend
 run:
   num_prompts: 4
   max_concurrency: 1
