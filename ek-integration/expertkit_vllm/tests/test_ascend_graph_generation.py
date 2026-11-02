@@ -130,6 +130,15 @@ def test_checked_in_examples_generate_frontend_options_and_local_worker_endpoint
     assert serve["dtype"] == "bfloat16"
     assert "max-num-seqs" not in serve and "max-num-batched-tokens" not in serve
     assert "block-size" not in serve and "num-gpu-blocks-override" not in serve
+    assert "seed" not in serve
+    bench = _read(output, "vllm-bench.yaml")
+    assert not {
+        "seed",
+        "request-rate",
+        "disable-shuffle",
+        "no-oversample",
+        "extra-body",
+    }.intersection(bench)
     if profile.startswith("deepseek"):
         assert serve["distributed-executor-backend"] == "mp"
         assert serve["load-format"] == "safetensors"
@@ -139,6 +148,155 @@ def test_checked_in_examples_generate_frontend_options_and_local_worker_endpoint
     else:
         assert serve["trust-remote-code"] is True
         assert "mode" not in serve["compilation-config"]
+
+
+@pytest.mark.parametrize("profile", ("qwen3-30b-a3b-w8a8", "deepseek-v4-flash-w8a8"))
+def test_benchmark_examples_render_full_graphs_and_frozen_sharegpt_cli(
+    tmp_path, generator, profile
+):
+    from bench_launcher import to_cmd
+
+    cluster, _ = _inputs(profile)
+    experiment = yaml.safe_load((ASCEND / "configs" / profile / "bench.example.yaml").read_text())
+    cluster["pools"][0]["devices"] = list(range(1, 9))
+    cluster["paths"]["datasets"]["sharegpt"] = "/data/frozen-sharegpt"
+    assert cluster["expert"]["backend"] == "ascend_fused"
+    assert cluster["attention"]["devices"] == [0]
+    assert not set(MODEL_FACTS).intersection(experiment["model"])
+    assert "input_len" not in experiment["run"]
+    generator(tmp_path, cluster, experiment)
+    workers = sorted((tmp_path / "worker-pool1/workers").glob("*.yaml"))
+    assert len(workers) == 8
+    for path in workers:
+        assert set(yaml.safe_load(path.read_text())["model"]) == {
+            "name",
+            "weight_version",
+            "activation_dtype",
+            "weight_dtype",
+        }
+    graph = json.loads((tmp_path / "ascend-decode-graph.json").read_text())
+    captures = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    assert graph == {
+        "mode": "full",
+        "capture_sizes": captures,
+        "timeout_seconds": 600.0,
+        "rendezvous_host": "192.0.2.10",
+        "rendezvous_port": 18090,
+    }
+    serve = _read(tmp_path, "vllm-serve.yaml")
+    is_v4 = profile == "deepseek-v4-flash-w8a8"
+    for field, value in {
+        "gpu-memory-utilization": 0.8,
+        "max-model-len": 8192,
+        "max-num-seqs": 256,
+        "max-num-batched-tokens": 2048,
+        "enable-chunked-prefill": True,
+        "block-size": 128,
+        "kv-cache-memory-bytes": 12884901888 if is_v4 else 17179869184,
+        "quantization": "ascend",
+        "trust-remote-code": not is_v4,
+        "async-scheduling": False,
+        "enable-prefix-caching": False,
+        "dtype": "bfloat16",
+        "seed": 0,
+    }.items():
+        assert serve[field] == value
+    compilation = {"cudagraph_mode": "FULL", "cudagraph_capture_sizes": captures}
+    if is_v4:
+        compilation["mode"] = "VLLM_COMPILE"
+        assert serve["num-gpu-blocks-override"] == 2048
+        assert serve["load-format"] == "safetensors"
+        assert serve["safetensors-load-strategy"] == "lazy"
+        assert serve["distributed-executor-backend"] == "mp"
+    else:
+        assert "num-gpu-blocks-override" not in serve
+    assert serve["compilation-config"] == compilation
+    benchmark = _read(tmp_path, "compose.attention.yaml")["services"]["benchmark"]
+    assert "/data/frozen-sharegpt:/workload:ro" in benchmark["volumes"]
+    bench = _read(tmp_path, "vllm-bench.yaml")
+    for field, value in {
+        "dataset-name": "sharegpt",
+        "dataset-path": "/workload/frozen.json",
+        "output-len": 128,
+        "num-prompts": 256,
+        "max-concurrency": 64,
+        "num-warmups": 0,
+        "ignore-eos": True,
+        "temperature": 0,
+        "save-result": True,
+        "save-detailed": True,
+        "percentile-metrics": "ttft,tpot,itl,e2el",
+        "metric-percentiles": "50,99",
+        "ready-check-timeout-sec": 0,
+        "seed": 0,
+        "request-rate": "inf",
+        "disable-shuffle": True,
+        "no-oversample": True,
+    }.items():
+        assert bench[field] == value
+    assert "input-len" not in bench
+    assert isinstance(bench["extra-body"], str)
+    command = to_cmd(tmp_path / "vllm-bench.yaml")
+    assert json.loads(command[command.index("--extra-body") + 1]) == {"seed": 0}
+    for flag in ("--disable-shuffle", "--no-oversample", "--ignore-eos", "--save-detailed"):
+        assert flag in command
+    for flag, value in (("--seed", "0"), ("--request-rate", "inf"), ("--output-len", "128")):
+        assert command[command.index(flag) + 1] == value
+
+
+@pytest.mark.parametrize("explicit_null", (False, True))
+def test_optional_benchmark_fields_preserve_null_false_and_json_values(
+    tmp_path, generator, explicit_null
+):
+    from bench_launcher import to_cmd
+
+    cluster, experiment = _inputs()
+    values = dict(
+        seed=0,
+        request_rate=2.5,
+        disable_shuffle=False,
+        no_oversample=False,
+        extra_body={"seed": 0, "options": [True, None, {"text": 'a "quote"'}]},
+    )
+    experiment["run"].update(dict.fromkeys(values) if explicit_null else values)
+    experiment["serve"]["seed"] = None if explicit_null else 0
+    generator(tmp_path, cluster, experiment)
+    bench = _read(tmp_path, "vllm-bench.yaml")
+    serve = _read(tmp_path, "vllm-serve.yaml")
+    command = to_cmd(tmp_path / "vllm-bench.yaml")
+    assert "--disable-shuffle" not in command and "--no-oversample" not in command
+    if explicit_null:
+        assert "seed" not in serve
+        assert not {field.replace("_", "-") for field in values}.intersection(bench)
+    else:
+        assert serve["seed"] == 0
+        for field, value in values.items():
+            actual = bench[field.replace("_", "-")]
+            assert (json.loads(actual) if field == "extra_body" else actual) == value
+        assert json.loads(command[command.index("--extra-body") + 1]) == values["extra_body"]
+
+
+@pytest.mark.parametrize(
+    "section,field,value",
+    (
+        ("serve", "seed", True),
+        ("run", "seed", 1.5),
+        ("run", "request_rate", 0),
+        ("run", "request_rate", -1),
+        ("run", "request_rate", float("nan")),
+        ("run", "disable_shuffle", "true"),
+        ("run", "no_oversample", 1),
+        ("run", "extra_body", {"invalid": object()}),
+    ),
+)
+def test_invalid_optional_benchmark_fields_fail_before_rendering(
+    tmp_path, generator, section, field, value
+):
+    cluster, experiment = _inputs()
+    experiment[section][field] = value
+    with pytest.raises(ValueError):
+        generator(tmp_path / "output", cluster, experiment)
+    assert not (tmp_path / "output").exists()
 
 
 @pytest.mark.parametrize("profile", ("qwen3-30b-a3b", "deepseek-v3"))

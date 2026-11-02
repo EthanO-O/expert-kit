@@ -1,0 +1,49 @@
+# Use one Frontend and eight Workers; see dev/ascend/README.md for cluster and frozen-data setup.
+# Worker model facts are resolved from Weight Server metadata at startup.
+model:
+  name: Qwen3-30B-A3B-w8a8
+  path_ref: qwen3-30b-a3b-w8a8
+  weight_version: main
+  weight_dtype: bf16
+  activation_dtype: bf16
+dataset:
+  type: sharegpt
+  name: ShareGPT
+  path_ref: sharegpt
+  mounted_path: /workload
+  file: frozen.json
+serve:
+  gpu_memory_utilization: 0.8
+  max_model_len: 8192
+  max_num_seqs: 256
+  max_num_batched_tokens: 2048
+  enable_chunked_prefill: true
+  block_size: 128
+  kv_cache_memory_bytes: 17179869184
+  quantization: ascend
+  trust_remote_code: true
+  seed: 0
+run:
+  num_prompts: 256
+  max_concurrency: 64
+  output_len: 128
+  num_warmups: 0
+  ignore_eos: true
+  temperature: 0
+  save_result: true
+  save_detailed: true
+  percentile_metrics: ttft,tpot,itl,e2el
+  metric_percentiles: 50,99
+  ready_check_timeout_sec: 0
+  seed: 0
+  request_rate: "inf"
+  disable_shuffle: true
+  no_oversample: true
+  extra_body:
+    seed: 0
+ascend_decode_graph:
+  mode: full
+  rendezvous_host: 192.0.2.10
+  rendezvous_port: 18090
+  capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+  timeout_seconds: 600.0

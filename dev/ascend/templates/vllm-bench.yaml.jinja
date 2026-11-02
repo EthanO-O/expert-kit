@@ -34,5 +34,19 @@ metric-percentiles: {{ run.metric_percentiles | tojson }}
 {% if run.ready_check_timeout_sec is not none %}
 ready-check-timeout-sec: {{ run.ready_check_timeout_sec }}
 {% endif %}
+{% if run.seed is not none %}
+seed: {{ run.seed }}
+{% endif %}
+{% if run.request_rate is not none %}
+request-rate: {{ run.request_rate }}
+{% endif %}
+{% for field in ["disable_shuffle", "no_oversample"] %}
+{% if run[field] is not none %}
+{{ field | replace("_", "-") }}: {{ run[field] | lower }}
+{% endif %}
+{% endfor %}
+{% if run.extra_body is not none %}
+extra-body: {{ run.extra_body | tojson | tojson }}
+{% endif %}
 result-dir: /results
 label: {{ label }}

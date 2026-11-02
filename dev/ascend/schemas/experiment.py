@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import (
     AnyHttpUrl,
     Field,
+    JsonValue,
     StrictBool,
     StrictInt,
     StrictStr,
@@ -197,6 +198,7 @@ class ServeConfig(ConfigModel):
     distributed_executor_backend: StrictStr | None = None
     trust_remote_code: StrictBool | None = None
     compilation_mode: StrictStr | StrictInt | None = None
+    seed: StrictInt | None = None
 
     def with_legacy_model_defaults(
         self, model: ModelConfig, *, graph_enabled: bool
@@ -243,3 +245,8 @@ class RunConfig(ConfigModel):
     percentile_metrics: str | None = None
     metric_percentiles: str | None = None
     ready_check_timeout_sec: int | None = Field(default=None, ge=0)
+    seed: StrictInt | None = None
+    request_rate: float | None = Field(default=None, gt=0)
+    disable_shuffle: StrictBool | None = None
+    no_oversample: StrictBool | None = None
+    extra_body: dict[str, JsonValue] | None = None

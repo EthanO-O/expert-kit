@@ -15,8 +15,8 @@ memory, and qualification requirements.
 | File | Owns | Lifecycle |
 | --- | --- | --- |
 | `configs/qwen3-30b-a3b/*.example.yaml` | Qwen3 cluster and experiment pair | Checked in |
-| `configs/qwen3-30b-a3b-w8a8/*.example.yaml` | Single-host Qwen3 W8A8 graph pair | Checked in |
-| `configs/deepseek-v4-flash-w8a8/*.example.yaml` | Single-host V4 W8A8 graph pair | Checked in |
+| `configs/qwen3-30b-a3b-w8a8/*.example.yaml` | Qwen3 W8A8 cluster, smoke experiment, and benchmark | Checked in |
+| `configs/deepseek-v4-flash-w8a8/*.example.yaml` | V4 W8A8 cluster, smoke experiment, and benchmark | Checked in |
 | `configs/deepseek-v3/*.example.yaml` | DeepSeek-V3 BF16 cluster and experiment pair | Checked in |
 | `configs/cluster.yaml` | Host addresses, placement, devices, ports, images, and paths | Host-local and ignored |
 | `configs/experiment.yaml` | Model, dataset adapter, serving, and benchmark settings | Host-local and ignored |
@@ -169,6 +169,74 @@ retaining containers. There is no automatic recapture or eager retry after a
 partially submitted graph failure. Device qualification of changed configurations
 remains separate from successful generation.
 
+## Benchmark examples
+
+The two W8A8 directories keep `experiment.example.yaml` for small smoke runs
+and provide `bench.example.yaml` as a complete experiment input for the earlier
+online benchmark settings. Both benchmark examples use Full graphs and the
+existing cluster's `ascend_fused` Workers, variable-length ShareGPT prompts,
+128 output tokens with EOS ignored, and concurrency 64 with 256 requests.
+These files preserve settings; they do not report a new benchmark of current code.
+
+Copy the benchmark and its existing cluster into the ignored local inputs:
+
+```bash
+profile=qwen3-30b-a3b-w8a8  # Or deepseek-v4-flash-w8a8.
+cp dev/ascend/configs/$profile/cluster.example.yaml dev/ascend/configs/cluster.yaml
+cp dev/ascend/configs/$profile/bench.example.yaml dev/ascend/configs/experiment.yaml
+```
+
+Fill in model/results paths and replace `192.0.2.10` in both local inputs.
+Keep `attention.devices: [0]` and use eight Workers: change the Qwen pool's
+`devices` to `[1, 2, 3, 4, 5, 6, 7, 8]`; the V4 pool already uses those devices.
+Add the directory containing `frozen.json` to `cluster.paths.datasets`:
+
+```yaml
+paths:
+  datasets:
+    sharegpt: "<FROZEN_SHAREGPT_DIR>"
+```
+
+Keep the other `paths` entries. The benchmark container mounts this directory
+read-only at `/workload`. Use the same ordered, frozen 1024 ShareGPT samples
+across models and comparison arms, with no reshuffling or oversampling. The
+earlier workload kept first turns unchanged from conversations with at least
+two turns, accepting prompts of 4–1024 tokens under both model tokenizers and
+requiring prompt length + 128 ≤ 2048. Exact reproduction requires the same
+`frozen.json`; an unfiltered ShareGPT download is a different workload. Omit
+`run.input_len` for these variable-length inputs.
+
+Generate with the existing command, then follow the
+[deployment workflow](../../doc/tutorial/ascend/README.md) through Worker READY
+and Frontend startup before running the benchmark container:
+
+```bash
+uv run python dev/ascend/cli.py generate \
+  --cluster dev/ascend/configs/cluster.yaml \
+  --experiment dev/ascend/configs/experiment.yaml \
+  --output dev/ascend/generated
+dev/ascend/run-compose.sh attention run --rm benchmark
+```
+
+For the full sweep, set `run.max_concurrency` to C and `run.num_prompts` to 4C:
+
+| C | Requests |
+| ---: | ---: |
+| 1 | 4 |
+| 4 | 16 |
+| 16 | 64 |
+| 64 | 256 |
+| 128 | 512 |
+| 256 | 1024 |
+
+Each window uses the first 4C samples of the frozen file. At each C, generate
+the matching inputs and run two complete warmup windows followed by three
+measured windows, keeping each window's results separate. `run.num_warmups: 0`
+controls vLLM's CLI warmup count; those two full warmup windows are separate
+benchmark invocations. Report medians from measured windows. `vllm bench serve`
+reports whole-request HTTP latency and throughput, including TTFT, TPOT, ITL,
+and end-to-end percentiles; these are not internal Prefill/Decode device TPS.
+
 ## File tree
 
 ```text
@@ -184,8 +252,8 @@ dev/ascend/
 │   ├── qwen3-30b-a3b/
 │   │   ├── cluster.example.yaml
 │   │   └── experiment.example.yaml
-│   ├── qwen3-30b-a3b-w8a8/          # single-host graph example pair
-│   ├── deepseek-v4-flash-w8a8/       # single-host graph example pair
+│   ├── qwen3-30b-a3b-w8a8/          # cluster, smoke experiment, and benchmark
+│   ├── deepseek-v4-flash-w8a8/       # cluster, smoke experiment, and benchmark
 │   ├── deepseek-v3/
 │   │   ├── cluster.example.yaml
 │   │   └── experiment.example.yaml
